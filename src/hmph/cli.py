@@ -29,8 +29,7 @@ async def run_database_command(name):
             await database.migrate()
             print("Database migrated.")
         else:
-            from hmph.model_gateway import FakeModel
-            from hmph.worker import Worker
+            from hmph.runtime import build_worker
 
             conversation = Conversation(
                 database,
@@ -38,12 +37,8 @@ async def run_database_command(name):
                 turn_timeout=settings.turn_timeout_seconds,
             )
             await conversation.bootstrap()
-            print("Worker running with deterministic FAKE model. No real memory or inference.")
-            await Worker(
-                conversation,
-                FakeModel(delay=settings.fake_delay_seconds),
-                lease_seconds=settings.lease_seconds,
-            ).run_forever()
+            print(f"Worker running in {settings.model_mode} mode (local testing).")
+            await build_worker(conversation, settings).run_forever()
     finally:
         await database.close()
 
@@ -53,7 +48,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Create local configuration without overwriting it")
     commands.add_parser("migrate", help="Apply versioned PostgreSQL migrations")
-    commands.add_parser("worker", help="Run the durable generation worker (fake model only)")
+    commands.add_parser("worker", help="Run the durable generation worker")
     evaluate = commands.add_parser("eval", help="Audit evaluation input isolation; no model calls")
     evaluate.add_argument("--suite", type=Path, required=True)
     evaluate.add_argument("--output", type=Path, required=True)

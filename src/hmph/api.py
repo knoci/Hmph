@@ -76,9 +76,14 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     async def health():
         return {
             "status": "ok",
-            "stage": "M0",
+            "stage": "M1-local" if settings.model_mode == "deepseek" else "M0",
             "model_mode": settings.model_mode,
-            "memory_status": "not_implemented",
+            "memory_status": "recent_history_only"
+            if settings.model_mode == "deepseek"
+            else "not_implemented",
+            "output_guard": "full_response"
+            if settings.model_mode == "deepseek"
+            else "fixture_whitelist",
         }
 
     @app.get("/ready")
@@ -108,7 +113,9 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
         body: CreateTurn,
         owner_id: Annotated[UUID, Depends(require_owner)],
     ):
-        return await conversation.accept(owner_id, chat_id, body.request_id, body.content)
+        return await conversation.accept(
+            owner_id, chat_id, body.request_id, body.content, model_mode=settings.model_mode
+        )
 
     @app.get("/api/conversations/{chat_id}/messages")
     async def messages(chat_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):

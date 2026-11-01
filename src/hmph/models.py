@@ -87,6 +87,8 @@ class Turn(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(60))
+    model_mode: Mapped[str] = mapped_column(String(20), default="fake", server_default="fake")
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
 class Message(Base):

@@ -35,6 +35,8 @@ class TurnView(View):
     status: str
     next_event_id: int
     error_code: str | None
+    model_mode: str
+    usage: dict[str, Any] | None
 
 
 class MessageView(View):

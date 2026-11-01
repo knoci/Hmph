@@ -26,6 +26,7 @@ class Database:
             config = Config()
             config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
             config.attributes["connection"] = connection
+            config.attributes["schema"] = self.schema
             command.upgrade(config, "head")
 
         async with self.engine.begin() as connection:

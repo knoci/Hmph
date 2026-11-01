@@ -19,6 +19,7 @@ from hmph.contracts import (
     TurnView,
 )
 from hmph.database import Database
+from hmph.model_gateway import ChatMessage, GenerationRequest
 from hmph.models import Character, Chat, Job, Message, Owner, Pair, StreamEvent, Turn, WriteRequest
 
 DEFAULT_OWNER = UUID("550062e6-03a7-4ff0-bb47-c5eef6515a18")
@@ -165,8 +166,16 @@ class Conversation:
         return event
 
     async def accept(
-        self, owner_id: UUID, chat_id: UUID, request_id: str, content: str
+        self,
+        owner_id: UUID,
+        chat_id: UUID,
+        request_id: str,
+        content: str,
+        *,
+        model_mode: str = "fake",
     ) -> TurnView:
+        if model_mode not in ("fake", "deepseek"):
+            raise DomainError("invalid_model_mode", 422)
         if not content.strip() or "\x00" in content or len(content) > 4000:
             raise DomainError("invalid_input", 422)
         digest = self._digest(str(chat_id), {"content": content})
@@ -197,6 +206,7 @@ class Conversation:
                 policy_revision=pair.policy_revision,
                 memory_epoch=pair.memory_epoch,
                 deadline=now + timedelta(seconds=self.turn_timeout),
+                model_mode=model_mode,
             )
             chat.next_source_seq += 2
             session.add(turn)
@@ -211,7 +221,7 @@ class Conversation:
                 )
             )
             session.add(Job(turn_id=turn.id))
-            self._event(session, turn, "turn.accepted", {"model_mode": "fake"})
+            self._event(session, turn, "turn.accepted", {"model_mode": model_mode})
             self._save_request(session, owner_id, "turn.create", request_id, digest, turn.id)
             await session.flush()
             return TurnView.model_validate(turn)
@@ -271,7 +281,9 @@ class Conversation:
         job.fence += 1
         job.lease_until = None
         job.worker_id = None
-        self._event(session, turn, f"turn.{status}", {"error_code": error_code})
+        self._event(
+            session, turn, f"turn.{status}", {"error_code": error_code, "usage": turn.usage}
+        )
 
     async def cancel(self, owner_id: UUID, turn_id: UUID, request_id: str) -> TurnView:
         digest = self._digest(str(turn_id), {"action": "cancel"})
@@ -285,7 +297,9 @@ class Conversation:
             await session.flush()
             return TurnView.model_validate(turn)
 
-    async def claim(self, worker_id: str, lease_seconds: float = 15) -> Lease | None:
+    async def claim(
+        self, worker_id: str, lease_seconds: float = 15, *, model_mode: str = "fake"
+    ) -> Lease | None:
         if lease_seconds <= 0 or not 1 <= len(worker_id) <= 100:
             raise ValueError("Invalid worker lease settings")
         async with self.db.sessions.begin() as session:
@@ -293,7 +307,11 @@ class Conversation:
                 select(Pair)
                 .join(Turn, Turn.pair_id == Pair.id)
                 .join(Job, Job.turn_id == Turn.id)
-                .where(Job.status == "pending", Turn.status == "accepted")
+                .where(
+                    Job.status == "pending",
+                    Turn.status == "accepted",
+                    Turn.model_mode == model_mode,
+                )
                 .order_by(Turn.created_at, Turn.id)
                 .limit(1)
                 .with_for_update(of=Pair, skip_locked=True)
@@ -412,12 +430,46 @@ class Conversation:
             await session.flush()
             return EventView.model_validate(event)
 
-    async def finish(self, lease: Lease, *, error_code: str | None = None) -> TurnView:
+    async def finish(
+        self, lease: Lease, *, error_code: str | None = None, usage: dict | None = None
+    ) -> TurnView:
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
+            turn.usage = usage
             await self._terminal(session, turn, "failed" if error_code else "completed", error_code)
             await session.flush()
             return TurnView.model_validate(turn)
+
+    async def generation_request(self, lease: Lease) -> GenerationRequest:
+        async with self.db.sessions.begin() as session:
+            turn, _, _ = await self._lease(session, lease)
+            rows = list(
+                await session.scalars(
+                    select(Message)
+                    .join(Turn, Message.turn_id == Turn.id)
+                    .where(
+                        Message.conversation_id == turn.conversation_id,
+                        Message.source_seq <= turn.source_seq,
+                        or_(Message.role == "user", Turn.status == "completed"),
+                    )
+                    .order_by(Message.source_seq.desc())
+                    .limit(40)
+                )
+            )
+            chosen = []
+            remaining = 6000  # Conservative UTF-8 budget, not a claimed exact tokenizer.
+            for row in rows:
+                size = len(row.content.encode("utf-8")) + 64
+                if size > remaining:
+                    if not chosen:
+                        raise DomainError("input_budget_exceeded", 422)
+                    break
+                chosen.append(ChatMessage(role=row.role, content=row.content))
+                remaining -= size
+            chosen.reverse()
+            if chosen and chosen[0].role == "assistant":
+                chosen.pop(0)
+            return GenerationRequest(messages=tuple(chosen))
 
     async def recover_expired(self, limit: int = 100) -> int:
         recovered = 0
