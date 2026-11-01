@@ -3,6 +3,7 @@
 import hashlib
 import json
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +39,7 @@ class GoldAnswer:
     evidence_sessions: tuple[str, ...]
     category: str | None
     abstention: bool
+    evidence_messages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -64,14 +66,20 @@ def parse_longmemeval(raw: dict) -> EvaluationCase:
         raise ValueError("Expected non-empty history sessions")
     if not (len(sessions) == len(dates) == len(original_ids)):
         raise ValueError("History sessions, IDs and dates must align")
-    if len(set(original_ids)) != len(original_ids):
-        raise ValueError("Duplicate history session IDs")
+    # Cleaned-S includes repeated filler IDs at different dates. Preserve every
+    # occurrence with distinct neutral IDs. Ambiguous gold references still fail.
+    counts = Counter(original_ids)
+    if any(counts.get(item, 0) > 1 for item in raw.get("answer_session_ids", [])):
+        raise ValueError("Ambiguous duplicate evidence session ID")
     session_mapping = {original: f"s{index:05d}" for index, original in enumerate(original_ids)}
     history = []
+    evidence_messages = []
     for index, (messages, date) in enumerate(zip(sessions, dates, strict=True)):
         if not isinstance(messages, list):
             raise ValueError("Expected a list of messages")
         for message_index, message in enumerate(messages):
+            if message.get("has_answer") is True:
+                evidence_messages.append(f"s{index:05d}/m{message_index:05d}")
             history.append(
                 HistoryMessage(
                     source_id=f"s{index:05d}/m{message_index:05d}",
@@ -94,6 +102,7 @@ def parse_longmemeval(raw: dict) -> EvaluationCase:
             evidence_sessions=tuple(session_mapping[item] for item in evidence),
             category=raw.get("question_type"),
             abstention=case_id.endswith("_abs"),
+            evidence_messages=tuple(evidence_messages),
         ),
     )
 
@@ -145,7 +154,7 @@ def audit_suite(path: Path) -> dict:
         "created_at": datetime.now(UTC).isoformat(),
         "code": _code_version(),
         "dataset_sha256": hashlib.sha256(raw_bytes).hexdigest(),
-        "adapter": "longmemeval-history-whitelist-v1",
+        "adapter": "longmemeval-history-whitelist-v2",
         "case_count": len(cases),
         "source_message_count": messages,
         "input_audit": {

@@ -19,6 +19,7 @@ async def test_real_api_and_worker_process_survive_a_worker_crash(conversation):
         HMPH_DATABASE_SCHEMA=conversation.db.schema,
         HMPH_DATABASE_URL=conversation.db.url,
         HMPH_FAKE_DELAY_SECONDS="0.3",
+        HMPH_MODEL_MODE="fake",
         HMPH_LEASE_SECONDS="0.3",
         PYTHONUTF8="1",
     )

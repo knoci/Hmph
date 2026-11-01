@@ -1,9 +1,6 @@
-import hashlib
-import hmac
-import json
-import re
 from datetime import timedelta
 from uuid import UUID, uuid5
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
@@ -19,18 +16,38 @@ from hmph.contracts import (
     TurnView,
 )
 from hmph.database import Database
+from hmph.dialogue import queue_dialogue, short_term_context, state_sources
 from hmph.model_gateway import ChatMessage, GenerationRequest
-from hmph.models import Character, Chat, Job, Message, Owner, Pair, StreamEvent, Turn, WriteRequest
+from hmph.models import (
+    Character,
+    Chat,
+    Job,
+    MemoryTask,
+    Message,
+    Owner,
+    Pair,
+    StreamEvent,
+    Turn,
+    TurnMemoryUse,
+    TurnSourceUse,
+)
+from hmph.persistence import RequestLedger, append_event, terminate_turn
+from hmph.working_memory import build_workspace, retrieve
 
 DEFAULT_OWNER = UUID("550062e6-03a7-4ff0-bb47-c5eef6515a18")
 DEFAULT_CHARACTER = UUID("af1d4af8-7c4e-49b3-9b42-83d5457bedce")
 
 
 class Conversation:
-    def __init__(self, db: Database, *, digest_key: bytes, turn_timeout: float = 45):
+    def __init__(
+        self, db: Database, *, digest_key: bytes, turn_timeout: float = 45, source_timezone="UTC"
+    ):
+        ZoneInfo(source_timezone)
         self.db = db
         self.digest_key = digest_key
         self.turn_timeout = turn_timeout
+        self.source_timezone = source_timezone
+        self.ledger = RequestLedger(digest_key)
 
     async def bootstrap(self, owner_id: UUID = DEFAULT_OWNER) -> Identity:
         async with self.db.sessions.begin() as session:
@@ -49,39 +66,17 @@ class Conversation:
         return Identity(owner_id=owner_id, character_id=DEFAULT_CHARACTER)
 
     def _digest(self, target: str, body: dict) -> str:
-        raw = json.dumps([target, body], sort_keys=True, ensure_ascii=False).encode()
-        return hmac.new(self.digest_key, raw, hashlib.sha256).hexdigest()
-
-    @staticmethod
-    def _request_id(request_id: str):
-        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
-            raise DomainError("invalid_request_id", 422)
+        return self.ledger.digest(target, body)
 
     async def _owner_lock(self, session, owner_id):
-        if (
-            await session.scalar(select(Owner).where(Owner.id == owner_id).with_for_update())
-            is None
-        ):
-            raise DomainError("not_found", 404)
+        await self.ledger.owner_lock(session, owner_id)
 
     async def _request(self, session, owner_id, operation, request_id, digest):
-        self._request_id(request_id)
-        existing = await session.get(WriteRequest, (owner_id, operation, request_id))
-        if existing and not hmac.compare_digest(existing.digest, digest):
-            raise DomainError("idempotency_conflict")
-        return existing.result_id if existing else None
+        return await self.ledger.request(session, owner_id, operation, request_id, digest)
 
     @staticmethod
     def _save_request(session, owner_id, operation, request_id, digest, result_id):
-        session.add(
-            WriteRequest(
-                owner_id=owner_id,
-                operation=operation,
-                request_id=request_id,
-                digest=digest,
-                result_id=result_id,
-            )
-        )
+        RequestLedger.save(session, owner_id, operation, request_id, digest, result_id)
 
     async def create_chat(self, owner_id: UUID, character_id: UUID, request_id: str) -> ChatView:
         digest = self._digest("conversations", {"character_id": str(character_id)})
@@ -154,16 +149,7 @@ class Conversation:
 
     @staticmethod
     def _event(session, turn, event_type, payload, *, segment_index=None):
-        event = StreamEvent(
-            turn_id=turn.id,
-            id=turn.next_event_id,
-            type=event_type,
-            payload=payload,
-            segment_index=segment_index,
-        )
-        turn.next_event_id += 1
-        session.add(event)
-        return event
+        return append_event(session, turn, event_type, payload, segment_index=segment_index)
 
     async def accept(
         self,
@@ -205,22 +191,36 @@ class Conversation:
                 source_seq=chat.next_source_seq,
                 policy_revision=pair.policy_revision,
                 memory_epoch=pair.memory_epoch,
+                source_timezone=self.source_timezone,
                 deadline=now + timedelta(seconds=self.turn_timeout),
+                created_at=now,
                 model_mode=model_mode,
             )
             chat.next_source_seq += 2
             session.add(turn)
             await session.flush()
+            message = Message(
+                conversation_id=chat.id,
+                turn_id=turn.id,
+                source_seq=turn.source_seq,
+                role="user",
+                content=content,
+            )
+            session.add(message)
+            await session.flush()
             session.add(
-                Message(
-                    conversation_id=chat.id,
-                    turn_id=turn.id,
-                    source_seq=turn.source_seq,
-                    role="user",
-                    content=content,
+                MemoryTask(
+                    pair_id=pair.id,
+                    source_message_id=message.id,
+                    source_revision=message.revision,
+                    source_order=pair.next_memory_seq,
+                    memory_epoch=pair.memory_epoch,
+                    model_mode=model_mode,
                 )
             )
+            pair.next_memory_seq += 1
             session.add(Job(turn_id=turn.id))
+            await queue_dialogue(session, turn, turn.source_seq)
             self._event(session, turn, "turn.accepted", {"model_mode": model_mode})
             self._save_request(session, owner_id, "turn.create", request_id, digest, turn.id)
             await session.flush()
@@ -272,18 +272,7 @@ class Conversation:
             return [EventView.model_validate(row) for row in rows]
 
     async def _terminal(self, session, turn, status, error_code=None):
-        if turn.status not in ACTIVE:
-            return
-        turn.status = status
-        turn.error_code = error_code
-        job = await session.scalar(select(Job).where(Job.turn_id == turn.id).with_for_update())
-        job.status = "done"
-        job.fence += 1
-        job.lease_until = None
-        job.worker_id = None
-        self._event(
-            session, turn, f"turn.{status}", {"error_code": error_code, "usage": turn.usage}
-        )
+        await terminate_turn(session, turn, status, error_code)
 
     async def cancel(self, owner_id: UUID, turn_id: UUID, request_id: str) -> TurnView:
         digest = self._digest(str(turn_id), {"action": "cancel"})
@@ -450,14 +439,42 @@ class Conversation:
                     .where(
                         Message.conversation_id == turn.conversation_id,
                         Message.source_seq <= turn.source_seq,
+                        Message.deleted.is_(False),
                         or_(Message.role == "user", Turn.status == "completed"),
                     )
                     .order_by(Message.source_seq.desc())
                     .limit(40)
                 )
             )
+            evidence = []
+            evidence_bytes = 0
+            current_size = len(rows[0].content.encode("utf-8")) + 64
+            short_term = await short_term_context(
+                session, turn, max(0, min(1300, 5000 - current_size))
+            )
+            state_bytes = len(short_term.model_dump_json().encode())
+            candidates = await retrieve(session, turn, rows[0].content, short_term)
+            for hit in candidates.memories:
+                # Retain every source in storage; supply bounded evidence in the prompt.
+                hit = hit.model_copy(update={"sources": hit.sources[:2]})
+                size = len(hit.model_dump_json().encode("utf-8")) + 64
+                if size + evidence_bytes > min(1500, 5000 - current_size - state_bytes):
+                    continue
+                evidence.append(hit)
+                evidence_bytes += size
+            raw_evidence = []
+            for source in candidates.raw:
+                size = len(source.model_dump_json().encode()) + 64
+                if (
+                    size + evidence_bytes > min(1500, 5000 - current_size - state_bytes)
+                    or len(evidence) + len(raw_evidence) >= 12
+                ):
+                    continue
+                raw_evidence.append(source)
+                evidence_bytes += size
             chosen = []
-            remaining = 6000  # Conservative UTF-8 budget, not a claimed exact tokenizer.
+            source_rows = []
+            remaining = 5000 - evidence_bytes - state_bytes
             for row in rows:
                 size = len(row.content.encode("utf-8")) + 64
                 if size > remaining:
@@ -465,11 +482,87 @@ class Conversation:
                         raise DomainError("input_budget_exceeded", 422)
                     break
                 chosen.append(ChatMessage(role=row.role, content=row.content))
+                source_rows.append(row)
                 remaining -= size
             chosen.reverse()
             if chosen and chosen[0].role == "assistant":
                 chosen.pop(0)
-            return GenerationRequest(messages=tuple(chosen))
+                source_rows.pop()
+            delta_total = await session.scalar(
+                select(func.count())
+                .select_from(Message)
+                .join(Turn)
+                .where(
+                    Message.conversation_id == turn.conversation_id,
+                    Message.source_seq > short_term.processed_through_seq,
+                    Message.source_seq <= turn.source_seq,
+                    Message.deleted.is_(False),
+                    or_(Message.role == "user", Turn.status == "completed"),
+                )
+            )
+            short_term.omitted_delta_messages = delta_total - sum(
+                row.source_seq > short_term.processed_through_seq for row in source_rows
+            )
+            short_term.pending_gap = short_term.omitted_delta_messages > 0
+            workspace = build_workspace(
+                candidates.plan,
+                evidence,
+                raw_evidence,
+                short_term,
+                query_count=candidates.query_count,
+                candidate_count=candidates.candidate_count,
+                budget_dropped=len(candidates.memories)
+                + len(candidates.raw)
+                - len(evidence)
+                - len(raw_evidence),
+            )
+            for source in raw_evidence:
+                await session.execute(
+                    insert(TurnSourceUse)
+                    .values(
+                        turn_id=turn.id,
+                        message_id=source.message_id,
+                        message_revision=source.message_revision,
+                    )
+                    .on_conflict_do_nothing()
+                )
+            for anchor in state_sources(short_term.data).values():
+                await session.execute(
+                    insert(TurnSourceUse)
+                    .values(
+                        turn_id=turn.id,
+                        message_id=anchor.message_id,
+                        message_revision=anchor.message_revision,
+                    )
+                    .on_conflict_do_nothing()
+                )
+            for row in source_rows:
+                await session.execute(
+                    insert(TurnSourceUse)
+                    .values(
+                        turn_id=turn.id,
+                        message_id=row.id,
+                        message_revision=row.revision,
+                    )
+                    .on_conflict_do_nothing()
+                )
+            for hit in evidence:
+                await session.execute(
+                    insert(TurnMemoryUse)
+                    .values(
+                        turn_id=turn.id,
+                        memory_id=hit.id,
+                        revision=hit.revision,
+                    )
+                    .on_conflict_do_nothing()
+                )
+            return GenerationRequest(
+                messages=tuple(chosen),
+                evidence=tuple(evidence),
+                short_term=short_term,
+                raw_evidence=tuple(raw_evidence),
+                workspace=workspace,
+            )
 
     async def recover_expired(self, limit: int = 100) -> int:
         recovered = 0

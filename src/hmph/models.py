@@ -46,6 +46,7 @@ class Pair(Base):
     preferences: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     policy_revision: Mapped[int] = mapped_column(default=1)
     memory_epoch: Mapped[int] = mapped_column(default=1)
+    next_memory_seq: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
 
 
 class Chat(Base):
@@ -84,11 +85,13 @@ class Turn(Base):
     published_segments: Mapped[int] = mapped_column(default=0)
     policy_revision: Mapped[int] = mapped_column()
     memory_epoch: Mapped[int] = mapped_column()
+    source_timezone: Mapped[str | None] = mapped_column(String(80))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(60))
     model_mode: Mapped[str] = mapped_column(String(20), default="fake", server_default="fake")
     usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    content_redacted: Mapped[bool] = mapped_column(default=False, server_default="false")
 
 
 class Message(Base):
@@ -105,6 +108,83 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
     revision: Mapped[int] = mapped_column(default=1)
+    deleted: Mapped[bool] = mapped_column(default=False, server_default="false")
+
+
+class MemoryEntry(Base):
+    __tablename__ = "memory_entries"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    predicate: Mapped[str] = mapped_column(String(60))
+    scope: Mapped[str] = mapped_column(String(20))
+    revision: Mapped[int] = mapped_column(default=1)
+    source_order: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(20), default="active", server_default="active")
+
+
+class MemoryVersion(Base):
+    __tablename__ = "memory_versions"
+    memory_id: Mapped[UUID] = mapped_column(ForeignKey("memory_entries.id"), primary_key=True)
+    revision: Mapped[int] = mapped_column(primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    time_text: Mapped[str | None] = mapped_column(String(100))
+    reference_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reference_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    time_precision: Mapped[str] = mapped_column(
+        String(20), default="unknown", server_default="unknown"
+    )
+    time_basis: Mapped[str] = mapped_column(
+        String(30), default="unresolved", server_default="unresolved"
+    )
+    source_timezone: Mapped[str | None] = mapped_column(String(80))
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MemorySource(Base):
+    __tablename__ = "memory_sources"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_id", "revision"], ["memory_versions.memory_id", "memory_versions.revision"]
+        ),
+    )
+    memory_id: Mapped[UUID] = mapped_column(primary_key=True)
+    revision: Mapped[int] = mapped_column(primary_key=True)
+    message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+    message_revision: Mapped[int] = mapped_column()
+    quote: Mapped[str] = mapped_column(Text)
+
+
+class MemoryTask(Base):
+    __tablename__ = "memory_tasks"
+    __table_args__ = (
+        UniqueConstraint("source_message_id", "source_revision"),
+        Index(
+            "one_memory_lease_per_pair",
+            "pair_id",
+            unique=True,
+            postgresql_where=text("status = 'leased'"),
+        ),
+        CheckConstraint(
+            "status IN ('pending','leased','done','failed')", name="memory_task_status"
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"), index=True)
+    source_message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"))
+    source_revision: Mapped[int] = mapped_column()
+    source_order: Mapped[int] = mapped_column(BigInteger)
+    memory_epoch: Mapped[int] = mapped_column()
+    model_mode: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
+    fence: Mapped[int] = mapped_column(default=0, server_default="0")
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    worker_id: Mapped[str | None] = mapped_column(String(100))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(60))
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
 class StreamEvent(Base):
@@ -135,3 +215,73 @@ class WriteRequest(Base):
     request_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     digest: Mapped[str] = mapped_column(String(64))
     result_id: Mapped[UUID] = mapped_column()
+
+
+class TurnSourceUse(Base):
+    __tablename__ = "turn_source_uses"
+    turn_id: Mapped[UUID] = mapped_column(ForeignKey("turns.id"), primary_key=True)
+    message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+    message_revision: Mapped[int] = mapped_column()
+
+
+class TurnMemoryUse(Base):
+    __tablename__ = "turn_memory_uses"
+    turn_id: Mapped[UUID] = mapped_column(ForeignKey("turns.id"), primary_key=True)
+    memory_id: Mapped[UUID] = mapped_column(ForeignKey("memory_entries.id"), primary_key=True)
+    revision: Mapped[int] = mapped_column()
+
+
+class MemoryDeletion(Base):
+    __tablename__ = "memory_deletions"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"))
+    memory_id: Mapped[UUID] = mapped_column(ForeignKey("memory_entries.id"))
+    status: Mapped[str] = mapped_column(String(20), default="completed")
+    memories: Mapped[int] = mapped_column()
+    messages: Mapped[int] = mapped_column()
+    turns: Mapped[int] = mapped_column()
+    dialogue_states: Mapped[int] = mapped_column(default=0, server_default="0")
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class DialogueState(Base):
+    __tablename__ = "dialogue_states"
+    conversation_id: Mapped[UUID] = mapped_column(ForeignKey("conversations.id"), primary_key=True)
+    pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"), index=True)
+    revision: Mapped[int] = mapped_column(default=0)
+    memory_epoch: Mapped[int] = mapped_column()
+    coverage_from_seq: Mapped[int] = mapped_column(BigInteger, default=1)
+    processed_through_seq: Mapped[int] = mapped_column(BigInteger, default=0)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
+
+class DialogueSource(Base):
+    __tablename__ = "dialogue_sources"
+    conversation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("dialogue_states.conversation_id"), primary_key=True
+    )
+    message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+    message_revision: Mapped[int] = mapped_column()
+
+
+class DialogueTask(Base):
+    __tablename__ = "dialogue_tasks"
+    conversation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("dialogue_states.conversation_id"), primary_key=True
+    )
+    requested_through_seq: Mapped[int] = mapped_column(BigInteger)
+    model_mode: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    fence: Mapped[int] = mapped_column(default=0)
+    attempts: Mapped[int] = mapped_column(default=0)
+    worker_id: Mapped[str | None] = mapped_column(String(100))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(60))
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','leased','idle','failed')", name="dialogue_task_status"
+        ),
+    )

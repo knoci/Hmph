@@ -37,6 +37,7 @@ class TurnView(View):
     error_code: str | None
     model_mode: str
     usage: dict[str, Any] | None
+    content_redacted: bool
 
 
 class MessageView(View):
@@ -45,6 +46,8 @@ class MessageView(View):
     role: str
     content: str
     source_seq: int
+    deleted: bool
+    revision: int
 
 
 class EventView(View):

@@ -29,18 +29,87 @@ async def run_database_command(name):
             await database.migrate()
             print("Database migrated.")
         else:
-            from hmph.runtime import build_worker
+            from hmph.runtime import build_memory_worker, build_state_worker, build_worker
 
             conversation = Conversation(
                 database,
                 digest_key=settings.request_digest_key.get_secret_value().encode(),
                 turn_timeout=settings.turn_timeout_seconds,
+                source_timezone=settings.source_timezone,
             )
             await conversation.bootstrap()
             print(f"Worker running in {settings.model_mode} mode (local testing).")
-            await build_worker(conversation, settings).run_forever()
+            factory = {
+                "memory-worker": build_memory_worker,
+                "state-worker": build_state_worker,
+                "worker": build_worker,
+            }[name]
+            worker = factory(conversation, settings)
+            await worker.run_forever()
     finally:
         await database.close()
+
+
+async def run_evaluation(args):
+    import json
+    import time
+
+    from hmph.deepseek import DeepSeekModel
+    from hmph.eval_runner import run_suite, save_report
+
+    settings = Settings(model_mode="fake") if args.retrieval_only else Settings()
+    if not args.retrieval_only and settings.deepseek_api_key is None:
+        raise ValueError("E1 requires a local DeepSeek key")
+    model = (
+        None
+        if args.retrieval_only
+        else DeepSeekModel(settings.deepseek_api_key, model=settings.deepseek_model)
+    )
+    semantic_ranker = None
+    if "hybrid_raw" in args.profiles:
+        from hmph.semantic import LocalSemanticRanker
+
+        semantic_ranker = await asyncio.to_thread(LocalSemanticRanker)
+    metadata = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else None
+    await asyncio.to_thread(args.output.parent.mkdir, parents=True, exist_ok=True)
+
+    last_checkpoint = 0
+
+    async def checkpoint(report):
+        nonlocal last_checkpoint
+        if args.retrieval_only and time.monotonic() - last_checkpoint < 1:
+            return
+        await asyncio.to_thread(save_report, args.output, report)
+        last_checkpoint = time.monotonic()
+
+    report = await run_suite(
+        args.suite,
+        model.read_evaluation if model else None,
+        judge=model.judge_evaluation if model and args.judge else None,
+        profiles=tuple(args.profiles),
+        limit=args.limit,
+        seed=args.seed,
+        budget_bytes=args.budget_bytes,
+        model=settings.deepseek_model if model else "not_run",
+        dataset_condition=args.condition,
+        dataset_metadata=metadata,
+        progress=checkpoint,
+        semantic_ranker=semantic_ranker,
+        retrieval_only=args.retrieval_only,
+        provider_config={
+            "reader_prompt": "deepseek-e1-reader-v2",
+            "judge_prompt": "hmph-binary-judge-v1" if args.judge else None,
+            "reader_max_output_tokens": 256,
+            "judge_max_output_tokens": 64,
+            "thinking": "disabled",
+        },
+    )
+    await asyncio.to_thread(save_report, args.output, report)
+    print(
+        f"E1 completed {report['case_count']} cases; "
+        f"{report['inference_requests']} attempted calls. "
+        "Official score: NO. Frontier status: NOT EVALUATED."
+    )
 
 
 def main():
@@ -49,9 +118,35 @@ def main():
     commands.add_parser("init", help="Create local configuration without overwriting it")
     commands.add_parser("migrate", help="Apply versioned PostgreSQL migrations")
     commands.add_parser("worker", help="Run the durable generation worker")
+    commands.add_parser("memory-worker", help="Run sourced memory extraction independently")
+    commands.add_parser("state-worker", help="Maintain grounded short-term state and watermarks")
     evaluate = commands.add_parser("eval", help="Audit evaluation input isolation; no model calls")
     evaluate.add_argument("--suite", type=Path, required=True)
     evaluate.add_argument("--output", type=Path, required=True)
+    infer = commands.add_parser(
+        "eval-run", help="Run opt-in DeepSeek memory QA baselines; paid calls"
+    )
+    infer.add_argument("--suite", type=Path, required=True)
+    infer.add_argument("--output", type=Path, required=True)
+    infer.add_argument("--manifest", type=Path)
+    infer.add_argument(
+        "--condition", required=True, help="Disclose history condition, e.g. cleaned-S"
+    )
+    infer.add_argument(
+        "--profiles",
+        nargs="+",
+        choices=["recent_window", "lexical_raw", "source_aware_raw", "hybrid_raw", "full_history"],
+        default=["recent_window", "lexical_raw", "full_history"],
+    )
+    infer.add_argument("--limit", type=int, default=5)
+    infer.add_argument("--seed", type=int, default=17)
+    infer.add_argument("--budget-bytes", type=int, default=12000)
+    infer.add_argument("--judge", action="store_true", help="Use separate DeepSeek grading calls")
+    infer.add_argument(
+        "--retrieval-only",
+        action="store_true",
+        help="Evaluate source retrieval without provider calls",
+    )
     serve = commands.add_parser("serve", help="Run the local authenticated HTTP API")
     serve.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1", "::1"])
     serve.add_argument("--port", type=int, default=8017)
@@ -78,6 +173,8 @@ def main():
         uvicorn.run(
             create_app(), host=args.host, port=args.port, access_log=False, proxy_headers=False
         )
+    elif args.command == "eval-run":
+        asyncio.run(run_evaluation(args))
     else:
         try:
             asyncio.run(run_database_command(args.command))

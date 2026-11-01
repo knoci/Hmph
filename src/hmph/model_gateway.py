@@ -6,6 +6,10 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from hmph.dialogue_types import ShortTermContext
+from hmph.memory_types import MemoryView
+from hmph.working_memory import EvidenceWorkspace, RawEvidence
+
 FAKE_SENTENCES = ("哼，收到啦。", "我现在使用的是测试模型，还没有接入真实记忆。")
 FALLBACK = "这条回复暂时无法提供，请稍后再试。"
 
@@ -19,6 +23,10 @@ class ChatMessage(BaseModel):
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     messages: tuple[ChatMessage, ...] = Field(min_length=1)
+    evidence: tuple[MemoryView, ...] = ()
+    short_term: ShortTermContext = Field(default_factory=ShortTermContext)
+    raw_evidence: tuple[RawEvidence, ...] = ()
+    workspace: EvidenceWorkspace | None = None
 
 
 class ModelUsage(BaseModel):

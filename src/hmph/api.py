@@ -15,6 +15,8 @@ from hmph.config import Settings
 from hmph.contracts import TERMINAL, DomainError
 from hmph.conversation import DEFAULT_CHARACTER, Conversation
 from hmph.database import Database
+from hmph.dialogue import Dialogue
+from hmph.memory import Memory
 
 
 class WriteBody(BaseModel):
@@ -29,6 +31,10 @@ class CreateTurn(WriteBody):
     content: str = Field(min_length=1, max_length=4000)
 
 
+class ForgetMemory(WriteBody):
+    expected_revision: int = Field(ge=1)
+
+
 def create_app(settings: Settings | None = None, *, conversation: Conversation | None = None):
     settings = settings or Settings()
     managed = conversation is None
@@ -40,6 +46,7 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             database,
             digest_key=settings.request_digest_key.get_secret_value().encode(),
             turn_timeout=settings.turn_timeout_seconds,
+            source_timezone=settings.source_timezone,
         )
 
     @asynccontextmanager
@@ -52,6 +59,12 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
                 await conversation.db.close()
 
     app = FastAPI(title="Hmph", version="0.1.0", lifespan=lifespan)
+    memory = Memory(
+        conversation.db,
+        digest_key=conversation.digest_key,
+        source_timezone=conversation.source_timezone,
+    )
+    dialogue = Dialogue(conversation.db)
     security = HTTPBearer(auto_error=False)
 
     async def require_owner(
@@ -76,11 +89,12 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     async def health():
         return {
             "status": "ok",
-            "stage": "M1-local" if settings.model_mode == "deepseek" else "M0",
+            "stage": "M2-local",
             "model_mode": settings.model_mode,
-            "memory_status": "recent_history_only"
-            if settings.model_mode == "deepseek"
-            else "not_implemented",
+            "memory_status": "sourced_lexical_baseline",
+            "short_term_status": "grounded_watermark",
+            "working_memory_status": "bounded_slots_and_raw_lookup",
+            "semantic_retrieval": "evaluation_only",
             "output_guard": "full_response"
             if settings.model_mode == "deepseek"
             else "fixture_whitelist",
@@ -121,6 +135,10 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     async def messages(chat_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
         return await conversation.messages(owner_id, chat_id)
 
+    @app.get("/api/conversations/{chat_id}/state")
+    async def dialogue_state(chat_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
+        return await dialogue.read(owner_id, chat_id)
+
     @app.get("/api/turns/{turn_id}")
     async def turn(turn_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
         return await conversation.get_turn(owner_id, turn_id)
@@ -132,6 +150,38 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
         owner_id: Annotated[UUID, Depends(require_owner)],
     ):
         return await conversation.cancel(owner_id, turn_id, body.request_id)
+
+    @app.get("/api/memories")
+    async def memories(
+        owner_id: Annotated[UUID, Depends(require_owner)],
+        character_id: UUID = DEFAULT_CHARACTER,
+        query: Annotated[str | None, Query(max_length=4000)] = None,
+    ):
+        if query is not None:
+            return await memory.recall(owner_id, character_id, query)
+        return await memory.entries(owner_id, character_id)
+
+    @app.get("/api/memories/{memory_id}/history")
+    async def memory_history(memory_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
+        return await memory.history(owner_id, memory_id)
+
+    @app.get("/api/memories/{memory_id}/forget-preview")
+    async def forget_preview(memory_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
+        return await memory.preview_forget(owner_id, memory_id)
+
+    @app.post("/api/memories/{memory_id}/forget")
+    async def forget_memory(
+        memory_id: UUID, body: ForgetMemory, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await memory.forget(
+            owner_id, memory_id, body.request_id, expected_revision=body.expected_revision
+        )
+
+    @app.get("/api/memory-tasks/{source_message_id}")
+    async def memory_task(
+        source_message_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await memory.task_status(owner_id, source_message_id)
 
     @app.get("/api/turns/{turn_id}/events")
     async def events(
@@ -156,6 +206,12 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             last_heartbeat = time.monotonic()
             while not await request.is_disconnected():
                 for event in batch:
+                    # Recheck before exposing a cached event batch after concurrent forgetting.
+                    if (await conversation.get_turn(owner_id, turn_id)).content_redacted:
+                        yield (
+                            'event: turn.content_redacted\ndata: {"reason":"memory_forgotten"}\n\n'
+                        )
+                        return
                     yield (
                         f"id: {event.id}\nevent: {event.type}\ndata: {event.model_dump_json()}\n\n"
                     )
@@ -173,7 +229,7 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             stream(),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-store",
                 "X-Accel-Buffering": "no",
             },
         )

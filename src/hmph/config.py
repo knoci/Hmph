@@ -1,4 +1,5 @@
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,12 +20,22 @@ class Settings(BaseSettings):
     request_digest_key: SecretStr
     database_schema: str = Field(default="public", pattern=r"^[a-z][a-z0-9_]*$")
     model_mode: Literal["fake", "deepseek"] = "fake"
+    source_timezone: str = Field(default="UTC", max_length=80)
     deepseek_api_key: SecretStr | None = None
     deepseek_model: Literal["deepseek-flash", "deepseek-v4-pro"] = "deepseek-flash"
     deepseek_max_tokens: int = Field(default=256, ge=1, le=512)
     fake_delay_seconds: float = Field(default=0.01, gt=0, le=10)
     lease_seconds: float = Field(default=15, gt=0, le=60)
     turn_timeout_seconds: float = Field(default=45, gt=0, le=300)
+
+    @field_validator("source_timezone")
+    @classmethod
+    def valid_source_timezone(cls, value):
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("Invalid source timezone") from None
+        return value
 
     @field_validator("api_token", "request_digest_key")
     @classmethod

@@ -1,3 +1,6 @@
+from hmph.model_gateway import ModelDelta
+
+
 async def test_worker_publishes_durable_segments_and_replay_skips_seen_events(conversation):
     from hmph.model_gateway import FakeModel
     from hmph.worker import Worker
@@ -95,7 +98,7 @@ async def test_unapproved_draft_is_replaced_before_publication(conversation):
 
     class UnapprovedProvider:
         async def stream(self, user_content):
-            yield "这段未审核草稿不能发布。"
+            yield ModelDelta(text="这段未审核草稿不能发布。")
 
     identity = await conversation.bootstrap()
     chat = await conversation.create_chat(identity.owner_id, identity.character_id, "chat")
@@ -112,7 +115,7 @@ async def test_provider_failure_has_terminal_event_without_exception_details(con
 
     class BrokenProvider:
         async def stream(self, user_content):
-            yield "哼，收到啦。"
+            yield ModelDelta(text="哼，收到啦。")
             raise RuntimeError("private-provider-token-123")
 
     identity = await conversation.bootstrap()
