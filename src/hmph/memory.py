@@ -13,6 +13,7 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from hmph.contracts import ACTIVE, DomainError
 from hmph.database import Database
 from hmph.dialogue import invalidate_dialogue
+from hmph.memory_builds import framework_space_count, retire_for_forget
 from hmph.memory_types import (
     DeletionReceipt,
     ForgetPreview,
@@ -640,7 +641,19 @@ class Memory:
                 messages=len(messages),
                 turns=len(turns),
                 dialogue_states=state_count,
+                framework_spaces=await framework_space_count(session, pair.id),
             )
+
+    async def deletion(self, owner_id: UUID, deletion_id: UUID):
+        async with self.db.sessions() as session:
+            receipt = await session.scalar(
+                select(MemoryDeletion)
+                .join(Pair)
+                .where(MemoryDeletion.id == deletion_id, Pair.owner_id == owner_id)
+            )
+            if receipt is None:
+                raise DomainError("not_found", 404)
+            return DeletionReceipt.model_validate(receipt)
 
     async def forget(
         self, owner_id: UUID, memory_id: UUID, request_id: str, *, expected_revision: int
@@ -734,6 +747,8 @@ class Memory:
                 dialogue_states=state_count,
             )
             session.add(receipt)
+            await session.flush()
+            await retire_for_forget(session, pair, receipt)
             await session.flush()
             self.ledger.save(session, owner_id, "memory.forget", request_id, digest, receipt.id)
             return DeletionReceipt.model_validate(receipt)

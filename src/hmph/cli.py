@@ -21,7 +21,7 @@ def initialize():
     print("Created .env with local credentials. Keep this file private.")
 
 
-async def run_database_command(name):
+async def run_database_command(name, *, max_calls=64, once=False):
     settings = Settings()
     database = Database(settings.database_url.get_secret_value(), schema=settings.database_schema)
     try:
@@ -38,6 +38,27 @@ async def run_database_command(name):
                 source_timezone=settings.source_timezone,
             )
             await conversation.bootstrap()
+            if name == "framework-worker":
+                from hmph.framework_worker import FrameworkWorker
+                from hmph.mem0_backend import Mem0Backend
+                from hmph.memory_builds import MemoryBuilds
+
+                if settings.deepseek_api_key is None:
+                    raise ValueError("Framework worker requires a local DeepSeek key")
+                backend = Mem0Backend(
+                    settings.deepseek_api_key,
+                    database_url=settings.database_url.get_secret_value(),
+                    max_calls=max_calls,
+                )
+                worker = FrameworkWorker(
+                    MemoryBuilds(database, digest_key=conversation.digest_key), backend
+                )
+                print("Mem0 shadow worker running; requested builds may call DeepSeek.")
+                if once:
+                    await worker.run_once()
+                else:
+                    await worker.run_forever()
+                return
             print(f"Worker running in {settings.model_mode} mode (local testing).")
             factory = {
                 "memory-worker": build_memory_worker,
@@ -120,6 +141,20 @@ def main():
     commands.add_parser("worker", help="Run the durable generation worker")
     commands.add_parser("memory-worker", help="Run sourced memory extraction independently")
     commands.add_parser("state-worker", help="Maintain grounded short-term state and watermarks")
+    framework = commands.add_parser(
+        "framework-worker", help="Run opt-in persistent Mem0 shadow builds"
+    )
+    framework.add_argument(
+        "--max-calls",
+        type=int,
+        choices=range(1, 129),
+        default=64,
+        metavar="1..128",
+        help="Provider attempt budget per build attempt",
+    )
+    framework.add_argument(
+        "--once", action="store_true", help="Process at most one build or cleanup"
+    )
     evaluate = commands.add_parser("eval", help="Audit evaluation input isolation; no model calls")
     evaluate.add_argument("--suite", type=Path, required=True)
     evaluate.add_argument("--output", type=Path, required=True)
@@ -177,7 +212,13 @@ def main():
         asyncio.run(run_evaluation(args))
     else:
         try:
-            asyncio.run(run_database_command(args.command))
+            asyncio.run(
+                run_database_command(
+                    args.command,
+                    max_calls=getattr(args, "max_calls", 64),
+                    once=getattr(args, "once", False),
+                )
+            )
         except KeyboardInterrupt:
             print("Stopped.")
 

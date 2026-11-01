@@ -4,6 +4,7 @@ Native configurations use a harmless placeholder. Only this HTTPS transport adds
 the local credential, and it never persists headers, prompts or provider errors.
 """
 
+import asyncio
 import json
 import threading
 import time
@@ -30,6 +31,7 @@ class ReferenceTransport(httpx.BaseTransport):
         self.model, self.max_calls, self.max_tokens = model, max_calls, max_tokens
         self.delegate = delegate or httpx.HTTPTransport(retries=0)
         self.records = []
+        self.budget_exhausted = False
         self._lock = threading.Lock()
 
     def handle_request(self, request):
@@ -54,6 +56,7 @@ class ReferenceTransport(httpx.BaseTransport):
             raise ReferenceCallError("reference_request_denied") from None
         with self._lock:
             if len(self.records) >= self.max_calls:
+                self.budget_exhausted = True
                 raise ReferenceCallError("reference_call_budget")
             record = {
                 "status": "started",
@@ -115,3 +118,33 @@ class ReferenceTransport(httpx.BaseTransport):
 
     def close(self):
         self.delegate.close()
+
+
+class AsyncReferenceTransport(httpx.AsyncBaseTransport):
+    """Async SDK adapter sharing the synchronous transport's limits and call ledger."""
+
+    def __init__(self, key, **kwargs):
+        self._transport = ReferenceTransport(key, **kwargs)
+        self.records = self._transport.records
+
+    async def handle_async_request(self, request):
+        await request.aread()
+        response = await asyncio.to_thread(self._transport.handle_request, request)
+        try:
+            return httpx.Response(
+                response.status_code,
+                # read() already decoded the provider body. Do not decode it twice.
+                headers={
+                    name: value
+                    for name, value in response.headers.items()
+                    if name.lower()
+                    not in {"content-encoding", "content-length", "transfer-encoding"}
+                },
+                content=response.content,
+                extensions=response.extensions,
+            )
+        finally:
+            response.close()
+
+    async def aclose(self):
+        await asyncio.to_thread(self._transport.close)

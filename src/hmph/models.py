@@ -47,6 +47,7 @@ class Pair(Base):
     policy_revision: Mapped[int] = mapped_column(default=1)
     memory_epoch: Mapped[int] = mapped_column(default=1)
     next_memory_seq: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    next_framework_seq: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
 
 
 class Chat(Base):
@@ -241,8 +242,9 @@ class MemoryDeletion(Base):
     messages: Mapped[int] = mapped_column()
     turns: Mapped[int] = mapped_column()
     dialogue_states: Mapped[int] = mapped_column(default=0, server_default="0")
-    completed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+    framework_spaces: Mapped[int] = mapped_column(default=0, server_default="0")
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True).evaluates_none(), server_default=func.now()
     )
 
 
@@ -285,3 +287,77 @@ class DialogueTask(Base):
             "status IN ('pending','leased','idle','failed')", name="dialogue_task_status"
         ),
     )
+
+
+class MemoryBuild(Base):
+    __tablename__ = "memory_builds"
+    __table_args__ = (
+        UniqueConstraint("pair_id", "generation"),
+        CheckConstraint("backend IN ('mem0','graphiti')", name="memory_build_backend"),
+        CheckConstraint(
+            "status IN ('queued','building','ready','retired','failed')", name="memory_build_status"
+        ),
+        Index(
+            "one_ready_memory_build",
+            "pair_id",
+            "backend",
+            unique=True,
+            postgresql_where=text("status = 'ready'"),
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"), index=True)
+    generation: Mapped[int] = mapped_column(BigInteger)
+    memory_epoch: Mapped[int] = mapped_column()
+    backend: Mapped[str] = mapped_column(String(20))
+    backend_revision: Mapped[str] = mapped_column(String(40))
+    model: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    watermark: Mapped[int] = mapped_column(BigInteger)
+    source_count: Mapped[int] = mapped_column()
+    snapshot_digest: Mapped[str] = mapped_column(String(64))
+    fence: Mapped[int] = mapped_column(default=0)
+    attempts: Mapped[int] = mapped_column(default=0)
+    worker_id: Mapped[str | None] = mapped_column(String(100))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(60))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MemoryBuildSource(Base):
+    __tablename__ = "memory_build_sources"
+    build_id: Mapped[UUID] = mapped_column(ForeignKey("memory_builds.id"), primary_key=True)
+    message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+    message_revision: Mapped[int] = mapped_column()
+    source_order: Mapped[int] = mapped_column(BigInteger)
+
+
+class MemorySpace(Base):
+    __tablename__ = "memory_spaces"
+    __table_args__ = (
+        UniqueConstraint("build_id", "fence"),
+        CheckConstraint(
+            "status IN ('writing','ready','retired','cleaning','cleaned')",
+            name="memory_space_status",
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    build_id: Mapped[UUID] = mapped_column(ForeignKey("memory_builds.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="writing")
+    fence: Mapped[int] = mapped_column()
+    worker_id: Mapped[str] = mapped_column(String(100))
+    quiesced: Mapped[bool] = mapped_column(default=False)
+    cleanup_fence: Mapped[int] = mapped_column(default=0)
+    cleanup_attempts: Mapped[int] = mapped_column(default=0)
+    cleanup_worker_id: Mapped[str | None] = mapped_column(String(100))
+    cleanup_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(60))
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MemoryDeletionSpace(Base):
+    __tablename__ = "memory_deletion_spaces"
+    deletion_id: Mapped[UUID] = mapped_column(ForeignKey("memory_deletions.id"), primary_key=True)
+    space_id: Mapped[UUID] = mapped_column(ForeignKey("memory_spaces.id"), primary_key=True)

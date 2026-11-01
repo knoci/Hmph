@@ -58,3 +58,42 @@ async def test_api_requires_credentials_and_labels_fake_mode(conversation):
             denied = await client.post("/api/conversations", json={"request_id": "chat"})
             assert denied.status_code == 401
             assert (await client.get("/health")).json()["model_mode"] == "fake"
+
+
+async def test_framework_build_http_is_authenticated_idempotent_and_shadow_only(conversation):
+    from hmph.api import create_app
+    from hmph.config import Settings
+
+    settings = Settings(
+        api_token="test-only-token-at-least-32-characters",
+        request_digest_key="test-only-digest-key-at-least-32-characters",
+        _env_file=None,
+    )
+    app = create_app(settings, conversation=conversation)
+    async with app.router.lifespan_context(app):
+        identity = app.state.identity
+        chat = await conversation.create_chat(identity.owner_id, identity.character_id, "chat")
+        turn = await conversation.accept(identity.owner_id, chat.id, "fact", "我喜欢无糖茶。")
+        await conversation.cancel(identity.owner_id, turn.id, "cancel")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            assert (
+                await client.post("/api/memory-builds", json={"request_id": "build"})
+            ).status_code == 401
+            client.headers["Authorization"] = "Bearer test-only-token-at-least-32-characters"
+            body = {"request_id": "build", "backend": "mem0"}
+            created = await client.post("/api/memory-builds", json=body)
+            assert created.status_code == 202
+            build = created.json()
+            assert build["source_count"] == 1 and build["mode"] == "shadow"
+            assert "无糖茶" not in created.text
+            assert (await client.post("/api/memory-builds", json=body)).json()["id"] == build["id"]
+            assert (await client.get(f"/api/memory-builds/{build['id']}")).json()[
+                "status"
+            ] == "queued"
+            assert (await client.get(f"/api/memory-builds/{build['id']}/spaces")).json() == []
+            assert (await client.get("/api/memory-builds/current")).json() is None
+            assert (await client.get("/health")).json()[
+                "memory_status"
+            ] == "sourced_lexical_baseline"

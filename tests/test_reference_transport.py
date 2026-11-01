@@ -44,6 +44,33 @@ def test_reference_calls_keep_real_key_out_of_native_config_and_meter_each_attem
     assert "test-private-key-not-real" not in json.dumps(transport.records)
 
 
+async def test_async_reference_transport_forwards_a_compressed_provider_response_once():
+    import gzip
+
+    from hmph.reference_transport import AsyncReferenceTransport
+
+    payload = {
+        "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105},
+    }
+    transport = AsyncReferenceTransport(
+        SecretStr("fake-private-key"),
+        delegate=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                headers={"content-encoding": "gzip", "content-type": "application/json"},
+                content=gzip.compress(json.dumps(payload).encode()),
+            )
+        ),
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post(
+            "https://api.deepseek.com/chat/completions", json={"model": "deepseek-flash"}
+        )
+        assert response.json() == payload
+    assert transport.records[0]["usage"]["total_tokens"] == 105
+
+
 @pytest.mark.parametrize("status,choices", [(401, None), (200, []), (200, None)])
 def test_reference_provider_failures_are_sanitized_and_known_usage_survives(status, choices):
     from hmph.reference_transport import ReferenceCallError, ReferenceTransport
@@ -67,3 +94,49 @@ def test_reference_provider_failures_are_sanitized_and_known_usage_survives(stat
     assert transport.records[0]["status"] == "failed"
     if status == 200:
         assert transport.records[0]["usage"]["total_tokens"] == 105
+
+
+async def test_async_reference_calls_share_the_budget_and_keep_native_credentials_unchanged():
+    import asyncio
+
+    from hmph.reference_transport import AsyncReferenceTransport, ReferenceCallError
+
+    def endpoint(request):
+        assert request.headers["Authorization"] == "Bearer test-private-key-not-real"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105},
+            },
+        )
+
+    transport = AsyncReferenceTransport(
+        SecretStr("test-private-key-not-real"), max_calls=2, delegate=httpx.MockTransport(endpoint)
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        replies = await asyncio.gather(
+            *(
+                client.post(
+                    "https://api.deepseek.com/chat/completions",
+                    headers={"Authorization": "Bearer native-placeholder"},
+                    json={"model": "deepseek-flash"},
+                )
+                for _ in range(3)
+            ),
+            return_exceptions=True,
+        )
+        completed = [r for r in replies if isinstance(r, httpx.Response)]
+        assert len(completed) == 2
+        assert sum(isinstance(r, ReferenceCallError) for r in replies) == 1
+        assert all(r.json()["choices"][0]["message"]["content"] == "{}" for r in completed)
+        assert all(
+            r.request.headers["Authorization"] == "Bearer native-placeholder" for r in completed
+        )
+        with pytest.raises(ReferenceCallError, match="reference_destination_denied"):
+            await client.post(
+                "https://example.com/chat/completions", json={"model": "deepseek-flash"}
+            )
+    assert len(transport.records) == 2
+    assert sum(r["usage"]["total_tokens"] for r in transport.records) == 210
+    assert "test-private-key-not-real" not in json.dumps(transport.records)

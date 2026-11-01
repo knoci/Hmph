@@ -2,7 +2,7 @@ import asyncio
 import hmac
 import time
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, Query, Request
@@ -17,6 +17,7 @@ from hmph.conversation import DEFAULT_CHARACTER, Conversation
 from hmph.database import Database
 from hmph.dialogue import Dialogue
 from hmph.memory import Memory
+from hmph.memory_builds import MemoryBuilds
 
 
 class WriteBody(BaseModel):
@@ -33,6 +34,11 @@ class CreateTurn(WriteBody):
 
 class ForgetMemory(WriteBody):
     expected_revision: int = Field(ge=1)
+
+
+class CreateMemoryBuild(WriteBody):
+    character_id: UUID = DEFAULT_CHARACTER
+    backend: Literal["mem0"] = "mem0"
 
 
 def create_app(settings: Settings | None = None, *, conversation: Conversation | None = None):
@@ -65,6 +71,7 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
         source_timezone=conversation.source_timezone,
     )
     dialogue = Dialogue(conversation.db)
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
     security = HTTPBearer(auto_error=False)
 
     async def require_owner(
@@ -95,6 +102,7 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             "short_term_status": "grounded_watermark",
             "working_memory_status": "bounded_slots_and_raw_lookup",
             "semantic_retrieval": "evaluation_only",
+            "framework_memory": "mem0_shadow_builds",
             "output_guard": "full_response"
             if settings.model_mode == "deepseek"
             else "fixture_whitelist",
@@ -160,6 +168,40 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
         if query is not None:
             return await memory.recall(owner_id, character_id, query)
         return await memory.entries(owner_id, character_id)
+
+    @app.post("/api/memory-builds", status_code=202)
+    async def request_memory_build(
+        body: CreateMemoryBuild, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await builds.request(
+            owner_id,
+            body.character_id,
+            body.request_id,
+            backend=body.backend,
+            model=settings.deepseek_model,
+        )
+
+    @app.get("/api/memory-builds/current")
+    async def current_memory_build(
+        owner_id: Annotated[UUID, Depends(require_owner)],
+        character_id: UUID = DEFAULT_CHARACTER,
+        backend: Literal["mem0"] = "mem0",
+    ):
+        return await builds.current(owner_id, character_id, backend=backend)
+
+    @app.get("/api/memory-builds/{build_id}")
+    async def memory_build(build_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
+        return await builds.get(owner_id, build_id)
+
+    @app.get("/api/memory-builds/{build_id}/spaces")
+    async def memory_build_spaces(
+        build_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await builds.spaces(owner_id, build_id)
+
+    @app.get("/api/memory-deletions/{deletion_id}")
+    async def memory_deletion(deletion_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
+        return await memory.deletion(owner_id, deletion_id)
 
     @app.get("/api/memories/{memory_id}/history")
     async def memory_history(memory_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):

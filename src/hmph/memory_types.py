@@ -68,6 +68,7 @@ class ForgetPreview(BaseModel):
     messages: int
     turns: int
     dialogue_states: int = 0
+    framework_spaces: int = 0
     deletion_mode: Literal["whole_message_and_derived_replies"] = (
         "whole_message_and_derived_replies"
     )
@@ -77,12 +78,13 @@ class DeletionReceipt(BaseModel):
     model_config = ConfigDict(from_attributes=True, frozen=True)
     id: UUID
     memory_id: UUID
-    status: Literal["completed"]
+    status: Literal["completed", "pending_cleanup"]
     memories: int
     messages: int
     turns: int
     dialogue_states: int = 0
-    completed_at: datetime
+    framework_spaces: int = 0
+    completed_at: datetime | None
 
 
 class MemoryTaskView(BaseModel):
