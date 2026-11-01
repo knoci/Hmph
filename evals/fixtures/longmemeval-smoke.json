@@ -1,0 +1,38 @@
+[
+  {
+    "question_id": "synthetic-update-01",
+    "question_type": "knowledge-update",
+    "question": "我现在在哪家公司工作？",
+    "question_date": "2026/11/01",
+    "answer": "B 公司",
+    "answer_session_ids": ["source-new-job"],
+    "haystack_session_ids": ["source-old-job", "source-new-job"],
+    "haystack_dates": ["2026/09/01", "2026/10/31"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "我在 A 公司工作。"}],
+      [{"role": "user", "content": "我已经离开 A 公司，现在在 B 公司。", "has_answer": true}]
+    ]
+  },
+  {
+    "question_id": "synthetic-missing-02_abs",
+    "question_type": "single-session-user",
+    "question": "我的生日是哪天？",
+    "question_date": "2026/11/01",
+    "answer": "记录中没有生日信息。",
+    "answer_session_ids": [],
+    "haystack_session_ids": ["source-hobby"],
+    "haystack_dates": ["2026/10/30"],
+    "haystack_sessions": [[{"role": "user", "content": "最近喜欢喝茶。"}]]
+  },
+  {
+    "question_id": "synthetic-time-03",
+    "question_type": "temporal-reasoning",
+    "question": "我说的面试安排在哪一天？",
+    "question_date": "2026/11/01",
+    "answer": "2026 年 11 月 2 日",
+    "answer_session_ids": ["source-interview"],
+    "haystack_session_ids": ["source-interview"],
+    "haystack_dates": ["2026/10/31"],
+    "haystack_sessions": [[{"role": "user", "content": "面试安排在后天。", "has_answer": true}]]
+  }
+]

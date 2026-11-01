@@ -1,0 +1,20 @@
+name: hmph
+services:
+  db:
+    image: pgvector/pgvector:0.8.1-pg16@sha256:33198da2828a14c30348d2ccb4750833d5ed9a44c88d840a0e523d7417120337
+    environment:
+      POSTGRES_USER: hmph
+      POSTGRES_PASSWORD: hmph_local_only
+      POSTGRES_DB: hmph
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - hmph_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hmph -d hmph"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  hmph_db:
+
