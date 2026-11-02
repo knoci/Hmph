@@ -2,6 +2,35 @@ from hmph.model_gateway import FakeModel
 from hmph.worker import Worker
 
 
+async def test_retired_supervised_attempt_cannot_register_a_late_child(conversation):
+    from uuid import uuid4
+
+    import pytest
+
+    from hmph.contracts import DomainError
+    from hmph.memory_build_types import WriterIdentity
+    from hmph.memory_builds import MemoryBuilds
+
+    identity = await conversation.bootstrap()
+    await say(conversation, identity, "我叫小沐。", "name")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    await builds.request(identity.owner_id, identity.character_id, "old", backend="mem0")
+    lease = await builds.claim("old-supervisor", backend="mem0")
+    reserved = WriterIdentity(host_id="a" * 64, boot_time=100, execution_id=uuid4())
+    await builds.reserve_execution(lease, reserved)
+    with pytest.raises(DomainError, match="framework_stop_proof_required"):
+        await builds.quiesce(lease)
+    await builds.request(identity.owner_id, identity.character_id, "new", backend="mem0")
+    await builds.confirm_execution_stopped(lease, reserved)
+    with pytest.raises(DomainError, match="stale_framework_lease"):
+        await builds.start_execution(
+            lease, reserved, reserved.model_copy(update={"pid": 1234, "started_at": 110})
+        )
+    assert not await builds.publish(lease)
+    new = await builds.claim("new-supervisor", backend="mem0")
+    assert new.space_id != lease.space_id
+
+
 async def say(conversation, identity, text, request_id):
     chat = await conversation.create_chat(identity.owner_id, identity.character_id, request_id)
     turn = await conversation.accept(identity.owner_id, chat.id, request_id, text)

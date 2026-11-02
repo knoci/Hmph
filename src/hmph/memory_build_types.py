@@ -68,6 +68,18 @@ class SpaceView(BaseModel):
     error_code: str | None
     usage: dict | None
     cleaned_at: datetime | None
+    execution: dict | None = None
+    stop_proof: str | None = None
+
+
+class WriterIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    protocol: Literal["mem0-spawn-v1"] = "mem0-spawn-v1"
+    host_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    boot_time: float
+    execution_id: UUID
+    pid: int | None = Field(default=None, gt=0)
+    started_at: float | None = None
 
 
 class CleanupLease(BaseModel):

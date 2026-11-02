@@ -5,9 +5,11 @@ generated PG schema and one directory; cleanup verifies both are absent.
 """
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
+import time
 from importlib.metadata import version
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -18,6 +20,33 @@ import httpx
 from hmph.mem0_reference import EMBEDDING_MODEL, MEM0_REVISION, PLACEHOLDER
 from hmph.memory_build_types import BuildUsage, CleanupProof, FrameworkBuildError
 from hmph.reference_transport import ReferenceTransport
+
+
+def validate_extraction(payload):
+    """Validate the pinned native writer's protocol before its forgiving parser.
+
+    Keep its JSON/code-fence parsing, but distinguish an explicit empty memory
+    list from malformed output. No extraction or update algorithm is replaced.
+    """
+    from mem0.memory.utils import extract_json, remove_code_blocks
+
+    choices = payload["choices"]
+    if len(choices) != 1:
+        raise ValueError("Invalid extraction response")
+    content = remove_code_blocks(choices[0]["message"]["content"])
+    try:
+        data = json.loads(content, strict=False)
+    except json.JSONDecodeError:
+        data = json.loads(extract_json(content), strict=False)
+    if not isinstance(data, dict) or not isinstance(data.get("memory"), list):
+        raise ValueError("Invalid extraction response")
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("text"), str)
+        or not item["text"].strip()
+        for item in data["memory"]
+    ):
+        raise ValueError("Invalid extraction response")
 
 
 class Mem0Backend:
@@ -46,7 +75,7 @@ class Mem0Backend:
         ).strip()
         if (
             revision != MEM0_REVISION
-            or subprocess.run(["git", "-C", str(repo), "diff", "--quiet"]).returncode
+            or subprocess.run(["git", "-C", str(repo), "diff", "HEAD", "--quiet"]).returncode
         ):
             raise RuntimeError("Native Mem0 checkout must match the unmodified pinned revision")
         self.key, self.max_calls, self.delegate = key, max_calls, delegate
@@ -78,9 +107,10 @@ class Mem0Backend:
         from psycopg import sql
         from psycopg.conninfo import make_conninfo
 
-        with psycopg.connect(self.database_url, autocommit=True, connect_timeout=5) as admin:
+        writer_connection = make_conninfo(self.database_url, application_name=schema)
+        with psycopg.connect(writer_connection, autocommit=True, connect_timeout=5) as admin:
             admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-        connection = make_conninfo(self.database_url, options=f"-csearch_path={schema},public")
+        connection = make_conninfo(writer_connection, options=f"-csearch_path={schema},public")
         http = httpx.Client(
             transport=transport, timeout=30, follow_redirects=False, trust_env=False
         )
@@ -133,9 +163,12 @@ class Mem0Backend:
         try:
             native.close()
         finally:
-            for store in (native.vector_store, getattr(native, "_entity_store", None)):
-                if store is not None:
-                    store.connection_pool.close()
+            try:
+                for store in (native.vector_store, getattr(native, "_entity_store", None)):
+                    if store is not None:
+                        store.connection_pool.close()
+            finally:
+                native.llm.client.close()
 
     async def build(self, lease, checkpoint):
         self.usage = BuildUsage(
@@ -148,7 +181,11 @@ class Mem0Backend:
         if lease.backend_revision != MEM0_REVISION or lease.backend != self.backend:
             raise FrameworkBuildError("build_failed", retryable=False)
         transport = ReferenceTransport(
-            self.key, model=lease.model, max_calls=self.max_calls, delegate=self.delegate
+            self.key,
+            model=lease.model,
+            max_calls=self.max_calls,
+            delegate=self.delegate,
+            response_validator=validate_extraction,
         )
         native = None
         processed, changes = 0, 0
@@ -177,6 +214,8 @@ class Mem0Backend:
         except Exception:
             if transport.budget_exhausted:
                 raise FrameworkBuildError("call_budget", retryable=False) from None
+            if any(r.get("error_code") == "reference_invalid_output" for r in transport.records):
+                raise FrameworkBuildError("provider_failed", retryable=False) from None
             raise
         finally:
             try:
@@ -221,3 +260,36 @@ class Mem0Backend:
         if lease.backend != self.backend:
             raise ValueError("Framework cleanup backend mismatch")
         return await asyncio.to_thread(self._purge, lease)
+
+    def _drain_writes(self, lease):
+        import psycopg
+
+        application, _ = self._location(lease.space_id)
+        with psycopg.connect(
+            self.database_url,
+            autocommit=True,
+            connect_timeout=5,
+            options="-cstatement_timeout=5000",
+        ) as admin:
+            until = time.monotonic() + 5
+            while True:
+                active = admin.execute(
+                    "SELECT pid FROM pg_stat_activity "
+                    "WHERE application_name=%s AND pid<>pg_backend_pid()",
+                    (application,),
+                ).fetchall()
+                if not active:
+                    return
+                admin.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE application_name=%s AND pid<>pg_backend_pid()",
+                    (application,),
+                ).fetchall()
+                if time.monotonic() >= until:
+                    raise RuntimeError("Framework database writes did not stop")
+                time.sleep(0.02)
+
+    async def drain_writes(self, lease):
+        if lease.backend != self.backend:
+            raise ValueError("Framework backend mismatch")
+        await asyncio.to_thread(self._drain_writes, lease)

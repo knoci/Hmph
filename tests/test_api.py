@@ -97,3 +97,35 @@ async def test_framework_build_http_is_authenticated_idempotent_and_shadow_only(
             assert (await client.get("/health")).json()[
                 "memory_status"
             ] == "sourced_lexical_baseline"
+
+
+async def test_readiness_rejects_outdated_or_missing_configured_schema_version(conversation):
+    from sqlalchemy import text
+
+    from hmph.api import create_app
+    from hmph.config import Settings
+
+    app = create_app(
+        Settings(
+            api_token="test-only-token-at-least-32-characters",
+            request_digest_key="test-only-digest-key-at-least-32-characters",
+            _env_file=None,
+        ),
+        conversation=conversation,
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            assert (await client.get("/ready")).status_code == 200
+            # Fault injection touches only this test's schema.
+            async with conversation.db.engine.begin() as connection:
+                await connection.execute(text("UPDATE alembic_version SET version_num='0007'"))
+            outdated = await client.get("/ready")
+            assert outdated.status_code == 503
+            assert outdated.json()["status"] == "database_migration_required"
+            async with conversation.db.engine.begin() as connection:
+                await connection.execute(
+                    text(f'DROP TABLE "{conversation.db.schema}".alembic_version')
+                )
+            assert (await client.get("/ready")).status_code == 503

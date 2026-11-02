@@ -9,7 +9,6 @@ from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import text
 
 from hmph.config import Settings
 from hmph.contracts import TERMINAL, DomainError
@@ -111,8 +110,10 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     @app.get("/ready")
     async def ready():
         try:
-            async with conversation.db.sessions() as session:
-                await session.execute(text("SELECT 1 FROM alembic_version LIMIT 1"))
+            if not await conversation.db.is_current():
+                return JSONResponse(
+                    status_code=503, content={"status": "database_migration_required"}
+                )
         except Exception:
             return JSONResponse(status_code=503, content={"status": "database_unavailable"})
         return {"status": "ready", "model_mode": settings.model_mode}

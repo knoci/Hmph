@@ -39,6 +39,7 @@ async def run_database_command(name, *, max_calls=64, once=False):
             )
             await conversation.bootstrap()
             if name == "framework-worker":
+                from hmph.framework_process import ProcessBackend
                 from hmph.framework_worker import FrameworkWorker
                 from hmph.mem0_backend import Mem0Backend
                 from hmph.memory_builds import MemoryBuilds
@@ -50,9 +51,8 @@ async def run_database_command(name, *, max_calls=64, once=False):
                     database_url=settings.database_url.get_secret_value(),
                     max_calls=max_calls,
                 )
-                worker = FrameworkWorker(
-                    MemoryBuilds(database, digest_key=conversation.digest_key), backend
-                )
+                builds = MemoryBuilds(database, digest_key=conversation.digest_key)
+                worker = FrameworkWorker(builds, ProcessBackend(builds, backend))
                 print("Mem0 shadow worker running; requested builds may call DeepSeek.")
                 if once:
                     await worker.run_once()

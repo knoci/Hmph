@@ -144,6 +144,58 @@ async def test_exhausted_native_call_budget_does_not_repeat_paid_builds(
     assert not await builds.current(identity.owner_id, identity.character_id, backend="mem0")
 
 
+@pytest.mark.parametrize("content", ["not-json", "{}", '{"memory":[{"text":42}]}'])
+async def test_invalid_native_extraction_never_publishes_an_empty_ready_build(
+    conversation, native_backend, content
+):
+    from hmph.framework_worker import FrameworkWorker
+    from hmph.memory_builds import MemoryBuilds
+
+    identity, _, _ = await seed(conversation)
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    requested = await builds.request(
+        identity.owner_id, identity.character_id, "build", backend="mem0"
+    )
+
+    def endpoint(_):
+        payload = response().json()
+        payload["choices"][0]["message"]["content"] = content
+        return httpx.Response(200, json=payload)
+
+    backend = native_backend(endpoint)
+    await FrameworkWorker(builds, backend).run_once()
+    result = await builds.get(identity.owner_id, requested.id)
+    assert result.status == "failed" and result.error_code == "provider_failed"
+    assert not await builds.current(identity.owner_id, identity.character_id, backend="mem0")
+    space = (await builds.spaces(identity.owner_id, requested.id))[0]
+    assert space.quiesced and space.usage["reported_tokens"] == 120
+    assert space.usage["processed_sources"] == 0
+    assert not await builds.claim("paid-retry", backend="mem0")
+    await FrameworkWorker(builds, backend).run_once()
+    assert (await builds.spaces(identity.owner_id, requested.id))[0].status == "cleaned"
+
+
+async def test_explicit_empty_native_extraction_is_a_valid_build(conversation, native_backend):
+    from hmph.framework_worker import FrameworkWorker
+    from hmph.memory_builds import MemoryBuilds
+
+    identity, _, _ = await seed(conversation)
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    requested = await builds.request(
+        identity.owner_id, identity.character_id, "empty", backend="mem0"
+    )
+
+    def endpoint(_):
+        payload = response().json()
+        payload["choices"][0]["message"]["content"] = '```json\n{"memory": []}\n```'
+        return httpx.Response(200, json=payload)
+
+    await FrameworkWorker(builds, native_backend(endpoint)).run_once()
+    assert (await builds.get(identity.owner_id, requested.id)).status == "ready"
+    space = (await builds.spaces(identity.owner_id, requested.id))[0]
+    assert space.usage["processed_sources"] == 1 and space.usage["native_changes"] == 0
+
+
 async def test_cancelling_a_native_writer_waits_for_the_thread_before_cleanup(
     conversation, native_backend
 ):

@@ -3,6 +3,8 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
@@ -21,10 +23,25 @@ class Database:
         )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
 
+    @staticmethod
+    def _migration_config():
+        config = Config()
+        config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
+        return config
+
+    async def is_current(self):
+        """Check this schema's version, never a search_path fallback's version."""
+        expected = set(ScriptDirectory.from_config(self._migration_config()).get_heads())
+        async with self.sessions() as session:
+            table = f'"{self.schema}".alembic_version'
+            if await session.scalar(text("SELECT to_regclass(:table)"), {"table": table}) is None:
+                return False
+            versions = set(await session.scalars(text(f"SELECT version_num FROM {table}")))
+            return versions == expected
+
     async def migrate(self):
         def upgrade(connection):
-            config = Config()
-            config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
+            config = self._migration_config()
             config.attributes["connection"] = connection
             config.attributes["schema"] = self.schema
             command.upgrade(config, "head")

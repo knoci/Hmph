@@ -348,6 +348,8 @@ class MemorySpace(Base):
     fence: Mapped[int] = mapped_column()
     worker_id: Mapped[str] = mapped_column(String(100))
     quiesced: Mapped[bool] = mapped_column(default=False)
+    execution: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    stop_proof: Mapped[str | None] = mapped_column(String(60))
     cleanup_fence: Mapped[int] = mapped_column(default=0)
     cleanup_attempts: Mapped[int] = mapped_column(default=0)
     cleanup_worker_id: Mapped[str | None] = mapped_column(String(100))

@@ -8,6 +8,27 @@ from hmph.conversation import Conversation
 from hmph.database import Database
 
 
+async def test_bootstrap_refuses_a_missing_schema_instead_of_writing_to_fallback(conversation):
+    import pytest
+
+    from hmph.contracts import DomainError
+
+    database = Database(conversation.db.url, schema="missing_" + uuid4().hex)
+
+    @event.listens_for(database.engine.sync_engine, "connect")
+    def configure_search_path(connection, record):
+        cursor = connection.cursor()
+        cursor.execute(f'SET search_path TO "{database.schema}", "{conversation.db.schema}"')
+        cursor.close()
+
+    try:
+        service = Conversation(database, digest_key=b"test-only-digest-key")
+        with pytest.raises(DomainError, match="database_migration_required"):
+            await service.bootstrap()
+    finally:
+        await database.close()
+
+
 async def test_empty_schema_is_migrated_even_if_search_path_contains_another_version_table():
     url = os.getenv(
         "HMPH_TEST_DATABASE_URL", "postgresql+asyncpg://hmph:hmph_local_only@127.0.0.1:54329/hmph"

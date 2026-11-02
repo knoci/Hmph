@@ -1,0 +1,691 @@
+{
+  "schema_version": "hmph-framework-selection-v1",
+  "split": "development",
+  "cases": [
+    {
+      "id": "case-001",
+      "category": "current_update",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "I work at Alder Labs."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "On 20 October 2026 I left Alder Labs and started working at Lumen Works. Lumen Works is my current employer."
+        }
+      ],
+      "query": {
+        "question": "What is my current employer as of 1 November 2026?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Lumen Works",
+        "aliases": [],
+        "evidence_sources": [
+          "s002"
+        ],
+        "rationale": "第二条明确离开旧雇主并说明当前雇主。"
+      }
+    },
+    {
+      "id": "case-002",
+      "category": "current_update",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My home is in Boston."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "On 20 October 2026 I moved from Boston to Austin. I now live in Austin."
+        }
+      ],
+      "query": {
+        "question": "Which city do I currently live in as of 1 November 2026?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Austin",
+        "aliases": [],
+        "evidence_sources": [
+          "s002"
+        ],
+        "rationale": "第二条是已发生的搬家，不是旅行或计划。"
+      }
+    },
+    {
+      "id": "case-003",
+      "category": "current_update",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "Please call me Alex."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "I have changed my preferred name. From now on please call me Sasha instead of Alex."
+        }
+      ],
+      "query": {
+        "question": "What name should you call me now?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Sasha",
+        "aliases": [],
+        "evidence_sources": [
+          "s002"
+        ],
+        "rationale": "明确称呼指令覆盖旧称呼。"
+      }
+    },
+    {
+      "id": "case-004",
+      "category": "late_history",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "Since February 2026 I have worked at Harbor Analytics, and I still work there."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "Looking back at 2022: I worked at Pine Studio then. I am describing my old job, not a job change now."
+        }
+      ],
+      "query": {
+        "question": "What is my current employer as of 1 November 2026?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Harbor Analytics",
+        "aliases": [],
+        "evidence_sources": [
+          "s001",
+          "s002"
+        ],
+        "rationale": "晚到消息明确回顾 2022 年，不能覆盖 2026 年当前工作。"
+      }
+    },
+    {
+      "id": "case-005",
+      "category": "late_history",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "I moved to Taipei in January 2026 and Taipei remains my home."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "A memory from 2019: I lived in Osaka that year. This is about my past, not where I live now."
+        }
+      ],
+      "query": {
+        "question": "Which city is my current home as of 1 November 2026?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Taipei",
+        "aliases": [],
+        "evidence_sources": [
+          "s001",
+          "s002"
+        ],
+        "rationale": "2019 年居住经历虽后记录，当前住处仍为台北。"
+      }
+    },
+    {
+      "id": "case-006",
+      "category": "late_history",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My current main instrument is the cello. I switched to it in 2024."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "In 2015 my main instrument was the violin. I am recalling my school days, not changing my current instrument."
+        }
+      ],
+      "query": {
+        "question": "What is my current main instrument?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "cello",
+        "aliases": [
+          "the cello"
+        ],
+        "evidence_sources": [
+          "s001",
+          "s002"
+        ],
+        "rationale": "旧学校经历不改写当前乐器。"
+      }
+    },
+    {
+      "id": "case-007",
+      "category": "relative_time",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-14T09:00:00+00:00",
+          "content": "Yesterday I attended my appointment with the bicycle mechanic."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-22T09:00:00+00:00",
+          "content": "My bicycle is running smoothly now."
+        }
+      ],
+      "query": {
+        "question": "On which date did I attend the bicycle mechanic appointment? Reply YYYY-MM-DD.",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "2026-10-13",
+        "aliases": [],
+        "evidence_sources": [
+          "s001"
+        ],
+        "rationale": "yesterday 相对来源 10 月 14 日解释，而非查询或运行日期。"
+      }
+    },
+    {
+      "id": "case-008",
+      "category": "relative_time",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-12-31T09:00:00+00:00",
+          "content": "My pottery workshop is tomorrow."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2027-01-03T09:00:00+00:00",
+          "content": "I enjoyed the pottery workshop and kept the bowl I made there."
+        }
+      ],
+      "query": {
+        "question": "On which date was my pottery workshop? Reply YYYY-MM-DD.",
+        "timestamp": "2027-01-10T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "2027-01-01",
+        "aliases": [],
+        "evidence_sources": [
+          "s001"
+        ],
+        "rationale": "tomorrow 相对 12 月 31 日跨年，第二条确认已经参加但不改日期。"
+      }
+    },
+    {
+      "id": "case-009",
+      "category": "relative_time",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-03-01T09:00:00+00:00",
+          "content": "Last month I visited Bergen for a photography exhibition."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-04-12T09:00:00+00:00",
+          "content": "I have finished editing the photographs from my Bergen trip."
+        }
+      ],
+      "query": {
+        "question": "In which month did I visit Bergen for the exhibition? Reply YYYY-MM.",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "2026-02",
+        "aliases": [],
+        "evidence_sources": [
+          "s001"
+        ],
+        "rationale": "last month 相对 3 月 1 日，保留月份精度，不能伪造某一天。"
+      }
+    },
+    {
+      "id": "case-010",
+      "category": "same_name",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My brother Jordan lives in Denver."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "My coworker Jordan lives in Miami. My coworker and my brother are two different people."
+        }
+      ],
+      "query": {
+        "question": "Where does my brother Jordan live?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Denver",
+        "aliases": [],
+        "evidence_sources": [
+          "s001"
+        ],
+        "rationale": "同名兄弟和同事必须区分，不能拿后说的同事地址覆盖兄弟。"
+      }
+    },
+    {
+      "id": "case-011",
+      "category": "same_name",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My dentist Chris likes the cafe Copper Cup."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "My roommate Chris, who is not my dentist, says their favorite cafe is Willow Cafe."
+        }
+      ],
+      "query": {
+        "question": "What is my roommate Chris's favorite cafe?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Willow Cafe",
+        "aliases": [
+          "Willow Café"
+        ],
+        "evidence_sources": [
+          "s002"
+        ],
+        "rationale": "同名牙医和室友有不同身份，询问室友。"
+      }
+    },
+    {
+      "id": "case-012",
+      "category": "same_name",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My cousin Sam has a cat named Pixel."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "My coworker Sam has a cat named Mochi. My coworker Sam is not my cousin."
+        }
+      ],
+      "query": {
+        "question": "What is the name of my cousin Sam's cat?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Pixel",
+        "aliases": [],
+        "evidence_sources": [
+          "s001"
+        ],
+        "rationale": "同名堂表亲与同事的宠物不同。"
+      }
+    },
+    {
+      "id": "case-013",
+      "category": "negation_hypothetical",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "I do not eat peanuts; I choose almonds instead."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "I bought a packet of almonds for my train journey."
+        }
+      ],
+      "query": {
+        "question": "Which food did I explicitly say I do not eat?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "peanuts",
+        "aliases": [],
+        "evidence_sources": [
+          "s001"
+        ],
+        "rationale": "否定范围是花生，不得反向提取成偏好花生，也不推断过敏。"
+      }
+    },
+    {
+      "id": "case-014",
+      "category": "negation_hypothetical",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "If I moved to Lisbon, I would rent near the river. This is only a hypothetical idea; I have not moved."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "I still live in Porto. Porto is my actual home."
+        }
+      ],
+      "query": {
+        "question": "Which city do I actually live in now?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Porto",
+        "aliases": [],
+        "evidence_sources": [
+          "s001",
+          "s002"
+        ],
+        "rationale": "假设中的里斯本不是已发生搬家，真实居住地明确为波尔图。"
+      }
+    },
+    {
+      "id": "case-015",
+      "category": "negation_hypothetical",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My friend Leah said, \"I love jazz.\" That statement describes Leah's taste, not mine."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "I personally prefer ambient music when I relax."
+        }
+      ],
+      "query": {
+        "question": "Which type of music did I say I personally prefer for relaxing?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "ambient music",
+        "aliases": [
+          "ambient"
+        ],
+        "evidence_sources": [
+          "s002"
+        ],
+        "rationale": "引用中的 jazz 属于朋友，用户明确偏好 ambient music。"
+      }
+    },
+    {
+      "id": "case-016",
+      "category": "two_hop",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My colleague Nora works at Beacon Design."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "Beacon Design has its headquarters in Bristol."
+        }
+      ],
+      "query": {
+        "question": "In which city is the headquarters of the company where my colleague Nora works?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Bristol",
+        "aliases": [],
+        "evidence_sources": [
+          "s001",
+          "s002"
+        ],
+        "rationale": "Nora → Beacon Design → Bristol，两条来源共同支持。"
+      }
+    },
+    {
+      "id": "case-017",
+      "category": "two_hop",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "My hiking partner is Ezra."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "Ezra has a dog named Poppy."
+        }
+      ],
+      "query": {
+        "question": "What is the name of my hiking partner's dog?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "Poppy",
+        "aliases": [],
+        "evidence_sources": [
+          "s001",
+          "s002"
+        ],
+        "rationale": "hiking partner → Ezra → Poppy，不能仅凭后条称已完整支持角色关系。"
+      }
+    },
+    {
+      "id": "case-018",
+      "category": "two_hop",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "I bought my reading lamp from Tern Market."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "Tern Market is located at 18 Quay Road."
+        }
+      ],
+      "query": {
+        "question": "What is the street address of the shop where I bought my reading lamp?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "18 Quay Road",
+        "aliases": [],
+        "evidence_sources": [
+          "s001",
+          "s002"
+        ],
+        "rationale": "reading lamp → Tern Market → 地址。"
+      }
+    },
+    {
+      "id": "case-019",
+      "category": "abstention",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "I enjoy cycling along the canal."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "My favorite color is teal."
+        }
+      ],
+      "query": {
+        "question": "What is my birthday?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": null,
+        "aliases": [],
+        "evidence_sources": [],
+        "rationale": "历史没有生日，爱好和颜色不支持推断。"
+      }
+    },
+    {
+      "id": "case-020",
+      "category": "abstention",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "I bake sourdough bread on weekends."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "My friend Priya works at Quartz Studio."
+        }
+      ],
+      "query": {
+        "question": "What company employs me?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": null,
+        "aliases": [],
+        "evidence_sources": [],
+        "rationale": "只说朋友的雇主，不能把朋友工作归给用户。"
+      }
+    },
+    {
+      "id": "case-021",
+      "category": "abstention",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "I have a cat, but I have not told you its name."
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "My neighbor has a dog named Fable."
+        }
+      ],
+      "query": {
+        "question": "What is my cat's name?",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": null,
+        "aliases": [],
+        "evidence_sources": [],
+        "rationale": "用户猫名未提供，邻居狗名不能填补缺口。"
+      }
+    },
+    {
+      "id": "case-022",
+      "category": "chinese",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "我以前最常喝无糖豆浆。"
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "最近我改喝冷泡乌龙茶了，现在我最常喝的是冷泡乌龙茶。"
+        }
+      ],
+      "query": {
+        "question": "我现在最常喝什么？",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "冷泡乌龙茶",
+        "aliases": [],
+        "evidence_sources": [
+          "s002"
+        ],
+        "rationale": "明确更新当前饮品，保留完整中文限定词。"
+      }
+    },
+    {
+      "id": "case-023",
+      "category": "chinese",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-02-15T09:00:00+00:00",
+          "content": "这个月我去北京旅行了。"
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-08-10T09:00:00+00:00",
+          "content": "八月这趟旅行我去了成都，和二月那次不是同一趟。"
+        }
+      ],
+      "query": {
+        "question": "我在二月那趟旅行去了哪座城市？",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "北京",
+        "aliases": [
+          "北京市"
+        ],
+        "evidence_sources": [
+          "s001"
+        ],
+        "rationale": "二月来源相对“这个月”定位二月，北京与八月成都为不同事件。"
+      }
+    },
+    {
+      "id": "case-024",
+      "category": "chinese",
+      "history": [
+        {
+          "source_id": "s001",
+          "observed_at": "2026-10-01T09:00:00+00:00",
+          "content": "我遇到烦心事时，以前会希望你先给建议。"
+        },
+        {
+          "source_id": "s002",
+          "observed_at": "2026-10-20T09:00:00+00:00",
+          "content": "我调整一下偏好：现在我难过时，请先听我说，不要一上来就给解决方案。"
+        }
+      ],
+      "query": {
+        "question": "按我现在的偏好，我难过时你应该先做什么？请用一个简短词语回答。",
+        "timestamp": "2026-11-01T09:00:00+00:00"
+      },
+      "gold": {
+        "answer": "倾听",
+        "aliases": [
+          "先倾听",
+          "先听我说",
+          "听我说"
+        ],
+        "evidence_sources": [
+          "s002"
+        ],
+        "rationale": "明确表达偏好更新为先倾听，不能继续沿用先给建议。"
+      }
+    }
+  ]
+}

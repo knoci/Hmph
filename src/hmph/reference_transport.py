@@ -26,10 +26,12 @@ class ReferenceTransport(httpx.BaseTransport):
         max_calls=12,
         max_tokens=1024,
         delegate=None,
+        response_validator=None,
     ):
         self._key = key
         self.model, self.max_calls, self.max_tokens = model, max_calls, max_tokens
         self.delegate = delegate or httpx.HTTPTransport(retries=0)
+        self.response_validator = response_validator
         self.records = []
         self.budget_exhausted = False
         self._lock = threading.Lock()
@@ -103,6 +105,12 @@ class ReferenceTransport(httpx.BaseTransport):
             ):
                 response.close()
                 raise ReferenceCallError("reference_incomplete_output")
+            if self.response_validator is not None:
+                try:
+                    self.response_validator(payload)
+                except Exception:
+                    response.close()
+                    raise ReferenceCallError("reference_invalid_output") from None
             record["status"] = "completed"
             return response
         except Exception as error:

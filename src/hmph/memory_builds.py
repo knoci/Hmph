@@ -19,6 +19,7 @@ from hmph.memory_build_types import (
     BuildView,
     CleanupLease,
     SpaceView,
+    WriterIdentity,
 )
 from hmph.models import (
     MemoryBuild,
@@ -359,9 +360,124 @@ class MemoryBuilds:
                 or space.worker_id != lease.worker_id
             ):
                 raise DomainError("stale_framework_lease")
+            if space.execution is not None:
+                raise DomainError("framework_stop_proof_required")
             space.quiesced = True
             if usage is not None:
                 space.usage = BuildUsage.model_validate(usage).model_dump()
+
+    async def reserve_execution(self, lease, identity):
+        async with self.db.sessions.begin() as session:
+            _, _, space, _ = await self._lease(session, lease)
+            if space.execution is not None or space.quiesced or identity.pid is not None:
+                raise DomainError("framework_execution_conflict")
+            space.execution = identity.model_dump(mode="json")
+
+    async def start_execution(self, lease, reserved, running):
+        async with self.db.sessions.begin() as session:
+            _, _, space, _ = await self._lease(session, lease)
+            if (
+                space.quiesced
+                or space.execution != reserved.model_dump(mode="json")
+                or running.model_copy(update={"pid": None, "started_at": None}) != reserved
+                or running.pid is None
+                or running.started_at is None
+            ):
+                raise DomainError("framework_execution_conflict")
+            space.execution = running.model_dump(mode="json")
+
+    async def execution(self, lease):
+        async with self.db.sessions() as session:
+            space = await session.get(MemorySpace, lease.space_id)
+            if (
+                space is None
+                or space.build_id != lease.build_id
+                or space.fence != lease.fence
+                or space.worker_id != lease.worker_id
+            ):
+                raise DomainError("stale_framework_lease")
+            return WriterIdentity.model_validate(space.execution) if space.execution else None
+
+    async def validate_execution(self, lease, running):
+        async with self.db.sessions.begin() as session:
+            _, _, space, _ = await self._lease(session, lease)
+            if space.quiesced or space.execution != running.model_dump(mode="json"):
+                raise DomainError("stale_framework_lease")
+
+    async def recoverable_executions(self, *, backend, host_id=None):
+        async with self.db.sessions() as session:
+            query = (
+                select(MemorySpace, MemoryBuild)
+                .join(MemoryBuild)
+                .where(
+                    MemoryBuild.backend == backend,
+                    MemorySpace.status == "retired",
+                    MemorySpace.quiesced.is_(False),
+                    MemorySpace.execution.is_not(None),
+                )
+            )
+            if host_id is not None:
+                query = query.where(MemorySpace.execution["host_id"].astext == host_id)
+            rows = (await session.execute(query.order_by(MemorySpace.id).limit(100))).all()
+            return [
+                (
+                    BuildLease(
+                        build_id=build.id,
+                        space_id=space.id,
+                        pair_id=build.pair_id,
+                        memory_epoch=build.memory_epoch,
+                        backend=build.backend,
+                        backend_revision=build.backend_revision,
+                        model=build.model,
+                        fence=space.fence,
+                        worker_id=space.worker_id,
+                        sources=(),
+                    ),
+                    WriterIdentity.model_validate(space.execution),
+                )
+                for space, build in rows
+            ]
+
+    async def confirm_execution_stopped(self, lease, expected, *, usage=None):
+        """Trusted supervisor holds the OS lock and has drained backend operations."""
+        async with self.db.sessions.begin() as session:
+            await session.scalar(select(Pair).where(Pair.id == lease.pair_id).with_for_update())
+            space = await session.scalar(
+                select(MemorySpace)
+                .join(MemoryBuild)
+                .where(
+                    MemorySpace.id == lease.space_id,
+                    MemoryBuild.pair_id == lease.pair_id,
+                )
+                .with_for_update(of=MemorySpace)
+            )
+            if (
+                space is None
+                or space.build_id != lease.build_id
+                or space.fence != lease.fence
+                or space.worker_id != lease.worker_id
+                or space.execution != expected.model_dump(mode="json")
+            ):
+                raise DomainError("stale_framework_lease")
+            space.quiesced = True
+            space.stop_proof = "process_lock_and_database_barrier"
+            if usage is not None:
+                space.usage = BuildUsage.model_validate(usage).model_dump()
+
+    async def stop_unverified(self, lease):
+        async with self.db.sessions.begin() as session:
+            await session.scalar(select(Pair).where(Pair.id == lease.pair_id).with_for_update())
+            await session.execute(
+                update(MemorySpace)
+                .where(
+                    MemorySpace.id == lease.space_id,
+                    MemorySpace.build_id == lease.build_id,
+                    MemorySpace.fence == lease.fence,
+                    MemorySpace.worker_id == lease.worker_id,
+                    MemorySpace.quiesced.is_(False),
+                )
+                .values(error_code="framework_stop_unverified")
+            )
 
     async def publish(self, lease):
         async with self.db.sessions.begin() as session:

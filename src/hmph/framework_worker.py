@@ -27,9 +27,10 @@ async def drain(task):
 
 
 class FrameworkWorker:
-    def __init__(self, builds, backend, *, lease_seconds=30, poll_seconds=0.5):
+    def __init__(self, builds, backend, *, lease_seconds=30, poll_seconds=0.5, cleanup_seconds=300):
         self.builds, self.backend = builds, backend
         self.lease_seconds, self.poll_seconds = lease_seconds, poll_seconds
+        self.cleanup_seconds = cleanup_seconds
         self.worker_id = "framework-" + uuid4().hex
 
     async def _heartbeat(self, lease):
@@ -60,8 +61,10 @@ class FrameworkWorker:
 
     async def run_once(self):
         await self.builds.recover_expired(backend=self.backend.backend)
+        if hasattr(self.backend, "recover"):
+            await self.backend.recover()
         cleanup = await self.builds.claim_cleanup(
-            self.worker_id, backend=self.backend.backend, lease_seconds=300
+            self.worker_id, backend=self.backend.backend, lease_seconds=self.cleanup_seconds
         )
         if cleanup is not None:
             await self._cleanup(cleanup)
@@ -99,8 +102,12 @@ class FrameworkWorker:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
             await drain(work)
-            await self.builds.quiesce(lease, usage=self.backend.usage)
-            if success:
+            if hasattr(self.backend, "quiesce"):
+                verified = await self.backend.quiesce(lease)
+            else:
+                await self.builds.quiesce(lease, usage=self.backend.usage)
+                verified = True
+            if success and verified:
                 await self.builds.publish(lease)
             else:
                 await self.builds.fail(lease, code=error_code, retryable=retryable)

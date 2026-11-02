@@ -50,6 +50,8 @@ class Conversation:
         self.ledger = RequestLedger(digest_key)
 
     async def bootstrap(self, owner_id: UUID = DEFAULT_OWNER) -> Identity:
+        if not await self.db.is_current():
+            raise DomainError("database_migration_required", 503)
         async with self.db.sessions.begin() as session:
             await session.execute(
                 insert(Owner).values(id=owner_id, name="Local owner").on_conflict_do_nothing()
