@@ -226,4 +226,6 @@ async def test_combined_context_preserves_source_text_and_the_reader_budget():
             assert all(item["source_ids"][0] in {e.uuid for e in episodes} for item in sources)
             assert len(context) <= 12
             assert len(json.dumps(context).encode()) < 12000
+            historical_context = await graph_context(graph, group, "Mira employer", None)
+            assert any("Cedar Atelier" in item.get("fact", "") for item in historical_context)
     assert not transport.records

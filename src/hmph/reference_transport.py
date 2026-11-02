@@ -27,11 +27,13 @@ class ReferenceTransport(httpx.BaseTransport):
         max_tokens=1024,
         delegate=None,
         response_validator=None,
+        budget=None,
     ):
         self._key = key
         self.model, self.max_calls, self.max_tokens = model, max_calls, max_tokens
         self.delegate = delegate or httpx.HTTPTransport(retries=0)
         self.response_validator = response_validator
+        self.budget = budget
         self.records = []
         self.budget_exhausted = False
         self._lock = threading.Lock()
@@ -60,6 +62,13 @@ class ReferenceTransport(httpx.BaseTransport):
             if len(self.records) >= self.max_calls:
                 self.budget_exhausted = True
                 raise ReferenceCallError("reference_call_budget")
+            reservation = None
+            if self.budget is not None:
+                try:
+                    reservation = self.budget.acquire(len(raw))
+                except Exception:
+                    self.budget_exhausted = True
+                    raise ReferenceCallError("reference_call_budget") from None
             record = {
                 "status": "started",
                 "usage": None,
@@ -123,6 +132,8 @@ class ReferenceTransport(httpx.BaseTransport):
             raise ReferenceCallError(code) from None
         finally:
             record["seconds"] = round(time.monotonic() - started, 3)
+            if self.budget is not None:
+                self.budget.finish(reservation, record)
 
     def close(self):
         self.delegate.close()

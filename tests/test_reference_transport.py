@@ -5,6 +5,46 @@ import pytest
 from pydantic import SecretStr
 
 
+def test_two_transports_share_durable_attempt_budget_and_preserve_usage(tmp_path):
+    from hmph.eval_budget import RunBudget
+    from hmph.reference_transport import ReferenceCallError, ReferenceTransport
+
+    budget = RunBudget(tmp_path / "calls.sqlite", max_calls=1, max_input_bytes=10000)
+
+    def endpoint(_):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+
+    for index, stage in enumerate(("writer", "reader")):
+        transport = ReferenceTransport(
+            SecretStr("fake-private-key"),
+            delegate=httpx.MockTransport(endpoint),
+            budget=budget.bind("case-001", "mem0", stage),
+        )
+        with httpx.Client(transport=transport) as client:
+            if index == 0:
+                assert (
+                    client.post(
+                        "https://api.deepseek.com/chat/completions",
+                        json={"model": "deepseek-flash"},
+                    ).status_code
+                    == 200
+                )
+            else:
+                with pytest.raises(ReferenceCallError, match="reference_call_budget"):
+                    client.post(
+                        "https://api.deepseek.com/chat/completions",
+                        json={"model": "deepseek-flash"},
+                    )
+    calls = budget.snapshot()["calls"]
+    assert len(calls) == 1 and calls[0]["record"]["usage"]["total_tokens"] == 15
+
+
 def test_reference_calls_keep_real_key_out_of_native_config_and_meter_each_attempt():
     from hmph.reference_transport import ReferenceCallError, ReferenceTransport
 

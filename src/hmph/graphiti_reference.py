@@ -78,7 +78,7 @@ async def graph_context(graph, group, query, date, *, max_bytes=12000):
     config.edge_config.sim_min_score = 0
     config.node_config.sim_min_score = 0
     result = await graph.search_(
-        query, config=config, group_ids=[group], search_filter=valid_on(date)
+        query, config=config, group_ids=[group], search_filter=valid_on(date) if date else None
     )
     source_ids = [e.uuid for e in result.episodes]
     source_ids += [s for edge in result.edges for s in edge.episodes]

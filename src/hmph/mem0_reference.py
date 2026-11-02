@@ -45,10 +45,12 @@ def native_mem0(directory, client, *, model, database_url=None, cleanup_audit=No
     native = None
     created = False
     try:
-        with psycopg.connect(database_url, autocommit=True) as admin:
+        with psycopg.connect(database_url, autocommit=True, connect_timeout=5) as admin:
             admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
             created = True
-        connection = make_conninfo(database_url, options=f"-csearch_path={schema},public")
+        connection = make_conninfo(
+            database_url, connect_timeout=5, options=f"-csearch_path={schema},public"
+        )
         native = Memory.from_config(
             {
                 "llm": {
@@ -85,7 +87,7 @@ def native_mem0(directory, client, *, model, database_url=None, cleanup_audit=No
                 if store is not None:
                     store.connection_pool.close()
         if created:
-            with psycopg.connect(database_url, autocommit=True) as admin:
+            with psycopg.connect(database_url, autocommit=True, connect_timeout=5) as admin:
                 admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
                 exists = admin.execute(
                     "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=%s)", (schema,)
