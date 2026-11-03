@@ -13,6 +13,7 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from hmph.contracts import ACTIVE, DomainError
 from hmph.database import Database
 from hmph.dialogue import invalidate_dialogue
+from hmph.lexical import tokenize
 from hmph.memory_builds import framework_space_count, retire_for_forget
 from hmph.memory_types import (
     DeletionReceipt,
@@ -384,18 +385,7 @@ class Memory:
         session, pair_id, query: str, *, limit=8, reference=None, source_timezone="UTC"
     ):
         """Bounded lexical selection; caller may hold the pair lock for snapshot consistency."""
-        terms = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]+", query.lower())
-        tokens = list(
-            dict.fromkeys(
-                token
-                for term in terms
-                for token in (
-                    [term]
-                    if not re.fullmatch(r"[\u4e00-\u9fff]+", term)
-                    else [term[i : i + 2] for i in range(len(term) - 1)]
-                )
-            )
-        )[:32]
+        tokens = list(dict.fromkeys(tokenize(query)))[:32]
         predicates = [p for p, hints in HINTS.items() if any(h in query.lower() for h in hints)]
         matches = [MemoryEntry.predicate.in_(predicates)] if predicates else []
         matches += [MemoryVersion.value.icontains(token, autoescape=True) for token in tokens]
@@ -627,13 +617,16 @@ class Memory:
             return MemoryTaskView.model_validate(task)
 
     @staticmethod
-    async def _closure(session, pair_id, memory_id):
+    async def _closure(session, pair_id, memory_id=None, *, source_message_id=None):
         """Follow recorded dependencies plus literal copies in the owner's raw history.
 
         Bounds make the first local implementation fail atomically on large graphs.
         Independent later user messages are not descendants of assistant output.
         """
-        memories, messages, turns = {memory_id}, set(), set()
+        memories = {memory_id} if memory_id is not None else set()
+        messages = {source_message_id} if source_message_id is not None else set()
+        turns = set()
+        seed = await session.get(Message, source_message_id) if source_message_id else None
 
         async def ids(query):
             result = set(await session.scalars(query.distinct().limit(2001)))
@@ -675,7 +668,11 @@ class Memory:
             )
             if len(copies) > 2000:
                 raise DomainError("deletion_scope_too_large", 413)
-            conditions = []
+            conditions = (
+                [Message.content.contains(seed.content, autoescape=True)]
+                if seed is not None and seed.content.strip()
+                else []
+            )
             for kind, value, time_text, quote in copies:
                 condition = Message.content.contains(value, autoescape=True)
                 if kind == "episode" and (time_text or quote):
@@ -727,9 +724,36 @@ class Memory:
                 return memories, messages, turns
 
     async def preview_forget(self, owner_id: UUID, memory_id: UUID):
+        return await self._preview_forget(owner_id, memory_id)
+
+    async def preview_forget_source(self, owner_id: UUID, source_message_id: UUID):
+        return await self._preview_forget(owner_id, source_message_id, source=True)
+
+    @staticmethod
+    async def _owned_source(session, owner_id, source_id, *, lock=False):
+        query = (
+            select(Pair)
+            .join(Turn, Turn.pair_id == Pair.id)
+            .join(Message, Message.turn_id == Turn.id)
+            .where(Pair.owner_id == owner_id, Message.id == source_id, Message.role == "user")
+        )
+        pair = await session.scalar(query.with_for_update(of=Pair) if lock else query)
+        if pair is None:
+            raise DomainError("not_found", 404)
+        message = await session.get(Message, source_id)
+        if message.deleted:
+            raise DomainError("source_deleted", 410)
+        return pair, message
+
+    async def _preview_forget(self, owner_id, target_id, *, source=False):
         async with self.db.sessions.begin() as session:
-            pair, entry = await self._owned_entry(session, owner_id, memory_id, lock=True)
-            memories, messages, turns = await self._closure(session, pair.id, memory_id)
+            lookup = self._owned_source if source else self._owned_entry
+            pair, entry = await lookup(session, owner_id, target_id, lock=True)
+            memory_id = None if source else target_id
+            source_id = target_id if source else None
+            memories, messages, turns = await self._closure(
+                session, pair.id, memory_id, source_message_id=source_id
+            )
             state_count = await session.scalar(
                 select(func.count(func.distinct(DialogueSource.conversation_id))).where(
                     DialogueSource.message_id.in_(messages)
@@ -737,6 +761,7 @@ class Memory:
             )
             return ForgetPreview(
                 memory_id=memory_id,
+                source_message_id=source_id,
                 revision=entry.revision,
                 memories=len(memories),
                 messages=len(messages),
@@ -759,20 +784,42 @@ class Memory:
     async def forget(
         self, owner_id: UUID, memory_id: UUID, request_id: str, *, expected_revision: int
     ):
+        return await self._forget(
+            owner_id, memory_id, request_id, expected_revision=expected_revision
+        )
+
+    async def forget_source(
+        self, owner_id: UUID, source_message_id: UUID, request_id: str, *, expected_revision: int
+    ):
+        return await self._forget(
+            owner_id,
+            source_message_id,
+            request_id,
+            expected_revision=expected_revision,
+            source=True,
+        )
+
+    async def _forget(self, owner_id, target_id, request_id, *, expected_revision, source=False):
+        operation = "source.forget" if source else "memory.forget"
         digest = self.ledger.digest(
-            str(memory_id), {"revision": expected_revision, "action": "forget"}
+            str(target_id), {"revision": expected_revision, "action": "forget"}
         )
         async with self.db.sessions.begin() as session:
             await self.ledger.owner_lock(session, owner_id)
-            existing = await self.ledger.request(
-                session, owner_id, "memory.forget", request_id, digest
-            )
+            existing = await self.ledger.request(session, owner_id, operation, request_id, digest)
             if existing:
                 return DeletionReceipt.model_validate(await session.get(MemoryDeletion, existing))
-            pair, entry = await self._owned_entry(session, owner_id, memory_id, lock=True)
+            lookup = self._owned_source if source else self._owned_entry
+            pair, entry = await lookup(session, owner_id, target_id, lock=True)
             if entry.revision != expected_revision:
-                raise DomainError("memory_revision_conflict")
-            memories, messages, turns = await self._closure(session, pair.id, memory_id)
+                raise DomainError(
+                    "source_revision_conflict" if source else "memory_revision_conflict"
+                )
+            memory_id = None if source else target_id
+            source_id = target_id if source else None
+            memories, messages, turns = await self._closure(
+                session, pair.id, memory_id, source_message_id=source_id
+            )
             pair.memory_epoch += 1
             from hmph.companion import forget_controls
             from hmph.models import CompanionMention, RepairState
@@ -862,6 +909,7 @@ class Memory:
             receipt = MemoryDeletion(
                 pair_id=pair.id,
                 memory_id=memory_id,
+                source_message_id=source_id,
                 memories=len(memories),
                 messages=len(messages),
                 turns=len(turns),
@@ -872,5 +920,5 @@ class Memory:
             await session.flush()
             await retire_for_forget(session, pair, receipt)
             await session.flush()
-            self.ledger.save(session, owner_id, "memory.forget", request_id, digest, receipt.id)
+            self.ledger.save(session, owner_id, operation, request_id, digest, receipt.id)
             return DeletionReceipt.model_validate(receipt)

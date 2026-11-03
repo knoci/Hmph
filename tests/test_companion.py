@@ -5,6 +5,268 @@ import pytest
 from hmph.preferences import Preferences
 
 
+@pytest.mark.parametrize(
+    "error,code",
+    [
+        ("provider_timeout", "provider_timeout"),
+        ("PRIVATE untrusted provider body", "provider_protocol"),
+    ],
+)
+async def test_guard_unavailable_records_safe_provider_code(conversation, error, code):
+    import json
+
+    from hmph.deepseek import ProviderError
+    from hmph.model_gateway import FALLBACK, ModelDelta
+    from hmph.worker import Worker
+
+    identity = await conversation.bootstrap()
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "guard")
+    turn = await conversation.accept(
+        identity.owner_id, chat.id, "query", "你好。", model_mode="deepseek"
+    )
+
+    class Model:
+        async def stream(self, request):
+            yield ModelDelta(text="你好。")
+
+    async def review(request, candidate):
+        raise ProviderError(error)
+
+    await Worker(conversation, Model(), model_mode="deepseek", reviewer=review).run_once()
+    result = await conversation.get_turn(identity.owner_id, turn.id)
+    assert result.error_code == "guard_unavailable"
+    assert result.usage["guard_error_code"] == code
+    assert "PRIVATE" not in json.dumps(result.usage)
+    assert (await conversation.messages(identity.owner_id, chat.id))[-1].content == FALLBACK
+
+
+@pytest.mark.parametrize(
+    "query,recall",
+    [
+        ("我现在午后固定喝什么？只回答饮品。", True),
+        ("我目前每天早上吃什么？", True),
+        ("我现在应该喝什么？", False),
+        ("我想知道你现在喝什么？", False),
+        ("我现在用什么键盘？", True),
+        ("我目前在用哪款电脑？", True),
+        ("我现在养的是哪只猫？", True),
+        ("我应该买什么键盘？", False),
+        ("如果我现在用机械键盘，哪款更合适？", False),
+        ("What is the name of Devon's dog?", True),
+        ("What should Devon's dog eat?", False),
+        ("If Devon's dog needed a bed, which would fit?", False),
+        ("我参加合唱排练是哪一天？", True),
+    ],
+)
+def test_direct_present_personal_question_is_recall_but_purchase_and_hypothesis_are_not(
+    query, recall
+):
+    from uuid import uuid4
+
+    from hmph.companion_policy import SourceCandidate, decide
+
+    source = SourceCandidate(uuid4(), "我在用青石牌键盘。")
+    plan = decide(query, {}, [source], policy_revision=1)
+    assert (plan.act == "recall") == recall
+
+
+@pytest.mark.parametrize(
+    "damage,reason",
+    [
+        ("quote", "source_quote"),
+        ("dependency", "source_dependency"),
+        ("revision", "stale_lease"),
+        ("deleted", "stale_lease"),
+    ],
+)
+async def test_invalid_mention_has_a_specific_reason_and_still_blocks(conversation, damage, reason):
+    from sqlalchemy import delete, update
+
+    from hmph.contracts import DomainError
+    from hmph.model_gateway import SourceMention
+    from hmph.models import Message, TurnSourceUse
+
+    identity = await conversation.bootstrap()
+    chat, _, lease, _ = await request(conversation, identity, "我喜欢茉莉茶。", "tea")
+    await conversation.finish(lease)
+    source = (await conversation.messages(identity.owner_id, chat.id))[0]
+    _, _, lease, _ = await request(
+        conversation, identity, "你记得我喜欢喝什么？", "recall", chat=chat
+    )
+    body = "你喜欢柠檬茶。" if damage == "quote" else "你喜欢茉莉茶。"
+    hint = SourceMention(source_id=source.id, quote="柠檬茶" if damage == "quote" else "茉莉茶")
+    async with conversation.db.sessions.begin() as session:
+        if damage == "dependency":
+            await session.execute(
+                delete(TurnSourceUse).where(
+                    TurnSourceUse.turn_id == lease.turn_id, TurnSourceUse.message_id == source.id
+                )
+            )
+        elif damage == "revision":
+            await session.execute(update(Message).where(Message.id == source.id).values(revision=2))
+        elif damage == "deleted":
+            await session.execute(
+                update(Message).where(Message.id == source.id).values(deleted=True)
+            )
+    if reason == "stale_lease":
+        with pytest.raises(DomainError, match="stale_lease"):
+            await conversation.companion_output_reason(lease, body, (hint,))
+        return
+    assert await conversation.companion_output_reason(lease, body, (hint,)) == reason
+    assert not await conversation.check_companion_output(lease, body, (hint,))
+
+
+async def test_direct_personal_recall_can_mention_two_valid_sources_after_review(conversation):
+    from hmph.memory import Memory
+    from hmph.memory_types import MemoryProposal
+    from hmph.model_gateway import GuardReview, ModelDelta, SourceMention
+    from hmph.worker import Worker
+
+    identity = await conversation.bootstrap()
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "keyboard")
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    sources = []
+    for i, value in enumerate(("灯塔牌键盘", "青石牌键盘")):
+        text = ("我之前用过" if i == 0 else "我现在换成") + value + "。"
+        turn = await conversation.accept(identity.owner_id, chat.id, f"source-{i}", text)
+        await conversation.cancel(identity.owner_id, turn.id, f"cancel-{i}")
+        sources.append((await conversation.messages(identity.owner_id, chat.id))[-1])
+        await memory.learn(
+            await memory.claim("learn"),
+            [MemoryProposal(predicate="preference", value=value, quote=text)],
+        )
+    turn = await conversation.accept(
+        identity.owner_id, chat.id, "recall", "我现在用什么键盘？", model_mode="deepseek"
+    )
+    body = "你现在用青石牌键盘，之前用的是灯塔牌键盘。"
+
+    class Model:
+        async def stream(self, request):
+            yield ModelDelta(text=body)
+
+    async def review(request, candidate):
+        return GuardReview(
+            allowed=True,
+            reason="ok",
+            mentions=tuple(
+                SourceMention(source_id=s.id, quote=value)
+                for s, value in zip(sources, ("灯塔牌键盘", "青石牌键盘"), strict=True)
+            ),
+        )
+
+    await Worker(conversation, Model(), model_mode="deepseek", reviewer=review).run_once()
+    actual = (await conversation.messages(identity.owner_id, chat.id))[-1].content
+    result = await conversation.get_turn(identity.owner_id, turn.id)
+    assert actual == body, result.usage.get("policy_reason")
+    assert result.usage["policy_reason"] == "ok"
+    assert (
+        len((await conversation.companion_explanation(identity.owner_id, turn.id))["mentions"]) == 2
+    )
+
+
+async def test_output_rejection_records_reason_without_candidate_or_quote(conversation):
+    identity = await conversation.bootstrap()
+    _, _, lease, _ = await request(conversation, identity, "先听我说，不要给建议。", "listen")
+    assert (
+        await conversation.companion_output_reason(lease, "你应该马上离职。") == "listening_advice"
+    )
+    assert not await conversation.check_companion_output(lease, "你应该马上离职。")
+
+
+async def test_memory_entry_id_is_diagnosed_and_never_repaired_into_source_id(conversation):
+    from hmph.memory import Memory
+    from hmph.memory_types import MemoryProposal
+    from hmph.model_gateway import SourceMention
+
+    identity = await conversation.bootstrap()
+    chat, _, lease, _ = await request(conversation, identity, "我喜欢雪梨汁。", "fact")
+    await conversation.finish(lease)
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    await memory.learn(
+        await memory.claim("extract"),
+        [MemoryProposal(predicate="preference", value="雪梨汁", quote="我喜欢雪梨汁")],
+    )
+    fact = (await memory.entries(identity.owner_id, identity.character_id))[0]
+    _, _, lease, _ = await request(
+        conversation, identity, "你记得我喜欢什么饮品？", "query", chat=chat
+    )
+    hint = SourceMention(source_id=fact.id, quote="雪梨汁")
+    assert (
+        await conversation.companion_output_reason(lease, "你喜欢雪梨汁。", (hint,))
+        == "memory_id_as_source"
+    )
+    assert not await conversation.check_companion_output(lease, "你喜欢雪梨汁。", (hint,))
+
+
+async def test_verified_same_source_witness_survives_a_redundant_translated_hint(conversation):
+    from hmph.memory import Memory
+    from hmph.memory_types import MemoryProposal
+    from hmph.model_gateway import SourceMention
+
+    identity = await conversation.bootstrap()
+    chat, _, lease, _ = await request(conversation, identity, "I work at River Glass.", "source")
+    await conversation.finish(lease)
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    await memory.learn(
+        await memory.claim("learn"),
+        [MemoryProposal(predicate="employer", value="River Glass", quote="I work at River Glass.")],
+    )
+    source = (await conversation.messages(identity.owner_id, chat.id))[0]
+    _, _, lease, _ = await request(
+        conversation, identity, "Where do I currently work?", "question", chat=chat
+    )
+    body = "你在 River Glass 工作。"
+    translated = SourceMention(source_id=source.id, quote="River Glass 工作")
+    witness = SourceMention(source_id=source.id, quote="River Glass")
+    assert await conversation.companion_output_reason(lease, body, (translated,)) == "source_quote"
+    assert await conversation.check_companion_output(lease, body, (translated, witness))
+    await conversation.publish(lease, 0, body, mentions=(translated, witness))
+    assert (
+        len(
+            (await conversation.companion_explanation(identity.owner_id, lease.turn_id))["mentions"]
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "original,answer,source_quote,quote",
+    [
+        ("I volunteer at Cedar Hall.", "你在雪松会馆做志愿者。", "Cedar Hall", "雪松会馆"),
+        ("我的演出在昨天。", "演出是在2026年9月12日。", "演出在昨天", "2026年9月12日"),
+    ],
+)
+async def test_reviewed_paraphrase_uses_separate_source_and_published_spans(
+    conversation, original, answer, source_quote, quote
+):
+    from hmph.model_gateway import SourceMention
+
+    identity = await conversation.bootstrap()
+    chat, _, lease, _ = await request(conversation, identity, original, "source")
+    await conversation.finish(lease)
+    source = (await conversation.messages(identity.owner_id, chat.id))[0]
+    _, _, lease, _ = await request(
+        conversation, identity, "你记得我之前说的事吗？", "recall", chat=chat
+    )
+    hint = SourceMention(source_id=source.id, quote=quote, source_quote=source_quote)
+    assert await conversation.check_companion_output(lease, answer, (hint,))
+    # An unpublished span cannot create a mention. The source anchor is checked
+    # separately, and a fabricated source anchor still fails closed.
+    await conversation.publish(lease, 0, "嗯，", mentions=(hint,))
+    assert not (await conversation.companion_explanation(identity.owner_id, lease.turn_id))[
+        "mentions"
+    ]
+    await conversation.publish(lease, 1, answer, mentions=(hint,))
+    assert (
+        len(
+            (await conversation.companion_explanation(identity.owner_id, lease.turn_id))["mentions"]
+        )
+        == 1
+    )
+    bad = hint.model_copy(update={"source_quote": "不存在的原话"})
+    assert await conversation.companion_output_reason(lease, answer, (bad,)) == "source_quote"
+
+
 def test_personal_history_enumeration_allows_requested_sources_instead_of_proactive_cap():
     from uuid import uuid4
 
@@ -15,6 +277,21 @@ def test_personal_history_enumeration_allows_requested_sources_instead_of_proact
     ]
     plan = decide("我一共去过哪些地方？", {}, sources, policy_revision=1)
     assert all(d.permission == "mention" and d.reason == "requested" for d in plan.memory_use)
+
+
+def test_event_question_with_matching_content_words_requests_memories_without_first_person():
+    from uuid import uuid4
+
+    from hmph.companion_policy import SourceCandidate, decide
+
+    sources = [SourceCandidate(uuid4(), "The sewing-machine technician will visit tomorrow.")]
+    question = "On what calendar date was the sewing-machine technician visit scheduled?"
+    plan = decide(question, {}, sources, policy_revision=1)
+    assert plan.act == "recall" and plan.memory_use[0].reason == "requested"
+    advice = decide(
+        "Should the sewing-machine technician visit tomorrow?", {}, sources, policy_revision=1
+    )
+    assert advice.act != "recall"
 
 
 async def test_longer_replacement_nickname_is_allowed_but_former_standalone_name_is_blocked(

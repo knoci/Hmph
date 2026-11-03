@@ -62,7 +62,8 @@ class LearnResult(BaseModel):
 
 
 class ForgetPreview(BaseModel):
-    memory_id: UUID
+    memory_id: UUID | None = None
+    source_message_id: UUID | None = None
     revision: int
     memories: int
     messages: int
@@ -77,7 +78,8 @@ class ForgetPreview(BaseModel):
 class DeletionReceipt(BaseModel):
     model_config = ConfigDict(from_attributes=True, frozen=True)
     id: UUID
-    memory_id: UUID
+    memory_id: UUID | None = None
+    source_message_id: UUID | None = None
     status: Literal["completed", "pending_cleanup"]
     memories: int
     messages: int

@@ -17,6 +17,25 @@ class ReferenceCallError(Exception):
     pass
 
 
+def failure_code(error):
+    """Never persist provider exception text, URLs or headers."""
+    if isinstance(error, ReferenceCallError):
+        from hmph.eval_budget import ERROR_CODES
+
+        return str(error) if str(error) in ERROR_CODES else "reference_network_or_protocol"
+    if isinstance(error, httpx.TimeoutException):
+        return "reference_timeout"
+    if isinstance(error, httpx.ProtocolError | ValueError | KeyError | TypeError | AttributeError):
+        return "reference_protocol"
+    if isinstance(error, httpx.TransportError):
+        return "reference_network"
+    return "reference_network_or_protocol"
+
+
+def http_failure_code(status):
+    return "reference_service_unavailable" if status == 503 else "reference_provider_error"
+
+
 class ReferenceTransport(httpx.BaseTransport):
     def __init__(
         self,
@@ -28,17 +47,21 @@ class ReferenceTransport(httpx.BaseTransport):
         delegate=None,
         response_validator=None,
         budget=None,
+        stop_file=None,
     ):
         self._key = key
         self.model, self.max_calls, self.max_tokens = model, max_calls, max_tokens
         self.delegate = delegate or httpx.HTTPTransport(retries=0)
         self.response_validator = response_validator
         self.budget = budget
+        self.stop_file = stop_file
         self.records = []
         self.budget_exhausted = False
         self._lock = threading.Lock()
 
     def handle_request(self, request):
+        if self.stop_file is not None and self.stop_file.exists():
+            raise ReferenceCallError("reference_cancelled")
         if (
             request.url.scheme != "https"
             or request.url.host != "api.deepseek.com"
@@ -87,16 +110,22 @@ class ReferenceTransport(httpx.BaseTransport):
             "POST", request.url, headers=headers, content=raw, extensions=request.extensions
         )
         started = time.monotonic()
+        response = None
+        record["failure_phase"] = "request"
         try:
+            if self.stop_file is not None and self.stop_file.exists():
+                raise ReferenceCallError("reference_cancelled")
             response = self.delegate.handle_request(outbound)
-            response.read()
             record["http_status"] = response.status_code
+            record["failure_phase"] = "response_body"
+            response.read()
             if response.status_code != 200:
                 response.close()
-                raise ReferenceCallError("reference_provider_error")
+                raise ReferenceCallError(http_failure_code(response.status_code))
             if len(response.content) > 65536:
                 response.close()
                 raise ReferenceCallError("reference_response_limit")
+            record["failure_phase"] = "response_protocol"
             payload = response.json()
             usage = payload.get("usage")
             if isinstance(usage, dict) and all(
@@ -115,22 +144,22 @@ class ReferenceTransport(httpx.BaseTransport):
                 response.close()
                 raise ReferenceCallError("reference_incomplete_output")
             if self.response_validator is not None:
+                record["failure_phase"] = "response_validation"
                 try:
                     self.response_validator(payload)
                 except Exception:
                     response.close()
                     raise ReferenceCallError("reference_invalid_output") from None
             record["status"] = "completed"
+            record.pop("failure_phase", None)
             return response
         except Exception as error:
-            code = (
-                str(error)
-                if isinstance(error, ReferenceCallError)
-                else "reference_network_or_protocol"
-            )
+            code = failure_code(error)
             record.update(status="failed", error_code=code)
             raise ReferenceCallError(code) from None
         finally:
+            if response is not None and record["status"] != "completed":
+                response.close()
             record["seconds"] = round(time.monotonic() - started, 3)
             if self.budget is not None:
                 self.budget.finish(reservation, record)

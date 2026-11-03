@@ -66,7 +66,8 @@ async def test_slow_provider_keeps_lease_alive(conversation):
     chat = await conversation.create_chat(identity.owner_id, identity.character_id, "chat")
     turn = await conversation.accept(identity.owner_id, chat.id, "turn", "你好")
     await Worker(conversation, FakeModel(delay=0.15), lease_seconds=0.12).run_once()
-    assert (await conversation.get_turn(identity.owner_id, turn.id)).status == "completed"
+    saved = await conversation.get_turn(identity.owner_id, turn.id)
+    assert saved.status == "completed", saved.error_code
 
 
 async def test_cancel_during_generation_stops_later_commits(conversation):

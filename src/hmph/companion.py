@@ -426,44 +426,60 @@ async def project_context(session, pair, turn, query, rows, candidates, short_te
     return safe_rows, candidates, short_term.model_copy(update={"data": data}), plan
 
 
-def output_allowed(pair, turn, query, body):
+def output_block_reason(pair, turn, query, body):
     plan = plan_view(turn)
     if forbidden_in(pair.preferences, query, body):
-        return False
+        return "boundary"
     if plan and plan.act == "close" and re.search(r"[?？]", body):
-        return False
+        return "closing_question"
     if (
         plan
         and plan.support_mode == "listen"
         and re.search(r"建议你|你应该|你可以试|不妨|you should", body, re.I)
     ):
-        return False
-    return True
+        return "listening_advice"
+    return None
+
+
+def output_allowed(pair, turn, query, body):
+    return output_block_reason(pair, turn, query, body) is None
 
 
 async def eligible_mentions(session, turn, body, mentions):
+    result, _ = await checked_mentions(session, turn, body, mentions)
+    return result
+
+
+async def checked_mentions(session, turn, body, mentions):
     from hmph.models import TurnSourceUse
 
     plan = plan_view(turn)
     allowed = {d.source_id for d in plan.memory_use if d.permission == "mention"} if plan else set()
     result = []
+    missing_quote = set()
     for hint in mentions:
         if hint.quote not in body:
             continue
         use = await session.get(TurnSourceUse, (turn.id, hint.source_id))
         source = await session.get(Message, hint.source_id)
-        if (
-            hint.source_id not in allowed
-            or use is None
-            or source is None
-            or source.deleted
-            or source.role != "user"
-            or source.revision != use.message_revision
-            or hint.quote not in source.content
-        ):
-            return None
+        if hint.source_id not in allowed:
+            entry = await session.get(MemoryEntry, hint.source_id)
+            if entry is not None and entry.pair_id == turn.pair_id:
+                return None, "memory_id_as_source"
+            return None, "source_permission"
+        if use is None:
+            return None, "source_dependency"
+        if source is None or source.deleted or source.role != "user":
+            return None, "source_invalid"
+        if source.revision != use.message_revision:
+            return None, "source_revision"
+        if (hint.source_quote or hint.quote) not in source.content:
+            missing_quote.add(source.id)
+            continue
         result.append((source.id, source.revision))
     result = list(dict.fromkeys(result))
+    if missing_quote - {source_id for source_id, _ in result}:
+        return None, "source_quote"
     if (
         plan
         and len(result) > 1
@@ -473,5 +489,5 @@ async def eligible_mentions(session, turn, body, mentions):
             if d.source_id in {r[0] for r in result}
         )
     ):
-        return None
-    return result
+        return None, "proactive_limit"
+    return result, "ok"

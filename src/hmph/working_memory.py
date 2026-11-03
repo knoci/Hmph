@@ -5,10 +5,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import case, or_, select
 
+from hmph.lexical import bm25_order, tokenize
 from hmph.memory import FUNCTIONAL, HINTS, PAST, Memory
 from hmph.models import Message, Turn
 from hmph.source_context import budget_window
@@ -87,18 +89,7 @@ def plan_recall(query):
 
 
 def query_terms(query):
-    terms = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]+", query.lower())
-    return list(
-        dict.fromkeys(
-            token
-            for term in terms
-            for token in (
-                [term]
-                if not re.fullmatch(r"[\u4e00-\u9fff]+", term)
-                else [term[i : i + 2] for i in range(len(term) - 1)]
-            )
-        )
-    )[:32]
+    return list(dict.fromkeys(tokenize(query)))[:32]
 
 
 def build_workspace(
@@ -157,7 +148,7 @@ async def search_raw(session, turn, query, slots, *, limit=80):
     score = sum(case((match, 1), else_=0) for match in matches)
     rows = list(
         await session.execute(
-            select(Message, Turn.created_at)
+            select(Message, Turn.created_at, Turn.source_timezone)
             .join(Turn)
             .where(
                 Turn.pair_id == turn.pair_id,
@@ -170,8 +161,12 @@ async def search_raw(session, turn, query, slots, *, limit=80):
             .limit(limit)
         )
     )
+    ranked = bm25_order([row[0] for row in rows], query)
+    ranked_set = set(ranked)
+    order = ranked + [i for i in range(len(rows)) if i not in ranked_set]
     evidence = []
-    for message, recorded in rows:
+    for index in order:
+        message, recorded, zone = rows[index]
         if not retainable(message.content):
             continue
         # Excerpts stay contiguous and disclose truncation; they are never new assertions.
@@ -181,7 +176,8 @@ async def search_raw(session, turn, query, slots, *, limit=80):
                 message_id=message.id,
                 message_revision=message.revision,
                 role=message.role,
-                recorded_at=recorded,
+                recorded_at=recorded.astimezone(ZoneInfo(zone)) if zone else recorded,
+                source_timezone=zone,
                 content=message.content[start:end],
                 start_offset=start,
                 end_offset=end,
@@ -217,7 +213,7 @@ async def retrieve(session, turn, query, short_term):
     missing = [slot.name for slot in initial.slots if slot.status != "supported"]
     raw, raw_count = [], 0
     rounds = 1
-    if missing or plan.intent in ("multi_hop", "enumeration"):
+    if missing or plan.intent in ("multi_hop", "enumeration", "temporal"):
         raw, raw_count = await search_raw(session, turn, query, missing, limit=80 - len(memories))
         rounds = 2
     return WorkingCandidates(plan, memories, raw, rounds, len(memories) + raw_count)

@@ -46,6 +46,15 @@ def native_provider(_):
 
 
 @dataclass
+class StopProvider:
+    path: object
+
+    def __call__(self, request):
+        self.path.touch()
+        return native_provider(request)
+
+
+@dataclass
 class PausedProvider:
     entered: object
     released: object
@@ -180,9 +189,59 @@ async def test_native_graphiti_build_writes_episode_through_fenced_driver(conver
         await control.close()
 
 
-@pytest.mark.parametrize("max_calls", [1, 8])
+@pytest.mark.parametrize("stage", ["native", "guard"])
+async def test_product_runner_stop_drains_native_work_and_removes_only_eval_schema(
+    conversation, tmp_path, stage
+):
+    import importlib.util
+    from pathlib import Path
+
+    from hmph.config import Settings
+    from hmph.eval_budget import RunBudget
+    from hmph.product_eval import EvaluationStopped, RunControl, smoke_case
+
+    spec = importlib.util.spec_from_file_location(
+        "native_product_runner", Path("scripts/product_run.py")
+    )
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    budget = RunBudget(tmp_path / "calls.sqlite", max_calls=64, max_input_bytes=1024 * 1024)
+    control = RunControl(tmp_path / "STOP")
+    services = runner.Services(
+        SecretStr("mock"),
+        budget,
+        "p2-dev-999",
+        "graphiti",
+        mock=True,
+        control=control,
+        mock_stop_stage=stage,
+    )
+    row, checkpoints = {}, []
+    try:
+        with pytest.raises(EvaluationStopped, match="operator_stop"):
+            await runner.run_case(
+                runner.scenario(smoke_case()),
+                services,
+                Settings(database_url=conversation.db.url),
+                row,
+                lambda: checkpoints.append(row.get("stage")),
+            )
+    finally:
+        await services.close()
+    assert row["cleanup_verified"] and row["schema_removed"]
+    calls = budget.snapshot()["calls"]
+    assert all(c["stage"] not in {"grounding", "answer_judge"} for c in calls)
+    if stage == "native":
+        assert sum(c["stage"] == "writer" for c in calls) == 1
+        assert "native_build" in checkpoints
+    else:
+        assert row["turn"]["status"] == "completed"
+        assert "generation_and_guard" in checkpoints
+
+
+@pytest.mark.parametrize("max_calls", [1, 8, "stop"])
 async def test_supervised_native_episode_publish_then_forget_cleans_persistent_space(
-    conversation, max_calls
+    conversation, max_calls, tmp_path
 ):
     from hmph.framework_process import GraphitiProcessBackend
     from hmph.framework_worker import FrameworkWorker
@@ -210,16 +269,22 @@ async def test_supervised_native_episode_publish_then_forget_cleans_persistent_s
         SecretStr("test-only-graphiti-key"),
         database_url=conversation.db.url,
         database_schema=conversation.db.schema,
-        max_calls=max_calls,
-        delegate=httpx.MockTransport(native_provider),
+        max_calls=8 if max_calls == "stop" else max_calls,
+        delegate=httpx.MockTransport(
+            StopProvider(tmp_path / "STOP") if max_calls == "stop" else native_provider
+        ),
+        stop_file=tmp_path / "STOP" if max_calls == "stop" else None,
     )
     worker = FrameworkWorker(builds, GraphitiProcessBackend(builds, native))
     try:
         assert await worker.run_once()
         result = await builds.get(identity.owner_id, requested.id)
         space = (await builds.spaces(identity.owner_id, requested.id))[0]
-        if max_calls == 1:
-            assert result.status == "failed" and result.error_code == "call_budget"
+        if max_calls in {1, "stop"}:
+            assert result.status == "failed"
+            assert result.error_code == (
+                "provider_failed" if max_calls == "stop" else "call_budget"
+            )
             assert result.attempts == 1 and not await builds.claim(
                 "no-paid-repeat", backend="graphiti"
             )
@@ -325,7 +390,11 @@ async def test_supervised_native_episode_publish_then_forget_cleans_persistent_s
             finally:
                 await reader.close()
         assert space.quiesced and space.stop_proof == "process_lock_and_neo4j_fence"
-        assert 0 < space.usage["attempted_calls"] <= max_calls and space.usage["usage_complete"]
+        if max_calls == "stop":
+            assert space.usage["attempted_calls"] == 1
+        else:
+            assert 0 < space.usage["attempted_calls"] <= max_calls
+        assert space.usage["usage_complete"]
         receipt = await memory.forget(identity.owner_id, fact.id, "forget", expected_revision=1)
         assert receipt.status == "pending_cleanup"
         assert await worker.run_once()

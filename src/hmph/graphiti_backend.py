@@ -65,6 +65,7 @@ class GraphitiBackend:
         max_calls=64,
         delegate=None,
         call_budget=None,
+        stop_file=None,
     ):
         if not 1 <= max_calls <= 128:
             raise ValueError("Invalid framework call budget")
@@ -91,6 +92,7 @@ class GraphitiBackend:
         self.uri, self.user, self.password = local_uri(uri), user, password
         self.key, self.max_calls, self.delegate = key, max_calls, delegate
         self.call_budget = call_budget
+        self.stop_file = stop_file
         self.database_url, self.database_schema = database_url, database_schema
         self.execution_id = None
         self.usage = empty_usage()
@@ -200,6 +202,7 @@ class GraphitiBackend:
             max_calls=self.max_calls,
             delegate=self.delegate,
             budget=self.call_budget,
+            stop_file=self.stop_file,
         )
         processed, changes = 0, 0
         graph = None
@@ -250,6 +253,8 @@ class GraphitiBackend:
                 if any(record["status"] != "completed" for record in transport.records):
                     raise FrameworkBuildError("provider_failed", retryable=False)
         except Exception as error:
+            if self.stop_file is not None and self.stop_file.exists():
+                raise FrameworkBuildError("provider_failed", retryable=False) from None
             if transport.budget_exhausted:
                 raise FrameworkBuildError("call_budget", retryable=False) from None
             if isinstance(error, (ValueError, TypeError, FenceClosed)):

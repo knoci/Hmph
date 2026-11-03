@@ -783,6 +783,16 @@ class Conversation:
                     .on_conflict_do_nothing()
                 )
             for hit in evidence:
+                for source in hit.sources:
+                    await session.execute(
+                        insert(TurnSourceUse)
+                        .values(
+                            turn_id=turn.id,
+                            message_id=source.message_id,
+                            message_revision=source.message_revision,
+                        )
+                        .on_conflict_do_nothing()
+                    )
                 await session.execute(
                     insert(TurnMemoryUse)
                     .values(
@@ -873,15 +883,19 @@ class Conversation:
             }
 
     async def check_companion_output(self, lease, body, mentions=()):
-        from hmph.companion import eligible_mentions, output_allowed
+        return await self.companion_output_reason(lease, body, mentions) == "ok"
+
+    async def companion_output_reason(self, lease, body, mentions=()):
+        from hmph.companion import checked_mentions, output_block_reason
 
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
             pair = await session.get(Pair, turn.pair_id)
-            return (
-                output_allowed(pair, turn, lease.user_content, body)
-                and await eligible_mentions(session, turn, body, mentions) is not None
-            )
+            reason = output_block_reason(pair, turn, lease.user_content, body)
+            if reason:
+                return reason
+            _, reason = await checked_mentions(session, turn, body, mentions)
+            return reason
 
     async def memory_explanation(self, owner_id, turn_id):
         async with self.db.sessions() as session:

@@ -12,6 +12,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 ERROR_CODES = {
+    "reference_cancelled",
+    "reference_timeout",
+    "reference_network",
+    "reference_protocol",
+    "reference_service_unavailable",
     "reference_destination_denied",
     "reference_request_denied",
     "reference_input_limit",
@@ -65,6 +70,14 @@ def sanitize(record, input_bytes):
         result["error_code"] = (
             code if isinstance(code, str) and code in ERROR_CODES else "sanitized_unknown"
         )
+    phase = record.get("failure_phase")
+    if isinstance(phase, str) and phase in {
+        "request",
+        "response_body",
+        "response_protocol",
+        "response_validation",
+    }:
+        result["failure_phase"] = phase
     return result
 
 
@@ -121,11 +134,20 @@ class RunBudget:
             and profile in {"lexical", "graphiti"}
             and stage in {"extract", "state", "generation", "guard", "grounding", "answer_judge"}
         )
+        audit = (
+            isinstance(case_id, str)
+            and re.fullmatch(r"p2-holdout-[0-9]{3}", case_id)
+            and profile == "audit"
+            and stage == "gold_audit"
+        )
         if (
             not isinstance(case_id, str)
             or re.fullmatch(r"(?:case-|p2-(?:dev|holdout)-)[0-9]{3}", case_id) is None
             or not (
-                product or profile in {"raw", "mem0", "graphiti"} and stage in {"writer", "reader"}
+                product
+                or audit
+                or profile in {"raw", "mem0", "graphiti"}
+                and stage in {"writer", "reader"}
             )
         ):
             raise ValueError("Invalid evaluation budget binding")

@@ -94,7 +94,10 @@ class Worker:
             "guard": None,
             "complete": False,
         }
-        if not await self.conversation.check_companion_output(lease, body):
+        reason = await self.conversation.companion_output_reason(lease, body)
+        metadata["policy_reason"] = reason
+        metadata["policy_stage"] = "before_review"
+        if reason != "ok":
             metadata["guard_action"] = "policy_fallback"
             metadata["guard_status"] = "not_called"
             await self.conversation.publish(lease, 0, FALLBACK)
@@ -102,8 +105,9 @@ class Worker:
             return
         try:
             review = await self.reviewer(request, body)
-        except ProviderError:
+        except ProviderError as error:
             metadata["guard_action"] = "unavailable_fallback"
+            metadata["guard_error_code"] = error.code
             await self.conversation.publish(lease, 0, FALLBACK)
             await self.conversation.finish(lease, error_code="guard_unavailable", usage=metadata)
             return
@@ -128,9 +132,14 @@ class Worker:
                         and len(mentions) < 12
                     ):
                         mentions.append(SourceMention(source_id=source.message_id, quote=hit.value))
-        allowed = review.allowed and await self.conversation.check_companion_output(
-            lease, body, mentions
+        reason = (
+            await self.conversation.companion_output_reason(lease, body, mentions)
+            if review.allowed
+            else "review_denied"
         )
+        metadata["policy_reason"] = reason
+        metadata["policy_stage"] = "after_review"
+        allowed = reason == "ok"
         if not allowed:
             metadata["guard_action"] = "blocked_fallback"
         remaining = body if allowed else FALLBACK

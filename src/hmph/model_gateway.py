@@ -71,6 +71,9 @@ class SourceMention(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     source_id: UUID
     quote: str = Field(min_length=2, max_length=80)
+    # The reviewer links two independently literal spans. A translated or
+    # normalized-date reply need not copy the source's surface form.
+    source_quote: str | None = Field(default=None, min_length=2, max_length=100)
 
 
 class ModelGateway(Protocol):

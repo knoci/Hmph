@@ -5,6 +5,74 @@ import pytest
 from pydantic import SecretStr
 
 
+@pytest.mark.parametrize(
+    "failure,code,phase",
+    [
+        ("timeout", "reference_timeout", "response_body"),
+        ("network", "reference_network", "request"),
+        ("503", "reference_service_unavailable", "response_body"),
+        ("protocol", "reference_protocol", "response_protocol"),
+    ],
+)
+@pytest.mark.parametrize("kind", ["native", "product"])
+async def test_failure_location_is_fixed_and_sanitized(tmp_path, failure, code, phase, kind):
+    from hmph.eval_budget import RunBudget
+    from hmph.product_eval import ProductTransport
+    from hmph.reference_transport import ReferenceCallError, ReferenceTransport
+
+    class PartialSync(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"{"
+            raise httpx.ReadTimeout("PRIVATE provider body and credential")
+
+    class PartialAsync(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"{"
+            raise httpx.ReadTimeout("PRIVATE provider body and credential")
+
+    def endpoint(request):
+        if failure == "network":
+            raise httpx.ConnectError("PRIVATE provider body and credential")
+        if failure == "timeout":
+            return httpx.Response(200, stream=PartialSync() if kind == "native" else PartialAsync())
+        return httpx.Response(503 if failure == "503" else 200, text="PRIVATE invalid JSON")
+
+    budget = RunBudget(tmp_path / "calls.sqlite", max_calls=1, max_input_bytes=64000)
+    bound = budget.bind("p2-dev-001", "graphiti", "writer" if kind == "native" else "guard")
+    transport_type = ReferenceTransport if kind == "native" else ProductTransport
+    transport = transport_type(
+        SecretStr("local-placeholder"), budget=bound, delegate=httpx.MockTransport(endpoint)
+    )
+    request = httpx.Request(
+        "POST",
+        "https://api.deepseek.com/chat/completions",
+        json={"model": "deepseek-flash", "stream": False},
+    )
+    if kind == "product" and failure == "503":
+        assert (await transport.handle_async_request(request)).status_code == 503
+    else:
+        error_type = (
+            ReferenceCallError
+            if kind == "native"
+            else {
+                "timeout": httpx.ReadTimeout,
+                "network": httpx.ConnectError,
+                "protocol": ValueError,
+            }[failure]
+        )
+        with pytest.raises(error_type, match=code):
+            if kind == "native":
+                transport.handle_request(request)
+            else:
+                await transport.handle_async_request(request)
+    record = budget.snapshot()["calls"][0]["record"]
+    assert record["error_code"] == code and record["failure_phase"] == phase
+    assert record["usage"] is None and "PRIVATE" not in json.dumps(record)
+    if failure != "network":
+        assert record["http_status"] == (503 if failure == "503" else 200)
+    transport.close() if kind == "native" else await transport.shutdown()
+
+
 def test_two_transports_share_durable_attempt_budget_and_preserve_usage(tmp_path):
     from hmph.eval_budget import RunBudget
     from hmph.reference_transport import ReferenceCallError, ReferenceTransport

@@ -92,6 +92,32 @@ class NativeReader:
         return NativeSources(source_ids=tuple(self.ids))
 
 
+async def test_successful_graph_result_is_complemented_by_matching_canonical_original(conversation):
+    from hmph.conversation import Conversation
+
+    identity = await conversation.bootstrap()
+    important = await say(conversation, identity, "我前天参加了合唱排练。", "event")
+    await say(conversation, identity, "我把蓝色雨伞放在玄关。", "unrelated")
+    build, _, native = await ready_graph(conversation, identity)
+    await MemorySelection(conversation.db, digest_key=conversation.digest_key).update(
+        identity.owner_id, identity.character_id, "select", expected_revision=1, build_id=build.id
+    )
+    service = Conversation(
+        conversation.db, digest_key=conversation.digest_key, source_reader=NativeReader(native[1:])
+    )
+    chat = await service.create_chat(identity.owner_id, identity.character_id, "query")
+    await service.accept(identity.owner_id, chat.id, "query", "我参加合唱排练是哪一天？")
+    lease = await service.claim("reader")
+    req = await service.generation_request(lease)
+    assert important.id in {s.message_id for s in req.raw_evidence}
+    assert req.workspace.backend == "graphiti"
+    assert req.workspace.candidate_count <= 80
+    assert len(req.raw_evidence) <= 12
+    explanation = await service.memory_explanation(identity.owner_id, lease.turn_id)
+    assert explanation["context"]["lexical_complement_sources"] == 1
+    await service.finish(lease)
+
+
 async def test_mapped_foreign_pair_source_is_rejected_even_if_native_id_exists(conversation):
     from sqlalchemy import update
 

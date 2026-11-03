@@ -440,3 +440,68 @@ async def test_repeated_confirmations_do_not_crowd_fact_out_of_context_budget(co
     assert len(full[0].sources) == 20
     assert request.evidence[0].total_sources == 20
     assert len(request.evidence[0].sources) <= 2
+
+
+async def test_forget_original_without_extracted_entry_clears_replies_and_stale_work(conversation):
+    from uuid import uuid4
+
+    import pytest
+
+    from hmph.contracts import DomainError
+    from hmph.memory import Memory
+    from hmph.memory_types import MemoryProposal
+
+    identity = await conversation.bootstrap()
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "original")
+    turn = await conversation.accept(
+        identity.owner_id, chat.id, "fact", "我买的折叠琴是 Moonbell。"
+    )
+    await conversation.cancel(identity.owner_id, turn.id, "cancel")
+    original = (await conversation.messages(identity.owner_id, chat.id))[0]
+    extraction = await memory.claim("slow-extractor")
+    other = await conversation.bootstrap(uuid4())
+    other_chat = await conversation.create_chat(other.owner_id, other.character_id, "other")
+    other_turn = await conversation.accept(
+        other.owner_id, other_chat.id, "fact", "我买的折叠琴是 Moonbell。"
+    )
+    await conversation.cancel(other.owner_id, other_turn.id, "cancel")
+    query_chat = await conversation.create_chat(identity.owner_id, identity.character_id, "query")
+    await conversation.accept(identity.owner_id, query_chat.id, "query", "我上次买的折叠琴是什么？")
+    lease = await conversation.claim("generator")
+    req = await conversation.generation_request(lease)
+    assert original.id in {s.message_id for s in req.raw_evidence}
+    await conversation.publish(lease, 0, "Moonbell。")
+    await conversation.finish(lease)
+    assert not await memory.entries(identity.owner_id, identity.character_id)
+    preview = await memory.preview_forget_source(identity.owner_id, original.id)
+    assert preview.memory_id is None and preview.source_message_id == original.id
+    assert preview.memories == 0 and preview.messages == 2
+    with pytest.raises(DomainError, match="source_revision_conflict"):
+        await memory.forget_source(identity.owner_id, original.id, "bad", expected_revision=99)
+    with pytest.raises(DomainError, match="not_found"):
+        await memory.preview_forget_source(other.owner_id, original.id)
+    receipt = await memory.forget_source(
+        identity.owner_id, original.id, "forget", expected_revision=1
+    )
+    assert receipt.memory_id is None and receipt.source_message_id == original.id
+    assert receipt.status == "completed"
+    assert (
+        await memory.forget_source(identity.owner_id, original.id, "forget", expected_revision=1)
+    ).id == receipt.id
+    assert (
+        await memory.learn(
+            extraction,
+            [
+                MemoryProposal(
+                    predicate="instrument", value="Moonbell", quote="我买的折叠琴是 Moonbell。"
+                )
+            ],
+        )
+    ).status == "stale"
+    assert all(
+        m.deleted
+        for m in await conversation.messages(identity.owner_id, query_chat.id)
+        if m.role == "assistant"
+    )
+    assert not (await conversation.messages(other.owner_id, other_chat.id))[0].deleted

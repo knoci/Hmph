@@ -259,9 +259,16 @@ class TurnMemoryUse(Base):
 
 class MemoryDeletion(Base):
     __tablename__ = "memory_deletions"
+    __table_args__ = (
+        CheckConstraint(
+            "(memory_id IS NOT NULL) <> (source_message_id IS NOT NULL)",
+            name="deletion_one_target",
+        ),
+    )
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"))
-    memory_id: Mapped[UUID] = mapped_column(ForeignKey("memory_entries.id"))
+    memory_id: Mapped[UUID | None] = mapped_column(ForeignKey("memory_entries.id"))
+    source_message_id: Mapped[UUID | None] = mapped_column(ForeignKey("messages.id"))
     status: Mapped[str] = mapped_column(String(20), default="completed")
     memories: Mapped[int] = mapped_column()
     messages: Mapped[int] = mapped_column()

@@ -18,6 +18,105 @@ async def test_missing_structured_fact_triggers_bounded_original_source_lookup(c
     assert request.workspace.coverage == "partial"
 
 
+async def test_memory_only_source_is_registered_for_mention_and_forgetting(conversation):
+    from hmph.memory import Memory
+    from hmph.memory_types import MemoryProposal
+    from hmph.model_gateway import SourceMention
+    from hmph.models import TurnSourceUse
+
+    identity = await conversation.bootstrap()
+    old = await conversation.create_chat(identity.owner_id, identity.character_id, "old")
+    turn = await conversation.accept(
+        identity.owner_id, old.id, "fact", "I currently work at River Glass."
+    )
+    await conversation.cancel(identity.owner_id, turn.id, "cancel")
+    source = (await conversation.messages(identity.owner_id, old.id))[0]
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    await memory.learn(
+        await memory.claim("extract"),
+        [
+            MemoryProposal(
+                predicate="employer", value="River Glass", quote="I currently work at River Glass."
+            )
+        ],
+    )
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "new")
+    query = await conversation.accept(
+        identity.owner_id, chat.id, "query", "Where do I currently work?"
+    )
+    lease = await conversation.claim("generation")
+    req = await conversation.generation_request(lease)
+    assert req.evidence and not req.raw_evidence
+    assert source.id not in {o.message_id for o in req.history_origins}
+    async with conversation.db.sessions() as s:
+        use = await s.get(TurnSourceUse, (query.id, source.id))
+        assert use is not None and use.message_revision == source.revision
+    hint = SourceMention(source_id=source.id, quote="River Glass")
+    assert await conversation.check_companion_output(lease, "你现在在 River Glass 工作。", (hint,))
+    await conversation.publish(lease, 0, "你现在在 River Glass 工作。", mentions=(hint,))
+    await conversation.finish(lease)
+    fact = req.evidence[0]
+    receipt = await memory.forget(
+        identity.owner_id, fact.id, "forget", expected_revision=fact.revision
+    )
+    assert receipt.status == "completed"
+    assert all(
+        m.deleted and "River Glass" not in m.content
+        for m in await conversation.messages(identity.owner_id, chat.id)
+        if m.role == "assistant"
+    )
+
+
+async def test_raw_lookup_preserves_source_local_calendar_and_timezone(conversation):
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+
+    from hmph.models import Turn
+
+    identity = await conversation.bootstrap()
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "source")
+    source = await conversation.accept(identity.owner_id, chat.id, "fact", "我昨天参加了合唱排练。")
+    await conversation.cancel(identity.owner_id, source.id, "cancel")
+    async with conversation.db.sessions.begin() as session:
+        await session.execute(
+            update(Turn)
+            .where(Turn.id == source.id)
+            .values(
+                created_at=datetime(2026, 9, 5, 6, 30, tzinfo=UTC),
+                source_timezone="America/Los_Angeles",
+            )
+        )
+    current = await conversation.create_chat(identity.owner_id, identity.character_id, "new")
+    await conversation.accept(identity.owner_id, current.id, "query", "我上次合唱排练是什么时候？")
+    req = await conversation.generation_request(await conversation.claim("reader"))
+    raw = next(s for s in req.raw_evidence if s.content == "我昨天参加了合唱排练。")
+    assert raw.source_timezone == "America/Los_Angeles"
+    assert raw.recorded_at.isoformat() == "2026-09-04T23:30:00-07:00"
+
+
+async def test_common_english_words_cannot_displace_the_old_matching_original(conversation):
+    identity = await conversation.bootstrap()
+    old = await conversation.create_chat(identity.owner_id, identity.character_id, "old")
+    fact = await conversation.accept(
+        identity.owner_id, old.id, "fact", "I received a drum recently."
+    )
+    await conversation.cancel(identity.owner_id, fact.id, "cancel")
+    original = (await conversation.messages(identity.owner_id, old.id))[0]
+    for i in range(16):
+        distractor = await conversation.accept(
+            identity.owner_id, old.id, f"distractor-{i}", f"The parcel was the item number {i}."
+        )
+        await conversation.cancel(identity.owner_id, distractor.id, f"cancel-{i}")
+    new = await conversation.create_chat(identity.owner_id, identity.character_id, "new")
+    await conversation.accept(
+        identity.owner_id, new.id, "query", "On what day was the drum delivered?"
+    )
+    req = await conversation.generation_request(await conversation.claim("reader"))
+    assert original.id in {s.message_id for s in req.raw_evidence}
+    assert req.workspace.candidate_count <= 80
+
+
 async def test_forget_retracts_reply_derived_only_from_raw_lookup(conversation):
     from hmph.memory import Memory
     from hmph.memory_types import MemoryProposal

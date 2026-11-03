@@ -2,6 +2,47 @@ import httpx
 import pytest
 
 
+async def test_unextracted_message_forgetting_has_authenticated_preview_and_receipt(conversation):
+    from hmph.api import create_app
+    from hmph.config import Settings
+
+    identity = await conversation.bootstrap()
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "raw")
+    turn = await conversation.accept(identity.owner_id, chat.id, "fact", "我有一台星灯收音机。")
+    await conversation.cancel(identity.owner_id, turn.id, "cancel")
+    source = (await conversation.messages(identity.owner_id, chat.id))[0]
+    token = "test-only-token-at-least-32-characters"
+    app = create_app(
+        Settings(
+            api_token=token,
+            request_digest_key="test-only-digest-key-at-least-32-characters",
+            _env_file=None,
+        ),
+        conversation=conversation,
+    )
+    path = f"/api/messages/{source.id}"
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            assert (await client.get(path + "/forget-preview")).status_code == 401
+            client.headers["Authorization"] = "Bearer " + token
+            preview = await client.get(path + "/forget-preview")
+            assert preview.status_code == 200 and preview.json()["memories"] == 0
+            bad = await client.post(
+                path + "/forget", json={"request_id": "stale", "expected_revision": 9}
+            )
+            assert bad.status_code == 409
+            body = {"request_id": "forget", "expected_revision": 1}
+            result = await client.post(path + "/forget", json=body)
+            assert result.status_code == 200
+            assert result.json()["source_message_id"] == str(source.id)
+            assert result.json()["memory_id"] is None
+            assert result.json()["status"] == "completed"
+            assert (await client.post(path + "/forget", json=body)).json() == result.json()
+            assert (await client.get(path + "/forget-preview")).status_code == 410
+
+
 async def test_memory_selection_and_explanation_routes_require_auth_and_revision(conversation):
     from uuid import uuid4
 

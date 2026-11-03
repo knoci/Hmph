@@ -388,6 +388,22 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     ):
         return await memory.sources_page(owner_id, memory_id, revision, limit=limit, cursor=cursor)
 
+    @app.get("/api/messages/{source_message_id}/forget-preview")
+    async def source_forget_preview(
+        source_message_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await memory.preview_forget_source(owner_id, source_message_id)
+
+    @app.post("/api/messages/{source_message_id}/forget")
+    async def forget_source(
+        source_message_id: UUID,
+        body: ForgetMemory,
+        owner_id: Annotated[UUID, Depends(require_owner)],
+    ):
+        return await memory.forget_source(
+            owner_id, source_message_id, body.request_id, expected_revision=body.expected_revision
+        )
+
     @app.get("/api/memories/{memory_id}/forget-preview")
     async def forget_preview(memory_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
         return await memory.preview_forget(owner_id, memory_id)

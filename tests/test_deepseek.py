@@ -5,6 +5,49 @@ import pytest
 from pydantic import SecretStr
 
 
+async def test_review_exposes_only_canonical_source_ids_not_memory_entry_ids(conversation):
+    from hmph.deepseek import DeepSeekModel
+    from hmph.memory import Memory
+    from hmph.memory_types import MemoryProposal
+
+    identity = await conversation.bootstrap()
+    chat = await conversation.create_chat(
+        identity.owner_id, identity.character_id, "source-contract"
+    )
+    turn = await conversation.accept(identity.owner_id, chat.id, "fact", "我喜欢雪梨汁。")
+    await conversation.cancel(identity.owner_id, turn.id, "cancel")
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    await memory.learn(
+        await memory.claim("extract"),
+        [MemoryProposal(predicate="preference", value="雪梨汁", quote="我喜欢雪梨汁")],
+    )
+    entry = (await memory.entries(identity.owner_id, identity.character_id))[0]
+    source = (await conversation.messages(identity.owner_id, chat.id))[0]
+    await conversation.accept(identity.owner_id, chat.id, "query", "你记得我喜欢什么饮品？")
+    request = await conversation.generation_request(await conversation.claim("review"))
+    assert request.evidence
+
+    def endpoint(req):
+        data = json.loads(json.loads(req.content)["messages"][-1]["content"])
+        assert str(entry.id) not in json.dumps(data)
+        assert data["evidence"][0]["sources"][0]["source_id"] == str(source.id)
+        assert any(h.get("source_id") == str(source.id) for h in data["history"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": '{"allow":true,"reason":"ok","mentions":[]}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    model = DeepSeekModel(SecretStr("mock"), transport=httpx.MockTransport(endpoint))
+    assert (await model.review(request, "你喜欢雪梨汁。")).allowed
+
+
 async def test_deepseek_stream_hides_reasoning_and_tracks_usage():
     from hmph.deepseek import DeepSeekModel
     from hmph.model_gateway import ChatMessage, GenerationRequest

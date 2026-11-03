@@ -11,6 +11,7 @@ from hmph.memory_types import MemoryProposal
 from hmph.model_gateway import GenerationRequest, GuardReview, ModelDelta, ModelUsage, SourceMention
 
 ENDPOINT = "https://api.deepseek.com/chat/completions"
+REVIEW_MAX_TOKENS = 384
 PERSONA = """你是 Hmph，一个轻微傲娇、认真可靠的文字陪伴角色，用自然中文交流。
 通常简短回应，约 50–120 字，不要每句话都加傲娇口头禅。
 先理解用户想倾听、庆祝、解题还是建议；用户只想吐槽时不要强行指导。
@@ -45,7 +46,13 @@ reason 只能取 ok、attack、dependency、distress、fabricated_action 或 oth
 遵守表达计划的 act/support_mode 和 memory_use：omit 不使用，context_only 不主动复述事实。
 主动旧事最多一项；倾听时不强塞建议，结束时不继续提问；违反这些规则也返回 reason=other。
 可额外返回 mentions 数组（最多两项，没实际提及旧事则为空）：
-每项为 {"source_id":"实际证据来源UUID","quote":"同时逐字出现在来源和候选回复的短语"}。
+每项为 {"source_id":"实际证据来源UUID","source_quote":"逐字来自原文的短语",
+"quote":"逐字来自候选回复的对应个人信息短语"}。
+source_id 只取 sources/raw_evidence/history 的 source_id 或状态的 message_id；
+它必须在 source_permissions 中获 mention 许可。记忆条目/工作条目编号不是原文来源，不能引用。
+source_quote 和 quote 分别来自原文与候选，两者允许不同（例如忠实翻译、明确的日期换算）。
+你必须先判断两段确实表达同一受支持事实，再分别摘录，不能把译文或换算值伪称为原文。
+mentions 不代替整段事实支持判断；没有能对应的个人事实则省略，不拼接或杜撰引文。
 只报告实际说出的个人信息，不把选中候选当成已经提及，不猜来源ID。不要给出分析。
 你只负责审查候选回复，不要回复用户，也不要返回分析或自由形式解释。"""
 
@@ -75,8 +82,36 @@ topic 为当前话题；goal 为用户正在做的事；open_items 为用户明�
 不要添加自由文本摘要或解释，不要输出未列出的字段。"""
 
 
+PROVIDER_ERROR_CODES = frozenset(
+    {
+        "provider_authentication",
+        "provider_balance",
+        "provider_access",
+        "provider_rate_limit",
+        "provider_unavailable",
+        "provider_request_rejected",
+        "provider_timeout",
+        "provider_network",
+        "provider_protocol",
+        "provider_input_limit",
+        "provider_response_limit",
+        "provider_frame_limit",
+        "provider_output_limit",
+        "provider_output_truncated",
+        "provider_interrupted",
+        "provider_stream_incomplete",
+    }
+)
+
+
 class ProviderError(Exception):
     """A static error code, with no HTTP body, request headers or provider exception."""
+
+    def __init__(self, code):
+        self.code = (
+            code if isinstance(code, str) and code in PROVIDER_ERROR_CODES else "provider_protocol"
+        )
+        super().__init__(self.code)
 
 
 class ReviewPayload(BaseModel):
@@ -289,12 +324,40 @@ class DeepSeekModel:
             raise ProviderError("provider_protocol") from None
 
     async def review(self, request: GenerationRequest, candidate: str) -> GuardReview:
+        history = []
+        origins = request.history_origins
+        for index, message in enumerate(request.messages):
+            item = message.model_dump()
+            if len(origins) == len(request.messages) and message.role == "user":
+                item["source_id"] = str(origins[index].message_id)
+            history.append(item)
+        evidence = []
+        for hit in request.evidence:
+            item = hit.model_dump(mode="json", exclude={"id", "revision"})
+            item["sources"] = [
+                {
+                    "source_id": str(s.message_id),
+                    "message_revision": s.message_revision,
+                    "quote": s.quote,
+                }
+                for s in hit.sources
+            ]
+            evidence.append(item)
+        workspace = request.workspace.model_dump(mode="json") if request.workspace else None
+        if workspace:
+            for slot in workspace["slots"]:
+                slot.pop("memory_refs", None)
+        raw = []
+        for source in request.raw_evidence:
+            item = source.model_dump(mode="json")
+            item["source_id"] = item.pop("message_id")
+            raw.append(item)
         context = {
-            "history": [message.model_dump() for message in request.messages[-6:]],
-            "evidence": [hit.model_dump(mode="json") for hit in request.evidence],
+            "history": history[-6:],
+            "evidence": evidence,
             "short_term": request.short_term.model_dump(mode="json"),
-            "workspace": request.workspace.model_dump(mode="json") if request.workspace else None,
-            "raw_evidence": [source.model_dump(mode="json") for source in request.raw_evidence],
+            "workspace": workspace,
+            "raw_evidence": raw,
             "candidate": candidate,
             "reference_time": request.reference_time.isoformat()
             if request.reference_time
@@ -309,7 +372,7 @@ class DeepSeekModel:
                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
             ],
             stream=False,
-            max_tokens=192,
+            max_tokens=REVIEW_MAX_TOKENS,
         )
         body["response_format"] = {"type": "json_object"}
         if len(json.dumps(body, ensure_ascii=False).encode("utf-8")) > 16384:

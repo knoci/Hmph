@@ -169,7 +169,10 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
     scan_overflow = len(delta) > CANDIDATES
     delta_gap = int(scan_overflow)
     delta = delta[:CANDIDATES]
-    source_ids = tuple(dict.fromkeys(native.source_ids))[: max(0, CANDIDATES - len(delta))]
+    # Reserve half of the shared candidate capacity for exact original-text
+    # matches. A successful semantic search can still omit the decisive source.
+    native_capacity = max(0, (CANDIDATES - len(delta)) // 2)
+    source_ids = tuple(dict.fromkeys(native.source_ids))[:native_capacity]
     rows = list(
         (
             await session.execute(
@@ -218,18 +221,25 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
             continue
         selected.append(source)
         used += size
-    # Framework failures degrade only to authoritative raw sources. No second
-    # framework or derived fact store is consulted implicitly.
+    # Reuse the existing PostgreSQL source lookup as a complement, within the
+    # same candidate/deadline/context budgets. This adds no framework writer.
     fallback = []
-    if status != "ok":
-        fallback, _ = await search_raw(
+    fallback_scanned = 0
+    if not delta_gap and not filtered:
+        fallback, fallback_scanned = await search_raw(
             session, turn, query, (), limit=CANDIDATES - len(delta) - len(rows)
         )
     candidates = [_raw(m, t, mapping.source_order) for mapping, m, t, _ in rows]
+    native_messages = {s.message_id for s in candidates}
     if delta_gap or filtered:
         candidates = []
     else:
-        candidates += fallback
+        candidates = [
+            items[i]
+            for i in range(max(len(candidates), len(fallback)))
+            for items in (fallback, candidates)
+            if i < len(items)
+        ]
     seen = {s.message_id for s in selected}
     for source in candidates:
         if source.message_id in seen or len(selected) >= SOURCES:
@@ -276,6 +286,13 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         "delta_scan_truncated": scan_overflow,
         "delta_scanned_from_order": min((task.source_order for _, _, task in delta), default=None),
         "native_budget_dropped": len(set(native.source_ids)) - len(source_ids),
+        "lexical_complement_sources": sum(
+            s.message_id not in native_messages and s.source_order <= ticket.build_watermark
+            for s in selected
+        )
+        if status == "ok"
+        else 0,
+        "lexical_candidates_scanned": fallback_scanned,
         "filtered_sources": filtered,
         "truncated_sources": truncated,
         "requests": native.requests,
@@ -291,7 +308,7 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         [],
         selected,
         native.requests if native.requests is not None else 1,
-        len(rows) + len(delta) + len(fallback),
+        len(rows) + len(delta) + fallback_scanned,
     ), audit
 
 

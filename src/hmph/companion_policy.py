@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from hmph.preference_types import ExpressionPreferences
 from hmph.source_policy import retainable
-from hmph.working_memory import query_terms
+from hmph.working_memory import plan_recall, query_terms
 
 
 class PersonaCore(BaseModel):
@@ -73,8 +73,13 @@ class SourceCandidate:
 
 
 RECALL = re.compile(
+    r"^我(?:现在|目前|最近)?(?:(?:每天|平时|午后|下午|早上|晚上|固定|通常|一般|主要|常常|常|最常|正在|在)){0,3}"
+    r"(?:喝|吃|在用|使用|用|养的|养|买的|选的|常用的)"
+    r"[^，,。！？?]{0,12}(?:什么|哪个|哪款|哪台|哪只)|"
     r"记得|上次|之前|以前|还记|我.{0,8}(?:叫什|住哪|住在|名字|喜欢|公司)|"
-    r"我.{0,30}(?:多少|哪些|哪几|几次|何时|什么时候|哪天|哪年|一共|总共)|"
+    r"我.{0,30}(?:多少|哪些|哪几|几次|何时|什么时候|哪一?天|几号|哪年|一共|总共)|"
+    r"^(?:what|which|who|where|when)\b(?![^?]{0,100}\b(?:should|could|would)\b)"
+    r"[^?]{0,80}\b[a-z][a-z-]{1,30}['’]s\b|"
     r"what.*(?:my|\bI\b|\bwe\b)|where.*\bI\b|when did|how many.*\b(?:I|we)\b",
     re.I,
 )
@@ -166,7 +171,22 @@ def decide(
     )
     close, listen = bool(CLOSE.search(query.strip())), bool(LISTEN.search(query))
     unclear = not repaired and (unclear_repair or bool(UNCLEAR.search(query)))
-    recall = bool(RECALL.search(query)) and not (close or unclear)
+    # A question about a retrieved event can omit "I/my" entirely. Use the
+    # existing query plan and content words, while keeping advice/hypotheses out.
+    terms = set(query_terms(query))
+    grounded_question = (
+        plan_recall(query).intent != "social"
+        and bool(
+            re.search(
+                r"\b(?:what|which|who|where|when)\b|什么|哪个|哪一|哪天|何时|多少|[?？]",
+                query,
+                re.I,
+            )
+        )
+        and not re.search(r"\b(?:should|could|would|if)\b|如果|假如|应该|建议", query, re.I)
+        and any(len(terms.intersection(query_terms(c.text))) >= 2 for c in candidates)
+    )
+    recall = (bool(RECALL.search(query)) or grounded_question) and not (close or unclear)
     help_requested = bool(HELP.search(query)) and not listen
     celebrate = bool(
         re.search(r"好消息|拿到.{0,6}offer|通过.{0,6}考试|升职了|被录取了|庆祝", query, re.I)

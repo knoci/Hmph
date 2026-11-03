@@ -147,3 +147,24 @@ def test_alternative_source_is_valid_but_null_with_citation_remains_protocol_fai
     ]
     with pytest.raises(ValueError, match="Unknown native source"):
         source_context(case, [{"kind": "source", "source_ids": ["s099"]}])
+
+
+def test_gold_audit_input_excludes_author_labels_and_accepts_frozen_alternative_sources():
+    import json
+    from dataclasses import replace
+    from pathlib import Path
+
+    from hmph.selection_eval import Reply
+    from hmph.trajectory_eval import load_trajectories
+    from scripts.trajectory_audit import audit_input, source_grade
+
+    cases, _ = load_trajectories(Path("evals/fixtures/p2-trajectories-holdout-v2.json"))
+    case = cases[2]
+    copy = replace(case, gold=case.gold.model_copy(update={"rationale": "PRIVATE_AUTHOR_LABEL"}))
+    payload = audit_input(copy).model_dump()
+    assert set(payload) == {"history", "query"}
+    assert len(payload["history"]) == 10
+    assert "PRIVATE_AUTHOR_LABEL" not in json.dumps(payload)
+    assert "source_timezone" in payload["history"][0]
+    reply = Reply.model_validate_json('{"answer":"Nell","source_ids":["s010"]}')
+    assert source_grade(case, reply)["correct"]
