@@ -1,4 +1,4 @@
-"""Prepare a frozen P1 run, then explicitly execute all three native profiles."""
+"""Freeze a bounded development run; paid execution always requires --run."""
 
 import argparse
 import hashlib
@@ -14,9 +14,9 @@ from hmph.eval_budget import RunBudget  # noqa: E402
 from hmph.selection_eval import (  # noqa: E402
     READER_PROMPT,
     SCORING_VERSION,
-    load_selection,
     screen_profiles,
 )
+from hmph.trajectory_eval import RunConfiguration, TrajectoryCase, load_suite  # noqa: E402
 
 
 def write(path, value):
@@ -26,17 +26,41 @@ def write(path, value):
 
 
 def main(args):
+    config = RunConfiguration.for_protocol(
+        args.protocol,
+        **{
+            key: tuple(value) if key in {"profiles", "case_ids"} else value
+            for key in (
+                "profiles",
+                "case_ids",
+                "max_calls",
+                "max_input_bytes",
+                "per_case_calls",
+                "reader_bytes",
+                "evidence_mode",
+            )
+            if (value := getattr(args, key)) is not None
+        },
+    )
     directory = args.directory.resolve()
     allowed = (ROOT / "artifacts/evals").resolve()
     if not directory.is_relative_to(allowed) or directory == allowed or directory.exists():
         raise ValueError("Use a new run directory under artifacts/evals")
-    cases, checksum = load_selection(args.suite)
+    cases, checksum = load_suite(args.suite, require_frozen=True)
+    if (config.protocol == "p2a") != isinstance(cases[0], TrajectoryCase):
+        raise ValueError("Suite does not match the selected protocol")
+    if config.case_ids:
+        selected = {case.case_id: case for case in cases}
+        if not set(config.case_ids).issubset(selected):
+            raise ValueError("Unknown development trajectory")
+        cases = [selected[identifier] for identifier in config.case_ids]
     interpreters = {
         "raw": ROOT / "artifacts/framework-env/Scripts/python.exe",
         "mem0": ROOT / "artifacts/framework-env/Scripts/python.exe",
         "graphiti": ROOT / "artifacts/graphiti-env/Scripts/python.exe",
     }
     environments = {}
+    interpreters = {profile: interpreters[profile] for profile in config.profiles}
     for profile, interpreter in interpreters.items():
         inspected = subprocess.run(
             [
@@ -45,6 +69,8 @@ def main(args):
                 "--profile",
                 profile,
                 "--inspect",
+                "--suite",
+                str(args.suite.resolve()),
             ],
             capture_output=True,
             text=True,
@@ -66,19 +92,21 @@ def main(args):
             "src/hmph/graphiti_reference.py",
             "src/hmph/mem0_reference.py",
             "src/hmph/mem0_backend.py",
+            "src/hmph/trajectory_eval.py",
         )
     }
     plan = {
-        "schema_version": "hmph-p1-plan-v1",
+        "schema_version": "hmph-selection-plan-v2",
+        "configuration": config.model_dump(mode="json"),
         "created_at": datetime.now(UTC).isoformat(),
         "dataset_sha256": checksum,
         "case_ids": [case.case_id for case in cases],
         "profiles": list(interpreters),
         "model": "deepseek-flash",
-        "limits": {"max_calls": 384, "max_input_bytes": 8 * 1024 * 1024, "per_case_calls": 24},
+        "limits": config.limits,
         "writer_max_output_tokens": 1024,
         "reader_max_output_tokens": 256,
-        "reader_messages_bytes": 12000,
+        "reader_messages_bytes": config.reader_bytes,
         "reader_temperature": 0,
         "reader_prompt_sha256": hashlib.sha256(READER_PROMPT.encode()).hexdigest(),
         "scoring": SCORING_VERSION,
@@ -104,12 +132,31 @@ def main(args):
         "currency_cost": None,
         "price_version": None,
     }
+    if config.protocol == "p2a":
+        plan["development_screen"] = None
+        plan["scope"] = "Source-only development calibration, not product or holdout acceptance"
+        plan["build_watermarks"] = {case.case_id: case.build_watermark for case in cases}
+        plan["adaptations"] += [
+            "P2 writers receive only sources at or before the frozen build watermark.",
+            "Readers get canonical original sources plus the unprocessed cross-session delta.",
+            "The delta overlay is evaluation-only; product coordination is not implemented.",
+            "The JSON reader uses a 5000-byte total messages cap, not the product companion chain.",
+        ]
     write(directory / "plan.json", plan)
     budget = RunBudget(directory / "calls.sqlite", **plan["limits"])
     report = {"status": "prepared", "profiles": {}, "plan": plan, "calls": budget.snapshot()}
     write(directory / "report.json", report)
     if not args.run:
-        print(json.dumps({"status": "prepared", "case_count": len(cases), "max_calls": 384}))
+        print(
+            json.dumps(
+                {
+                    "status": "prepared",
+                    "case_count": len(cases),
+                    "max_calls": config.max_calls,
+                    "protocol": config.protocol,
+                }
+            )
+        )
         return
     report["status"] = "running"
     write(directory / "report.json", report)
@@ -174,7 +221,14 @@ def main(args):
             },
         }
     report["summary"] = summary
-    report["screening"] = screen_profiles(report["profiles"], cases)
+    report["screening"] = (
+        screen_profiles(report["profiles"], cases)
+        if config.protocol == "p1"
+        else {
+            "decision": "not_applicable",
+            "meaning": "P2-a development calibration only; no eligibility decision.",
+        }
+    )
     calls = report["calls"]["calls"]
     report["cost"] = {
         profile: {
@@ -207,4 +261,12 @@ if __name__ == "__main__":
         "--suite", type=Path, default=ROOT / "evals/fixtures/framework-selection-dev.json"
     )
     parser.add_argument("--run", action="store_true", help="Explicitly enable bounded paid calls")
+    parser.add_argument("--protocol", choices=("p1", "p2a"), default="p1")
+    parser.add_argument("--profiles", nargs="+", choices=("raw", "mem0", "graphiti"))
+    parser.add_argument("--case-ids", nargs="+")
+    parser.add_argument("--max-calls", type=int)
+    parser.add_argument("--max-input-bytes", type=int)
+    parser.add_argument("--per-case-calls", type=int)
+    parser.add_argument("--reader-bytes", type=int)
+    parser.add_argument("--evidence-mode", choices=("native", "source_only"))
     main(parser.parse_args())

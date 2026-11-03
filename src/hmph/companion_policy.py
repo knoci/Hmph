@@ -1,0 +1,252 @@
+"""Pure, bounded companion decisions. No database, model or inferred profile."""
+
+import re
+from dataclasses import dataclass
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from hmph.preference_types import ExpressionPreferences
+from hmph.source_policy import retainable
+from hmph.working_memory import query_terms
+
+
+class PersonaCore(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    version: int = 1
+    name: Literal["Hmph"] = "Hmph"
+    identity: Literal["fictional_companion"] = "fictional_companion"
+    language: Literal["zh"] = "zh"
+    style: Literal["mild_tsundere"] = "mild_tsundere"
+
+
+class MemoryUse(BaseModel):
+    source_id: UUID
+    permission: Literal["omit", "context_only", "mention"]
+    reason: Literal[
+        "boundary",
+        "sensitive",
+        "repeated",
+        "requested",
+        "continuity",
+        "proactive",
+        "not_relevant",
+        "closing",
+        "unclear_repair",
+    ]
+
+
+class CompanionPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    version: int = 1
+    persona_version: int = 1
+    policy_revision: int
+    act: Literal[
+        "acknowledge", "celebrate", "playful", "help", "recall", "clarify", "repair", "close"
+    ]
+    support_mode: Literal["listen", "suggest", "solve", "unknown"]
+    tone: Literal["warm", "gentle", "light"]
+    operator: Literal["none", "direct_care", "mild_tease"]
+    memory_use: tuple[MemoryUse, ...] = Field(default=(), max_length=160)
+    shared_thread_action: Literal["hold", "pause"] = "hold"
+    repair_action: Literal["none", "applied", "clarify"] = "none"
+    output_limit: int = 256
+    max_proactive_memories: int = 1
+    signal_source: UUID | None = None
+
+    def model_context(self):
+        return {
+            **self.model_dump(mode="json", exclude={"memory_use"}),
+            "persona": PersonaCore().model_dump(),
+            "source_permissions": {
+                str(d.source_id): d.permission for d in self.memory_use if d.permission != "omit"
+            },
+        }
+
+
+@dataclass(frozen=True)
+class SourceCandidate:
+    id: UUID
+    text: str
+    recent: bool = False
+
+
+RECALL = re.compile(
+    r"记得|上次|之前|以前|还记|我.{0,8}(?:叫什|住哪|住在|名字|喜欢|公司)|"
+    r"我.{0,30}(?:多少|哪些|哪几|几次|何时|什么时候|哪天|哪年|一共|总共)|"
+    r"what.*(?:my|\bI\b|\bwe\b)|where.*\bI\b|when did|how many.*\b(?:I|we)\b",
+    re.I,
+)
+CLOSE = re.compile(
+    r"^(?:今天|现在)?(?:先这样|不聊了|再见|晚安|我要睡了|bye|good night)"
+    r"(?:吧|啦|哦|啊)?(?:[，,。！？!?.\s]|$)",
+    re.I,
+)
+LISTEN = re.compile(
+    r"只想.{0,4}(?:倾诉|吐槽|说说)|先听我|别.{0,4}(?:建议|办法)|不要.{0,4}建议|不需要建议"
+)
+HELP = re.compile(r"给我.{0,4}建议|帮我.{0,4}(?:分析|解决|想办法)|该怎么办|how (?:do|can) I", re.I)
+SENSITIVE = re.compile(r"失恋|创伤|自杀|抑郁|病情|性经历|家暴|银行卡|密码|trauma|diagnosis", re.I)
+UNCLEAR = re.compile(r"你.{0,3}(?:又|记|叫|弄|说)错|不是我的|不是我|别再这样")
+
+
+def requested(query, target=""):
+    return bool(RECALL.search(query) or re.search(r"[?？]|告诉我|聊聊|说说", query)) and (
+        not target or target.casefold() in query.casefold()
+    )
+
+
+def forbidden_targets(preferences, query):
+    return tuple(
+        b["target"]
+        for b in preferences.get("_boundaries", ())
+        if b["mode"] != "on_request" or not requested(query, b["target"])
+    )
+
+
+def nickname_targets(preferences, query):
+    active = set(forbidden_targets(preferences, query))
+    topics = {b["target"] for b in preferences.get("_boundaries", ()) if b["kind"] == "topic"}
+    return {
+        b["target"]
+        for b in preferences.get("_boundaries", ())
+        if b["kind"] == "nickname" and b["target"] in active
+    } - topics
+
+
+def has_forbidden(text, targets, *, nickname=None, name_targets=()):
+    # An explicitly selected longer nickname may contain the former nickname.
+    # Only nickname rules get this exception; topic boundaries still win.
+    without_name = text.replace(nickname, " ") if nickname else text
+    return any(
+        t.casefold() in (without_name if t in name_targets else text).casefold() for t in targets
+    )
+
+
+def forbidden_in(preferences, query, text):
+    return has_forbidden(
+        text,
+        forbidden_targets(preferences, query),
+        nickname=preferences.get("nickname"),
+        name_targets=nickname_targets(preferences, query),
+    )
+
+
+def safe_excerpt(text, targets, *, nickname=None, name_targets=()):
+    """Only whole contiguous clauses. Never synthesize an alleged user quotation."""
+    if not retainable(text):
+        return None
+    if not has_forbidden(text, targets, nickname=nickname, name_targets=name_targets):
+        return 0, len(text)
+    spans = [(m.start(), m.end()) for m in re.finditer(r"[^，,。；;！？!?\n]+", text)]
+    spans = [
+        (a, b)
+        for a, b in spans
+        if text[a:b].strip()
+        and not has_forbidden(text[a:b], targets, nickname=nickname, name_targets=name_targets)
+    ]
+    return max(spans, key=lambda s: s[1] - s[0], default=None)
+
+
+def decide(
+    query,
+    preferences,
+    candidates,
+    *,
+    policy_revision,
+    recent_mentions=(),
+    repaired=False,
+    unclear_repair=False,
+    mode_hint=None,
+    signal_source=None,
+):
+    prefs = ExpressionPreferences.model_validate(
+        {k: v for k, v in preferences.items() if k in ExpressionPreferences.model_fields}
+    )
+    close, listen = bool(CLOSE.search(query.strip())), bool(LISTEN.search(query))
+    unclear = not repaired and (unclear_repair or bool(UNCLEAR.search(query)))
+    recall = bool(RECALL.search(query)) and not (close or unclear)
+    help_requested = bool(HELP.search(query)) and not listen
+    celebrate = bool(
+        re.search(r"好消息|拿到.{0,6}offer|通过.{0,6}考试|升职了|被录取了|庆祝", query, re.I)
+    )
+    if close:
+        act = "close"
+    elif repaired:
+        act = "repair"
+    elif unclear:
+        act = "clarify"
+    elif listen:
+        act = "acknowledge"
+    elif help_requested:
+        act = "help"
+    elif celebrate:
+        act = "celebrate"
+    else:
+        act = "recall" if recall else "acknowledge"
+    mode = (
+        "listen"
+        if listen
+        else "solve"
+        if help_requested
+        else (
+            "listen"
+            if prefs.support_mode == "listen"
+            else "suggest"
+            if prefs.support_mode == "suggest"
+            else "unknown"
+        )
+    )
+    explicit_support = "support_mode" in preferences.get(
+        "_field_sources", {"support_mode": True} if preferences.get("_source_memory_id") else {}
+    )
+    used_signal = (
+        not listen
+        and not help_requested
+        and not explicit_support
+        and mode_hint in {"listen", "advice", "solve"}
+    )
+    if used_signal:
+        mode = {"listen": "listen", "advice": "suggest", "solve": "solve"}[mode_hint]
+    targets, terms = forbidden_targets(preferences, query), set(query_terms(query))
+    decisions, proactive = [], False
+    for source in candidates:
+        span = safe_excerpt(
+            source.text,
+            targets,
+            nickname=preferences.get("nickname"),
+            name_targets=nickname_targets(preferences, query),
+        )
+        visible = source.text[slice(*span)] if span else ""
+        if span is None:
+            permission, reason = "omit", "boundary"
+        elif close or unclear:
+            permission, reason = "omit", "closing" if close else "unclear_repair"
+        elif SENSITIVE.search(visible) and not (
+            recall and terms.intersection(query_terms(visible))
+        ):
+            permission, reason = "omit", "sensitive"
+        elif source.id in recent_mentions and not recall:
+            permission, reason = "omit", "repeated"
+        elif recall:
+            permission, reason = "mention", "requested"
+        elif not proactive and terms.intersection(query_terms(visible)) and not listen:
+            permission, reason, proactive = "mention", "proactive", True
+        elif source.recent:
+            permission, reason = "context_only", "continuity"
+        else:
+            permission, reason = "omit", "not_relevant"
+        decisions.append(MemoryUse(source_id=source.id, permission=permission, reason=reason))
+    gentle = mode == "listen" or repaired or unclear or bool(SENSITIVE.search(query))
+    return CompanionPlan(
+        policy_revision=policy_revision,
+        act=act,
+        support_mode=mode,
+        tone="gentle" if gentle else "warm",
+        operator="direct_care" if gentle else "none",
+        memory_use=tuple(decisions),
+        shared_thread_action="pause" if close else "hold",
+        repair_action="applied" if repaired else "clarify" if unclear else "none",
+        signal_source=signal_source if used_signal else None,
+    )

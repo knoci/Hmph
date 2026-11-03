@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 from uuid import uuid4
@@ -22,11 +23,15 @@ from hmph.eval_budget import RunBudget  # noqa: E402
 from hmph.selection_eval import (  # noqa: E402
     Reply,
     Source,
-    grade,
-    load_selection,
     raw_context,
     reader_messages,
     source_text,
+)
+from hmph.trajectory_eval import (  # noqa: E402
+    RunConfiguration,
+    grade_trajectory,
+    load_suite,
+    source_context,
 )
 
 
@@ -44,12 +49,12 @@ def inspect(profile):
     from hmph.mem0_reference import MEM0_REVISION
 
     packages = (
-        ("openai",)
+        ("openai", "tzdata")
         if profile == "raw"
         else (
-            ("mem0ai", "fastembed", "psycopg", "openai")
+            ("mem0ai", "fastembed", "psycopg", "openai", "tzdata")
             if profile == "mem0"
-            else ("graphiti-core", "fastembed", "neo4j", "openai")
+            else ("graphiti-core", "fastembed", "neo4j", "openai", "tzdata")
         )
     )
     if profile != "raw":
@@ -69,18 +74,18 @@ def transport(key, model, budget, case_id, profile, stage, *, validator=None):
     return ReferenceTransport(
         key,
         model=model,
-        max_calls=24,
+        max_calls=budget.limits["per_case_calls"],
         max_tokens=256 if stage == "reader" else 1024,
         response_validator=validator,
         budget=budget.bind(case_id, profile, stage),
     )
 
 
-def _read_answer(query, evidence, key, model, budget, case_id, profile):
+def _read_answer(query, evidence, key, model, budget, case_id, profile, max_bytes=12000):
     import httpx
     from openai import OpenAI
 
-    messages = reader_messages(query, evidence)
+    messages = reader_messages(query, evidence, max_bytes=max_bytes)
     supplied = json.loads(messages[1]["content"])["evidence"]
     ids = {source for item in supplied for source in item["source_ids"]}
     with httpx.Client(
@@ -106,10 +111,27 @@ def _read_answer(query, evidence, key, model, budget, case_id, profile):
     return reply, ids, supplied
 
 
-def read_answer(query, evidence, key, model, budget, case_id, profile, row):
+def read_answer(
+    query,
+    evidence,
+    key,
+    model,
+    budget,
+    case_id,
+    profile,
+    row,
+    *,
+    case=None,
+    evidence_mode="native",
+    max_bytes=12000,
+):
     started = time.monotonic()
     try:
-        reply, ids, supplied = _read_answer(query, evidence, key, model, budget, case_id, profile)
+        if evidence_mode == "source_only":
+            evidence = source_context(case, evidence)
+        reply, ids, supplied = _read_answer(
+            query, evidence, key, model, budget, case_id, profile, max_bytes
+        )
         # Preserve predictions even if native cleanup subsequently fails.
         row.update(reply=reply.model_dump(mode="json"), evidence=supplied)
         return reply, ids, supplied
@@ -204,7 +226,7 @@ async def graphiti_context(history, query, key, model, budget, case_id, cleanup,
     writer = AsyncReferenceTransport(
         key,
         model=model,
-        max_calls=24,
+        max_calls=budget.limits["per_case_calls"],
         max_tokens=1024,
         budget=budget.bind(case_id, "graphiti", "writer"),
     )
@@ -278,7 +300,15 @@ async def run(args):
     for name, expected in plan["code_hashes"].items():
         if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != expected:
             raise ValueError("Frozen code hash mismatch")
-    cases, checksum = load_selection(args.suite)
+    config = RunConfiguration.model_validate(plan["configuration"])
+    if config.limits != plan["limits"] or config.reader_bytes != plan["reader_messages_bytes"]:
+        raise ValueError("Frozen configuration mismatch")
+    cases, checksum = load_suite(args.suite, require_frozen=True)
+    if config.case_ids:
+        selected = {case.case_id: case for case in cases}
+        cases = [selected[identifier] for identifier in config.case_ids]
+    if [case.case_id for case in cases] != plan["case_ids"]:
+        raise ValueError("Frozen case selection mismatch")
     if plan["dataset_sha256"] != checksum:
         raise ValueError("Frozen dataset hash mismatch")
     values = {**dotenv_values(ROOT / ".env"), **dotenv_values(ROOT / ".env.local"), **os.environ}
@@ -323,7 +353,7 @@ async def run(args):
                     )
                     if args.profile == "raw":
                         before = time.monotonic()
-                        evidence = raw_context(case)
+                        evidence = raw_context(replace(case, history=history))
                         row["timings"]["retrieval_and_scope_check_seconds"] = (
                             time.monotonic() - before
                         )
@@ -337,6 +367,9 @@ async def run(args):
                             case.case_id,
                             args.profile,
                             row,
+                            case=case,
+                            evidence_mode=config.evidence_mode,
+                            max_bytes=config.reader_bytes,
                         )
                     elif args.profile == "mem0":
                         with mem0_context(
@@ -359,6 +392,9 @@ async def run(args):
                                 case.case_id,
                                 args.profile,
                                 row,
+                                case=case,
+                                evidence_mode=config.evidence_mode,
+                                max_bytes=config.reader_bytes,
                             )
                     else:
                         async with graphiti_context(
@@ -381,12 +417,15 @@ async def run(args):
                                 case.case_id,
                                 args.profile,
                                 row,
+                                case=case,
+                                evidence_mode=config.evidence_mode,
+                                max_bytes=config.reader_bytes,
                             )
                     row.update(
                         status="completed",
                         reply=reply.model_dump(mode="json"),
                         evidence=selected,
-                        scores=grade(case, reply, ids),
+                        scores=grade_trajectory(case, reply, ids),
                         scope_isolation=True,
                     )
                 except Exception as error:
@@ -420,6 +459,8 @@ if __name__ == "__main__":
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
     if args.inspect:
+        if args.suite:
+            load_suite(args.suite, require_frozen=True)
         print(json.dumps(inspect(args.profile)))
     elif args.run and args.plan and args.suite:
         result = asyncio.run(run(args))

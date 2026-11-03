@@ -1,9 +1,12 @@
+import asyncio
+import time
 from datetime import timedelta
 from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import aliased
 
 from hmph.contracts import (
     ACTIVE,
@@ -31,7 +34,16 @@ from hmph.models import (
     TurnMemoryUse,
     TurnSourceUse,
 )
+from hmph.online_memory import (
+    READ_SECONDS,
+    NativeSources,
+    expand_sources,
+    pin_read,
+    retrieve_native,
+    validate_read,
+)
 from hmph.persistence import RequestLedger, append_event, terminate_turn
+from hmph.preference_types import expression_preferences
 from hmph.working_memory import build_workspace, retrieve
 
 DEFAULT_OWNER = UUID("550062e6-03a7-4ff0-bb47-c5eef6515a18")
@@ -40,7 +52,13 @@ DEFAULT_CHARACTER = UUID("af1d4af8-7c4e-49b3-9b42-83d5457bedce")
 
 class Conversation:
     def __init__(
-        self, db: Database, *, digest_key: bytes, turn_timeout: float = 45, source_timezone="UTC"
+        self,
+        db: Database,
+        *,
+        digest_key: bytes,
+        turn_timeout: float = 45,
+        source_timezone="UTC",
+        source_reader=None,
     ):
         ZoneInfo(source_timezone)
         self.db = db
@@ -48,6 +66,7 @@ class Conversation:
         self.turn_timeout = turn_timeout
         self.source_timezone = source_timezone
         self.ledger = RequestLedger(digest_key)
+        self.source_reader = source_reader
 
     async def bootstrap(self, owner_id: UUID = DEFAULT_OWNER) -> Identity:
         if not await self.db.is_current():
@@ -254,8 +273,61 @@ class Conversation:
                     Message.conversation_id == chat_id,
                 )
                 .order_by(Message.source_seq)
+                .limit(1001)
             )
-            return [MessageView.model_validate(row) for row in rows]
+            result = [MessageView.model_validate(row) for row in rows]
+            if len(result) > 1000:
+                raise DomainError("pagination_required", 413)
+            return result
+
+    async def chat_page(self, owner_id, *, limit=30, cursor=None):
+        if not 1 <= limit <= 100:
+            raise DomainError("invalid_cursor", 422)
+        async with self.db.sessions() as session:
+            query = select(Chat).join(Pair).where(Pair.owner_id == owner_id)
+            if cursor:
+                anchor = await self._chat(session, owner_id, cursor)
+                query = query.where(
+                    tuple_(Chat.created_at, Chat.id) < (anchor.created_at, anchor.id)
+                )
+            rows = list(
+                await session.scalars(
+                    query.order_by(Chat.created_at.desc(), Chat.id.desc()).limit(limit + 1)
+                )
+            )
+            return {
+                "items": [ChatView.model_validate(row) for row in rows[:limit]],
+                "next_cursor": str(rows[limit - 1].id) if len(rows) > limit else None,
+            }
+
+    async def message_page(self, owner_id, chat_id, *, limit=50, cursor=None):
+        if not 1 <= limit <= 100 or cursor is not None and cursor < 1:
+            raise DomainError("invalid_cursor", 422)
+        async with self.db.sessions() as session:
+            await self._chat(session, owner_id, chat_id)
+            query = select(Message).where(Message.conversation_id == chat_id)
+            if cursor is not None:
+                query = query.where(Message.source_seq < cursor)
+            rows = list(
+                await session.scalars(query.order_by(Message.source_seq.desc()).limit(limit + 1))
+            )
+            return {
+                "items": [MessageView.model_validate(row) for row in reversed(rows[:limit])],
+                "next_cursor": rows[limit - 1].source_seq if len(rows) > limit else None,
+            }
+
+    async def active_turn(self, owner_id, character_id):
+        async with self.db.sessions() as session:
+            turn = await session.scalar(
+                select(Turn)
+                .join(Pair)
+                .where(
+                    Pair.owner_id == owner_id,
+                    Pair.character_id == character_id,
+                    Turn.status.in_(ACTIVE),
+                )
+            )
+            return TurnView.model_validate(turn) if turn else None
 
     async def events(self, owner_id: UUID, turn_id: UUID, after: int = 0) -> list[EventView]:
         async with self.db.sessions() as session:
@@ -333,6 +405,16 @@ class Conversation:
             ):
                 await self._terminal(session, turn, "invalidated", "snapshot_changed")
                 return None
+            from hmph.companion import apply_controls
+
+            user_message = await session.scalar(
+                select(Message).where(Message.turn_id == turn.id, Message.role == "user")
+            )
+            try:
+                await apply_controls(session, pair, turn, user_message)
+            except DomainError as error:
+                await self._terminal(session, turn, "failed", error.code)
+                return None
             job.status = "leased"
             job.fence += 1
             job.worker_id = worker_id
@@ -372,6 +454,25 @@ class Conversation:
             or pair.memory_epoch != lease.memory_epoch
         ):
             raise DomainError("stale_lease")
+        await validate_read(session, pair, turn, job, now)
+        if turn.memory_context is not None:
+            source_turn = aliased(Turn)
+            invalid_source = await session.scalar(
+                select(TurnSourceUse.message_id)
+                .join(Message, TurnSourceUse.message_id == Message.id)
+                .join(source_turn, Message.turn_id == source_turn.id)
+                .where(
+                    TurnSourceUse.turn_id == turn.id,
+                    or_(
+                        Message.deleted.is_(True),
+                        Message.revision != TurnSourceUse.message_revision,
+                        source_turn.pair_id != pair.id,
+                    ),
+                )
+                .limit(1)
+            )
+            if invalid_source is not None:
+                raise DomainError("stale_lease")
         return turn, job, now
 
     async def renew(self, lease: Lease, lease_seconds: float):
@@ -379,7 +480,9 @@ class Conversation:
             turn, job, now = await self._lease(session, lease)
             job.lease_until = min(now + timedelta(seconds=lease_seconds), turn.deadline)
 
-    async def publish(self, lease: Lease, segment_index: int, content: str) -> EventView:
+    async def publish(
+        self, lease: Lease, segment_index: int, content: str, *, mentions=()
+    ) -> EventView:
         if not content or len(content) > 256 or "\x00" in content:
             raise DomainError("invalid_segment", 422)
         async with self.db.sessions.begin() as session:
@@ -413,6 +516,30 @@ class Conversation:
                 session.add(message)
             if len(message.content) + len(content) > 2000:
                 raise DomainError("output_limit")
+            from hmph.companion import eligible_mentions, output_allowed
+            from hmph.models import CompanionMention
+
+            actual = []
+            if turn.companion_plan is not None:
+                pair = await session.get(Pair, turn.pair_id)
+                if not output_allowed(pair, turn, lease.user_content, message.content + content):
+                    raise DomainError("companion_output_blocked")
+                actual = await eligible_mentions(session, turn, message.content + content, mentions)
+            elif mentions:
+                raise DomainError("companion_output_blocked")
+            if actual is None:
+                raise DomainError("companion_output_blocked")
+            for source_id, revision in actual:
+                await session.execute(
+                    insert(CompanionMention)
+                    .values(
+                        turn_id=turn.id,
+                        source_message_id=source_id,
+                        source_revision=revision,
+                        segment_index=segment_index,
+                    )
+                    .on_conflict_do_nothing()
+                )
             message.content += content
             event = self._event(
                 session, turn, "text.delta", {"text": content}, segment_index=segment_index
@@ -432,8 +559,57 @@ class Conversation:
             return TurnView.model_validate(turn)
 
     async def generation_request(self, lease: Lease) -> GenerationRequest:
+        started = time.monotonic()
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
+            pair = await session.get(Pair, turn.pair_id)
+            ticket = await pin_read(session, pair, turn, lease)
+        native, retrieval_status = (None, None)
+        if ticket is not None:
+            native, retrieval_status = await retrieve_native(
+                self.source_reader, ticket, lease.user_content, deadline=started + READ_SECONDS
+            )
+        if ticket is not None:
+            try:
+                async with asyncio.timeout(max(0, started + READ_SECONDS - time.monotonic())):
+                    return await self._assemble_request(
+                        lease, ticket, native, retrieval_status, started
+                    )
+            except TimeoutError:
+                # The experimental route has ended; fallback uses no native result.
+                return await self._assemble_request(
+                    lease, ticket, NativeSources(requests=None), "timeout", started
+                )
+        return await self._assemble_request(lease, ticket, native, retrieval_status, started)
+
+    async def _assemble_request(self, lease, ticket, native, retrieval_status, started):
+        async with self.db.sessions.begin() as session:
+            turn, _, _ = await self._lease(session, lease)
+            pair = await session.get(Pair, turn.pair_id)
+            from hmph.companion import field_sources
+
+            control_sources = set(field_sources(pair.preferences).values()) | {
+                b["source_memory_id"] for b in pair.preferences.get("_boundaries", [])
+            }
+            if pair.preferences.get("_source_memory_id"):
+                control_sources.add(pair.preferences["_source_memory_id"])
+            if control_sources:
+                from hmph.models import MemorySource
+
+                for source in await session.scalars(
+                    select(MemorySource).where(
+                        MemorySource.memory_id.in_([UUID(mid) for mid in control_sources])
+                    )
+                ):
+                    await session.execute(
+                        insert(TurnSourceUse)
+                        .values(
+                            turn_id=turn.id,
+                            message_id=source.message_id,
+                            message_revision=source.message_revision,
+                        )
+                        .on_conflict_do_nothing()
+                    )
             rows = list(
                 await session.scalars(
                     select(Message)
@@ -455,12 +631,37 @@ class Conversation:
                 session, turn, max(0, min(1300, 5000 - current_size))
             )
             state_bytes = len(short_term.model_dump_json().encode())
-            candidates = await retrieve(session, turn, rows[0].content, short_term)
+            evidence_budget = max(
+                0, min(3300 if ticket is not None else 1500, 5000 - current_size - state_bytes)
+            )
+            audit = None
+            if ticket is None:
+                candidates = await retrieve(session, turn, rows[0].content, short_term)
+            else:
+                candidates, audit = await expand_sources(
+                    session,
+                    turn,
+                    ticket,
+                    native,
+                    retrieval_status,
+                    rows[0].content,
+                    budget=evidence_budget,
+                )
+            from hmph.companion import project_context, repaired
+
+            inspected_rows = {row.id: row.source_seq for row in rows}
+            rows, candidates, short_term, companion_plan = await project_context(
+                session, pair, turn, lease.user_content, rows, candidates, short_term
+            )
+            turn.companion_plan = {
+                **companion_plan.model_dump(mode="json"),
+                "controls_applied": repaired(turn),
+            }
             for hit in candidates.memories:
                 # Retain every source in storage; supply bounded evidence in the prompt.
                 hit = hit.model_copy(update={"sources": hit.sources[:2]})
                 size = len(hit.model_dump_json().encode("utf-8")) + 64
-                if size + evidence_bytes > min(1500, 5000 - current_size - state_bytes):
+                if size + evidence_bytes > evidence_budget:
                     continue
                 evidence.append(hit)
                 evidence_bytes += size
@@ -468,7 +669,7 @@ class Conversation:
             for source in candidates.raw:
                 size = len(source.model_dump_json().encode()) + 64
                 if (
-                    size + evidence_bytes > min(1500, 5000 - current_size - state_bytes)
+                    size + evidence_bytes > evidence_budget
                     or len(evidence) + len(raw_evidence) >= 12
                 ):
                     continue
@@ -502,8 +703,14 @@ class Conversation:
                     or_(Message.role == "user", Turn.status == "completed"),
                 )
             )
-            short_term.omitted_delta_messages = delta_total - sum(
-                row.source_seq > short_term.processed_through_seq for row in source_rows
+            short_term.omitted_delta_messages = (
+                delta_total
+                - sum(row.source_seq > short_term.processed_through_seq for row in source_rows)
+                - sum(
+                    seq > short_term.processed_through_seq
+                    for mid, seq in inspected_rows.items()
+                    if mid not in {row.id for row in rows}
+                )
             )
             short_term.pending_gap = short_term.omitted_delta_messages > 0
             workspace = build_workspace(
@@ -518,6 +725,26 @@ class Conversation:
                 - len(evidence)
                 - len(raw_evidence),
             )
+            workspace.policy_filtered_sources = len(inspected_rows) - len(rows)
+            if workspace.policy_filtered_sources:
+                workspace.coverage = "partial"
+            if audit is not None:
+                workspace.rounds = 1  # Provenance expansion is not another planned search round.
+                workspace = workspace.model_copy(
+                    update={key: audit[key] for key in ("backend", "retrieval_status", "delta_gap")}
+                )
+                if audit["delta_gap"] or audit["filtered_sources"]:
+                    workspace.coverage = "partial"
+                turn.memory_context = {
+                    **audit,
+                    "retrieval_seconds": round(time.monotonic() - started, 4),
+                }
+            elif turn.memory_context is None:
+                turn.memory_context = {
+                    "backend": "lexical",
+                    "retrieval_status": "baseline",
+                    "config_revision": pair.memory_config_revision,
+                }
             for source in raw_evidence:
                 await session.execute(
                     insert(TurnSourceUse)
@@ -526,6 +753,13 @@ class Conversation:
                         message_id=source.message_id,
                         message_revision=source.message_revision,
                     )
+                    .on_conflict_do_nothing()
+                )
+            if companion_plan.signal_source is not None:
+                signal = await session.get(Message, companion_plan.signal_source)
+                await session.execute(
+                    insert(TurnSourceUse)
+                    .values(turn_id=turn.id, message_id=signal.id, message_revision=signal.revision)
                     .on_conflict_do_nothing()
                 )
             for anchor in state_sources(short_term.data).values():
@@ -558,13 +792,95 @@ class Conversation:
                     )
                     .on_conflict_do_nothing()
                 )
+            from hmph.companion_policy import forbidden_in
+
+            effective_preferences = expression_preferences(pair.preferences)
+            if effective_preferences.nickname and forbidden_in(
+                pair.preferences, lease.user_content, effective_preferences.nickname
+            ):
+                effective_preferences = effective_preferences.model_copy(update={"nickname": None})
+                turn.companion_plan = {**turn.companion_plan, "withheld_preferences": ["nickname"]}
             return GenerationRequest(
                 messages=tuple(chosen),
                 evidence=tuple(evidence),
                 short_term=short_term,
                 raw_evidence=tuple(raw_evidence),
                 workspace=workspace,
+                preferences=effective_preferences,
+                companion=companion_plan.model_copy(
+                    update={
+                        "memory_use": tuple(
+                            d
+                            for d in companion_plan.memory_use
+                            if d.source_id
+                            in (
+                                {row.id for row in source_rows}
+                                | {s.message_id for s in raw_evidence}
+                                | {s.message_id for m in evidence for s in m.sources}
+                                | set(state_sources(short_term.data))
+                            )
+                        )
+                    }
+                ),
             )
+
+    async def companion_explanation(self, owner_id, turn_id):
+        from hmph.models import CompanionMention, RepairState
+
+        async with self.db.sessions() as session:
+            turn = await self._turn(session, owner_id, turn_id)
+            repairs = list(
+                await session.scalars(
+                    select(RepairState)
+                    .where(RepairState.pair_id == turn.pair_id)
+                    .order_by(RepairState.policy_revision.desc(), RepairState.source_message_id)
+                    .limit(32)
+                )
+            )
+            return {
+                "plan": turn.companion_plan,
+                "mentions": list(
+                    await session.scalars(
+                        select(CompanionMention.source_message_id).where(
+                            CompanionMention.turn_id == turn.id
+                        )
+                    )
+                ),
+                "repairs": [
+                    {
+                        "kind": r.kind,
+                        "status": r.status,
+                        "source_message_id": r.source_message_id,
+                        "source_revision": r.source_revision,
+                        "source_memory_id": r.source_memory_id,
+                        "policy_revision": r.policy_revision,
+                    }
+                    for r in repairs
+                ],
+            }
+
+    async def check_companion_output(self, lease, body, mentions=()):
+        from hmph.companion import eligible_mentions, output_allowed
+
+        async with self.db.sessions.begin() as session:
+            turn, _, _ = await self._lease(session, lease)
+            pair = await session.get(Pair, turn.pair_id)
+            return (
+                output_allowed(pair, turn, lease.user_content, body)
+                and await eligible_mentions(session, turn, body, mentions) is not None
+            )
+
+    async def memory_explanation(self, owner_id, turn_id):
+        async with self.db.sessions() as session:
+            turn = await self._turn(session, owner_id, turn_id)
+            sources = list(
+                await session.scalars(
+                    select(TurnSourceUse.message_id)
+                    .join(Message, TurnSourceUse.message_id == Message.id)
+                    .where(TurnSourceUse.turn_id == turn.id, Message.deleted.is_(False))
+                )
+            )
+            return {"context": turn.memory_context, "source_ids": sources}
 
     async def recover_expired(self, limit: int = 100) -> int:
         recovered = 0

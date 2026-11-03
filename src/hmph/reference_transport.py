@@ -146,6 +146,10 @@ class AsyncReferenceTransport(httpx.AsyncBaseTransport):
         self._transport = ReferenceTransport(key, **kwargs)
         self.records = self._transport.records
 
+    @property
+    def budget_exhausted(self):
+        return self._transport.budget_exhausted
+
     async def handle_async_request(self, request):
         await request.aread()
         response = await asyncio.to_thread(self._transport.handle_request, request)

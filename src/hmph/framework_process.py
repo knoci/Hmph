@@ -1,9 +1,9 @@
-"""Local Mem0 writer supervision. Native algorithms stay in a spawned process.
+"""Local native writer supervision. Algorithms stay in a spawned process.
 
 Each space has a persistent lock inode and a durable execution nonce. A late
 child must register under that lock before opening native stores. Recovery holds
-the same lock while checking process identity, draining PG sessions and confirming
-quiescence. No PID-only kill, timeout-only stop proof, or raw-text spool files.
+the same lock while checking process identity and the specific backend's database
+barrier. No PID-only kill, timeout-only stop proof, or raw-text spool files.
 """
 
 import asyncio
@@ -137,6 +137,7 @@ class ProcessBackend:
     """Execution adapter used by the product CLI, with native Mem0 as delegate."""
 
     backend = "mem0"
+    protocol = "mem0-spawn-v1"
 
     def __init__(self, builds, native):
         if native.backend != self.backend:
@@ -149,9 +150,14 @@ class ProcessBackend:
     async def build(self, lease, checkpoint):
         self.usage = None
         reserved = WriterIdentity(
-            host_id=self.host_id, boot_time=psutil.boot_time(), execution_id=uuid4()
+            protocol=self.protocol,
+            host_id=self.host_id,
+            boot_time=psutil.boot_time(),
+            execution_id=uuid4(),
         )
         await self.builds.reserve_execution(lease, reserved)
+        if hasattr(self.native, "prepare_execution"):
+            await self.native.prepare_execution(lease, reserved)
         context = multiprocessing.get_context("spawn")
         receiver, sender = context.Pipe(duplex=False)
         process = context.Process(
@@ -187,16 +193,23 @@ class ProcessBackend:
             receiver.close()
 
     async def _confirm(self, lease, identity, *, usage=None):
-        if identity.host_id != self.host_id:
+        if identity.host_id != self.host_id or identity.protocol != self.protocol:
             return False
         if not await asyncio.to_thread(stop_identified_process, identity):
             return False
         with execution_lock(self.root, lease.space_id) as acquired:
             if not acquired:
                 return False
-            await self.native.drain_writes(lease)
-            await self.builds.confirm_execution_stopped(lease, identity, usage=usage)
+            await self._database_barrier(lease, identity)
+            await self.builds.confirm_execution_stopped(
+                lease, identity, usage=usage, stop_proof=self.stop_proof
+            )
             return True
+
+    stop_proof = "process_lock_and_database_barrier"
+
+    async def _database_barrier(self, lease, identity):
+        await self.native.drain_writes(lease)
 
     async def quiesce(self, lease):
         identity = await self.builds.execution(lease)
@@ -219,3 +232,14 @@ class ProcessBackend:
 
     async def purge(self, lease):
         return await self.native.purge(lease)
+
+
+class GraphitiProcessBackend(ProcessBackend):
+    """Reuse process containment, with a distinct durable Neo4j stop barrier."""
+
+    backend = "graphiti"
+    protocol = "graphiti-spawn-v1"
+    stop_proof = "process_lock_and_neo4j_fence"
+
+    async def _database_barrier(self, lease, identity):
+        await self.native.drain_writes(lease, identity)

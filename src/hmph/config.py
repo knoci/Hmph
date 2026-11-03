@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     fake_delay_seconds: float = Field(default=0.01, gt=0, le=10)
     lease_seconds: float = Field(default=15, gt=0, le=60)
     turn_timeout_seconds: float = Field(default=45, gt=0, le=300)
+    browser_session_seconds: int = Field(default=28800, ge=1, le=86400)
+    graphiti_uri: str = "bolt://127.0.0.1:17688"
+    graphiti_user: str = "neo4j"
+    graphiti_password: SecretStr = SecretStr("hmph_graphiti_runtime_local_only")
+    graphiti_reader_python: str | None = None
 
     @field_validator("source_timezone")
     @classmethod

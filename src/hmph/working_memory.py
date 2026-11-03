@@ -42,6 +42,8 @@ class RawEvidence(BaseModel):
     start_offset: int
     end_offset: int
     truncated: bool
+    source_timezone: str | None = None
+    source_order: int | None = None
 
 
 class EvidenceSlot(BaseModel):
@@ -61,6 +63,10 @@ class EvidenceWorkspace(BaseModel):
     coverage: Literal["complete", "partial", "unknown"]
     coverage_semantics: str = "retrieved_support_only; raw_candidates_need_reading"
     budget_dropped: int = 0
+    backend: str = "lexical"
+    retrieval_status: str = "baseline"
+    delta_gap: int = 0
+    policy_filtered_sources: int = 0
 
 
 def plan_recall(query):

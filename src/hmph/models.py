@@ -48,6 +48,10 @@ class Pair(Base):
     memory_epoch: Mapped[int] = mapped_column(default=1)
     next_memory_seq: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
     next_framework_seq: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    memory_config_revision: Mapped[int] = mapped_column(default=1, server_default="1")
+    selected_memory_build: Mapped[UUID | None] = mapped_column(
+        ForeignKey("memory_builds.id", use_alter=True, name="pair_selected_memory_build")
+    )
 
 
 class Chat(Base):
@@ -93,6 +97,27 @@ class Turn(Base):
     model_mode: Mapped[str] = mapped_column(String(20), default="fake", server_default="fake")
     usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     content_redacted: Mapped[bool] = mapped_column(default=False, server_default="false")
+    memory_context: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    companion_plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
+class RepairState(Base):
+    __tablename__ = "companion_repairs"
+    source_message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(40), primary_key=True)
+    pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"), index=True)
+    source_memory_id: Mapped[UUID] = mapped_column(ForeignKey("memory_entries.id"))
+    source_revision: Mapped[int] = mapped_column()
+    policy_revision: Mapped[int] = mapped_column()
+    status: Mapped[str] = mapped_column(String(20))
+
+
+class CompanionMention(Base):
+    __tablename__ = "companion_mentions"
+    turn_id: Mapped[UUID] = mapped_column(ForeignKey("turns.id"), primary_key=True)
+    source_message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+    source_revision: Mapped[int] = mapped_column()
+    segment_index: Mapped[int] = mapped_column()
 
 
 class Message(Base):
@@ -363,3 +388,28 @@ class MemoryDeletionSpace(Base):
     __tablename__ = "memory_deletion_spaces"
     deletion_id: Mapped[UUID] = mapped_column(ForeignKey("memory_deletions.id"), primary_key=True)
     space_id: Mapped[UUID] = mapped_column(ForeignKey("memory_spaces.id"), primary_key=True)
+
+
+class MemoryNativeSource(Base):
+    """Native episode IDs map to authoritative source revisions, never text copies."""
+
+    __tablename__ = "memory_native_sources"
+    space_id: Mapped[UUID] = mapped_column(ForeignKey("memory_spaces.id"), primary_key=True)
+    native_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), index=True)
+    message_revision: Mapped[int] = mapped_column()
+    source_order: Mapped[int] = mapped_column(BigInteger)
+
+
+class MemoryRead(Base):
+    """Bounded read/publish capability. No source text or framework facts."""
+
+    __tablename__ = "memory_reads"
+    turn_id: Mapped[UUID] = mapped_column(ForeignKey("turns.id"), primary_key=True)
+    build_id: Mapped[UUID] = mapped_column(ForeignKey("memory_builds.id"), index=True)
+    space_id: Mapped[UUID] = mapped_column(ForeignKey("memory_spaces.id"))
+    config_revision: Mapped[int] = mapped_column()
+    cutoff: Mapped[int] = mapped_column(BigInteger)
+    job_fence: Mapped[int] = mapped_column()
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    invalidated: Mapped[bool] = mapped_column(default=False, server_default="false")

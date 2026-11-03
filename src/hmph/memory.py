@@ -333,8 +333,8 @@ class Memory:
         await session.flush()
 
     @staticmethod
-    async def _view(session, entry, version):
-        sources = await session.scalars(
+    async def _view(session, entry, version, *, source_limit=None):
+        query = (
             select(MemorySource)
             .where(
                 MemorySource.memory_id == entry.id,
@@ -342,7 +342,21 @@ class Memory:
             )
             .order_by(MemorySource.message_id)
         )
+        if source_limit is not None:
+            query = query.limit(source_limit)
+        sources = await session.scalars(query)
         source_views = tuple(SourceView.model_validate(s) for s in sources)
+        total = (
+            len(source_views)
+            if source_limit is None
+            else await session.scalar(
+                select(func.count())
+                .select_from(MemorySource)
+                .where(
+                    MemorySource.memory_id == entry.id, MemorySource.revision == version.revision
+                )
+            )
+        )
         return MemoryView(
             id=entry.id,
             revision=version.revision,
@@ -362,7 +376,7 @@ class Memory:
             else None,
             recorded_at=version.recorded_at,
             sources=source_views,
-            total_sources=len(source_views),
+            total_sources=total,
         )
 
     @staticmethod
@@ -484,8 +498,48 @@ class Memory:
                     MemoryVersion.memory_id == memory_id,
                 )
                 .order_by(MemoryVersion.revision)
+                .limit(101)
             )
+            versions = list(versions)
+            if len(versions) > 100:
+                raise DomainError("pagination_required", 413)
             return [await self._view(session, entry, version) for version in versions]
+
+    async def history_page(self, owner_id, memory_id, *, limit=10, cursor=None):
+        async with self.db.sessions() as session:
+            _, entry = await self._owned_entry(session, owner_id, memory_id)
+            query = select(MemoryVersion).where(MemoryVersion.memory_id == memory_id)
+            if cursor is not None:
+                query = query.where(MemoryVersion.revision < cursor)
+            rows = list(
+                await session.scalars(
+                    query.order_by(MemoryVersion.revision.desc()).limit(limit + 1)
+                )
+            )
+            return {
+                "items": [
+                    await self._view(session, entry, v, source_limit=20) for v in rows[:limit]
+                ],
+                "next_cursor": rows[limit - 1].revision if len(rows) > limit else None,
+            }
+
+    async def sources_page(self, owner_id, memory_id, revision, *, limit=20, cursor=None):
+        async with self.db.sessions() as session:
+            await self._owned_entry(session, owner_id, memory_id)
+            if await session.get(MemoryVersion, (memory_id, revision)) is None:
+                raise DomainError("not_found", 404)
+            query = select(MemorySource).where(
+                MemorySource.memory_id == memory_id, MemorySource.revision == revision
+            )
+            if cursor is not None:
+                query = query.where(MemorySource.message_id > cursor)
+            rows = list(
+                await session.scalars(query.order_by(MemorySource.message_id).limit(limit + 1))
+            )
+            return {
+                "items": [SourceView.model_validate(s) for s in rows[:limit]],
+                "next_cursor": str(rows[limit - 1].message_id) if len(rows) > limit else None,
+            }
 
     async def entries(self, owner_id: UUID, character_id: UUID, *, limit=100):
         if not 1 <= limit <= 100:
@@ -510,6 +564,53 @@ class Memory:
                 .limit(limit)
             )
             return [await self._view(session, entry, version) for entry, version in rows]
+
+    async def entries_page(self, owner_id, character_id, *, limit=30, cursor=None):
+        if not 1 <= limit <= 100:
+            raise DomainError("invalid_cursor", 422)
+        from sqlalchemy import tuple_
+
+        async with self.db.sessions() as session:
+            query = (
+                select(MemoryEntry, MemoryVersion)
+                .join(Pair)
+                .join(
+                    MemoryVersion,
+                    and_(
+                        MemoryVersion.memory_id == MemoryEntry.id,
+                        MemoryVersion.revision == MemoryEntry.revision,
+                    ),
+                )
+                .where(
+                    Pair.owner_id == owner_id,
+                    Pair.character_id == character_id,
+                    MemoryEntry.status == "active",
+                )
+            )
+            if cursor:
+                pair, anchor = await self._owned_entry(session, owner_id, cursor)
+                if pair.character_id != character_id:
+                    raise DomainError("invalid_cursor", 422)
+                query = query.where(
+                    tuple_(MemoryEntry.source_order, MemoryEntry.id)
+                    < (anchor.source_order, anchor.id)
+                )
+            rows = list(
+                (
+                    await session.execute(
+                        query.order_by(
+                            MemoryEntry.source_order.desc(), MemoryEntry.id.desc()
+                        ).limit(limit + 1)
+                    )
+                ).all()
+            )
+            return {
+                "items": [
+                    await self._view(session, entry, version, source_limit=20)
+                    for entry, version in rows[:limit]
+                ],
+                "next_cursor": str(rows[limit - 1][0].id) if len(rows) > limit else None,
+            }
 
     async def task_status(self, owner_id: UUID, source_message_id: UUID):
         async with self.db.sessions() as session:
@@ -673,6 +774,26 @@ class Memory:
                 raise DomainError("memory_revision_conflict")
             memories, messages, turns = await self._closure(session, pair.id, memory_id)
             pair.memory_epoch += 1
+            from hmph.companion import forget_controls
+            from hmph.models import CompanionMention, RepairState
+
+            forget_controls(pair, memories)
+            await session.execute(
+                delete(RepairState).where(
+                    or_(
+                        RepairState.source_message_id.in_(messages),
+                        RepairState.source_memory_id.in_(memories),
+                    )
+                )
+            )
+            await session.execute(
+                delete(CompanionMention).where(
+                    or_(
+                        CompanionMention.source_message_id.in_(messages),
+                        CompanionMention.turn_id.in_(turns),
+                    )
+                )
+            )
             active = await session.scalars(
                 select(Turn)
                 .where(
@@ -733,6 +854,7 @@ class Memory:
                 )
                 for turn in affected:
                     turn.content_redacted = True
+                    turn.companion_plan = None
                     append_event(
                         session, turn, "turn.content_redacted", {"reason": "memory_forgotten"}
                     )

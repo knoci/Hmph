@@ -1,0 +1,12 @@
+# Application pins to combine with graphiti-constraints.txt for the product runtime.
+alembic==1.20.1
+asyncpg==0.32.0
+fastapi==0.162.0
+greenlet==3.5.6
+mako==1.4.3
+pydantic-settings==2.16.2
+python-dotenv==1.2.4
+sqlalchemy==2.0.55
+starlette==1.10.0
+uvicorn==0.54.0
+psutil==7.2.2

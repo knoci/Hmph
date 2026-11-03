@@ -13,6 +13,7 @@ from hmph.model_gateway import (
     GenerationRequest,
     GuardReview,
     ModelGateway,
+    SourceMention,
 )
 
 
@@ -93,6 +94,12 @@ class Worker:
             "guard": None,
             "complete": False,
         }
+        if not await self.conversation.check_companion_output(lease, body):
+            metadata["guard_action"] = "policy_fallback"
+            metadata["guard_status"] = "not_called"
+            await self.conversation.publish(lease, 0, FALLBACK)
+            await self.conversation.finish(lease, usage=metadata)
+            return
         try:
             review = await self.reviewer(request, body)
         except ProviderError:
@@ -104,13 +111,38 @@ class Worker:
         metadata["complete"] = generation_usage is not None and review.usage is not None
         metadata["guard_action"] = "allowed" if review.allowed else "blocked_fallback"
         metadata["guard_reason"] = review.reason
-        remaining = body if review.allowed else FALLBACK
+        permissions = (
+            {d.source_id: d.permission for d in request.companion.memory_use}
+            if request.companion
+            else {}
+        )
+        mentions = list(review.mentions)
+        # Verbatim known facts have a deterministic witness too. Paraphrases
+        # without a validated shared span are deliberately not guessed into the ledger.
+        for hit in request.evidence:
+            if 2 <= len(hit.value) <= 80 and hit.value in body:
+                for source in hit.sources:
+                    if (
+                        permissions.get(source.message_id) == "mention"
+                        and hit.value in source.quote
+                        and len(mentions) < 12
+                    ):
+                        mentions.append(SourceMention(source_id=source.message_id, quote=hit.value))
+        allowed = review.allowed and await self.conversation.check_companion_output(
+            lease, body, mentions
+        )
+        if not allowed:
+            metadata["guard_action"] = "blocked_fallback"
+        remaining = body if allowed else FALLBACK
+        mentions = tuple(mentions) if allowed else ()
         segment_index = 0
         # The full body was reviewed; segmentation never adds or rewrites text.
         while remaining:
             match = re.search(r"[。！？.!?\n]", remaining[:256])
             length = match.end() if match else min(len(remaining), 256)
-            await self.conversation.publish(lease, segment_index, remaining[:length])
+            await self.conversation.publish(
+                lease, segment_index, remaining[:length], mentions=mentions
+            )
             remaining = remaining[length:]
             segment_index += 1
         await self.conversation.finish(lease, usage=metadata)

@@ -2,14 +2,18 @@ import asyncio
 import hmac
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from hmph.browser_auth import COOKIE, BrowserSessions
 from hmph.config import Settings
 from hmph.contracts import TERMINAL, DomainError
 from hmph.conversation import DEFAULT_CHARACTER, Conversation
@@ -17,6 +21,9 @@ from hmph.database import Database
 from hmph.dialogue import Dialogue
 from hmph.memory import Memory
 from hmph.memory_builds import MemoryBuilds
+from hmph.online_memory import MemorySelection
+from hmph.preference_types import ExpressionPreferences
+from hmph.preferences import Preferences
 
 
 class WriteBody(BaseModel):
@@ -37,7 +44,23 @@ class ForgetMemory(WriteBody):
 
 class CreateMemoryBuild(WriteBody):
     character_id: UUID = DEFAULT_CHARACTER
-    backend: Literal["mem0"] = "mem0"
+    backend: Literal["mem0", "graphiti"] = "mem0"
+
+
+class LoginBody(BaseModel):
+    token: str = Field(min_length=1, max_length=1024, repr=False)
+
+
+class UpdatePreferences(WriteBody):
+    conversation_id: UUID
+    expected_revision: int = Field(ge=1)
+    preferences: ExpressionPreferences
+
+
+class SelectMemoryBuild(WriteBody):
+    character_id: UUID = DEFAULT_CHARACTER
+    expected_revision: int = Field(ge=1)
+    build_id: UUID | None = None
 
 
 def create_app(settings: Settings | None = None, *, conversation: Conversation | None = None):
@@ -64,6 +87,53 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
                 await conversation.db.close()
 
     app = FastAPI(title="Hmph", version="0.1.0", lifespan=lifespan)
+    sessions = BrowserSessions(settings.browser_session_seconds)
+    static = Path(__file__).parent / "static"
+    app.mount("/static", StaticFiles(directory=static), name="static")
+
+    @app.middleware("http")
+    async def browser_headers(request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            )
+        return response
+
+    @app.get("/", include_in_schema=False)
+    async def index():
+        return FileResponse(static / "index.html")
+
+    @app.post("/api/session")
+    async def login(body: LoginBody, request: Request, response: Response):
+        key, session = sessions.login(request, body.token, settings.api_token.get_secret_value())
+        response.set_cookie(
+            COOKIE,
+            key,
+            max_age=settings.browser_session_seconds,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict",
+        )
+        return {"csrf_token": session.csrf, "expires_in": settings.browser_session_seconds}
+
+    @app.get("/api/session")
+    async def browser_session(request: Request):
+        session = sessions.require(request)
+        return {"csrf_token": session.csrf}
+
+    @app.post("/api/session/logout")
+    async def logout(request: Request, response: Response):
+        sessions.logout(request)
+        response.delete_cookie(COOKIE, httponly=True, samesite="strict")
+        return {"status": "logged_out"}
+
     memory = Memory(
         conversation.db,
         digest_key=conversation.digest_key,
@@ -71,17 +141,28 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     )
     dialogue = Dialogue(conversation.db)
     builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    selection = MemorySelection(conversation.db, digest_key=conversation.digest_key)
+    preferences = Preferences(conversation)
     security = HTTPBearer(auto_error=False)
 
     async def require_owner(
+        request: Request,
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
     ):
-        if credentials is None or not hmac.compare_digest(
-            credentials.credentials.encode(),
-            settings.api_token.get_secret_value().encode(),
-        ):
-            raise DomainError("unauthorized", 401)
+        if credentials is not None:
+            if not hmac.compare_digest(
+                credentials.credentials.encode(), settings.api_token.get_secret_value().encode()
+            ):
+                raise DomainError("unauthorized", 401)
+        else:
+            sessions.require(request, write=request.method not in ("GET", "HEAD", "OPTIONS"))
+            request.state.browser_authenticated = True
         return app.state.identity.owner_id
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request, error):
+        # FastAPI's default detail includes submitted values, including login credentials.
+        return JSONResponse(status_code=422, content={"error": {"code": "invalid_request"}})
 
     @app.exception_handler(DomainError)
     async def domain_error(request, error):
@@ -102,6 +183,9 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             "working_memory_status": "bounded_slots_and_raw_lookup",
             "semantic_retrieval": "evaluation_only",
             "framework_memory": "mem0_shadow_builds",
+            "graphiti_memory": "source_reader_experimental",
+            "framework_online": False,
+            "graphiti_reader_configured": bool(settings.graphiti_reader_python),
             "output_guard": "full_response"
             if settings.model_mode == "deepseek"
             else "fixture_whitelist",
@@ -122,6 +206,25 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     async def identity(owner_id: Annotated[UUID, Depends(require_owner)]):
         return app.state.identity
 
+    @app.get("/api/preferences")
+    async def read_preferences(
+        owner_id: Annotated[UUID, Depends(require_owner)], character_id: UUID = DEFAULT_CHARACTER
+    ):
+        return await preferences.read(owner_id, character_id)
+
+    @app.put("/api/preferences")
+    async def update_preferences(
+        body: UpdatePreferences, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await preferences.update(
+            owner_id,
+            body.conversation_id,
+            body.request_id,
+            body.expected_revision,
+            body.preferences,
+            model_mode=settings.model_mode,
+        )
+
     @app.post("/api/conversations", status_code=201)
     async def create_chat(body: CreateChat, owner_id: Annotated[UUID, Depends(require_owner)]):
         return await conversation.create_chat(owner_id, body.character_id, body.request_id)
@@ -129,6 +232,29 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     @app.get("/api/conversations")
     async def list_chats(owner_id: Annotated[UUID, Depends(require_owner)]):
         return await conversation.chats(owner_id)
+
+    @app.get("/api/conversations/page")
+    async def chat_page(
+        owner_id: Annotated[UUID, Depends(require_owner)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 30,
+        cursor: UUID | None = None,
+    ):
+        return await conversation.chat_page(owner_id, limit=limit, cursor=cursor)
+
+    @app.get("/api/active-turn")
+    async def active_turn(
+        owner_id: Annotated[UUID, Depends(require_owner)], character_id: UUID = DEFAULT_CHARACTER
+    ):
+        return await conversation.active_turn(owner_id, character_id)
+
+    @app.get("/api/conversations/{chat_id}/messages/page")
+    async def message_page(
+        chat_id: UUID,
+        owner_id: Annotated[UUID, Depends(require_owner)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        cursor: Annotated[int | None, Query(ge=1)] = None,
+    ):
+        return await conversation.message_page(owner_id, chat_id, limit=limit, cursor=cursor)
 
     @app.post("/api/conversations/{chat_id}/turns", status_code=202)
     async def accept_turn(
@@ -151,6 +277,10 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     @app.get("/api/turns/{turn_id}")
     async def turn(turn_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
         return await conversation.get_turn(owner_id, turn_id)
+
+    @app.get("/api/turns/{turn_id}/companion-plan")
+    async def companion_plan(turn_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
+        return await conversation.companion_explanation(owner_id, turn_id)
 
     @app.post("/api/turns/{turn_id}/cancel")
     async def cancel(
@@ -182,11 +312,42 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             model=settings.deepseek_model,
         )
 
+    @app.get("/api/memory-selection")
+    async def read_memory_selection(
+        owner_id: Annotated[UUID, Depends(require_owner)], character_id: UUID = DEFAULT_CHARACTER
+    ):
+        return await selection.get(owner_id, character_id)
+
+    @app.put("/api/memory-selection")
+    async def select_memory_build(
+        body: SelectMemoryBuild, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await selection.update(
+            owner_id,
+            body.character_id,
+            body.request_id,
+            expected_revision=body.expected_revision,
+            build_id=body.build_id,
+        )
+
+    @app.get("/api/turns/{turn_id}/memory-context")
+    async def memory_context(turn_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
+        return await conversation.memory_explanation(owner_id, turn_id)
+
+    @app.get("/api/memories/page")
+    async def memory_page(
+        owner_id: Annotated[UUID, Depends(require_owner)],
+        character_id: UUID = DEFAULT_CHARACTER,
+        limit: Annotated[int, Query(ge=1, le=100)] = 30,
+        cursor: UUID | None = None,
+    ):
+        return await memory.entries_page(owner_id, character_id, limit=limit, cursor=cursor)
+
     @app.get("/api/memory-builds/current")
     async def current_memory_build(
         owner_id: Annotated[UUID, Depends(require_owner)],
         character_id: UUID = DEFAULT_CHARACTER,
-        backend: Literal["mem0"] = "mem0",
+        backend: Literal["mem0", "graphiti"] = "mem0",
     ):
         return await builds.current(owner_id, character_id, backend=backend)
 
@@ -207,6 +368,25 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     @app.get("/api/memories/{memory_id}/history")
     async def memory_history(memory_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
         return await memory.history(owner_id, memory_id)
+
+    @app.get("/api/memories/{memory_id}/history/page")
+    async def memory_history_page(
+        memory_id: UUID,
+        owner_id: Annotated[UUID, Depends(require_owner)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 10,
+        cursor: Annotated[int | None, Query(ge=1)] = None,
+    ):
+        return await memory.history_page(owner_id, memory_id, limit=limit, cursor=cursor)
+
+    @app.get("/api/memories/{memory_id}/sources")
+    async def memory_source_page(
+        memory_id: UUID,
+        owner_id: Annotated[UUID, Depends(require_owner)],
+        revision: Annotated[int, Query(ge=1)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        cursor: UUID | None = None,
+    ):
+        return await memory.sources_page(owner_id, memory_id, revision, limit=limit, cursor=cursor)
 
     @app.get("/api/memories/{memory_id}/forget-preview")
     async def forget_preview(memory_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
@@ -248,6 +428,12 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             batch = initial
             last_heartbeat = time.monotonic()
             while not await request.is_disconnected():
+                if getattr(request.state, "browser_authenticated", False):
+                    try:
+                        sessions.require(request)
+                    except DomainError:
+                        yield "event: session.expired\ndata: {}\n\n"
+                        return
                 for event in batch:
                     # Recheck before exposing a cached event batch after concurrent forgetting.
                     if (await conversation.get_turn(owner_id, turn_id)).content_redacted:

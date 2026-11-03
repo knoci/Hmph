@@ -21,7 +21,7 @@ def initialize():
     print("Created .env with local credentials. Keep this file private.")
 
 
-async def run_database_command(name, *, max_calls=64, once=False):
+async def run_database_command(name, *, max_calls=64, once=False, backend_name="mem0"):
     settings = Settings()
     database = Database(settings.database_url.get_secret_value(), schema=settings.database_schema)
     try:
@@ -41,19 +41,36 @@ async def run_database_command(name, *, max_calls=64, once=False):
             if name == "framework-worker":
                 from hmph.framework_process import ProcessBackend
                 from hmph.framework_worker import FrameworkWorker
-                from hmph.mem0_backend import Mem0Backend
                 from hmph.memory_builds import MemoryBuilds
 
                 if settings.deepseek_api_key is None:
                     raise ValueError("Framework worker requires a local DeepSeek key")
-                backend = Mem0Backend(
-                    settings.deepseek_api_key,
-                    database_url=settings.database_url.get_secret_value(),
-                    max_calls=max_calls,
-                )
                 builds = MemoryBuilds(database, digest_key=conversation.digest_key)
-                worker = FrameworkWorker(builds, ProcessBackend(builds, backend))
-                print("Mem0 shadow worker running; requested builds may call DeepSeek.")
+                if backend_name == "graphiti":
+                    from hmph.framework_process import GraphitiProcessBackend
+                    from hmph.graphiti_backend import GraphitiBackend
+
+                    backend = GraphitiBackend(
+                        settings.deepseek_api_key,
+                        database_url=settings.database_url.get_secret_value(),
+                        database_schema=settings.database_schema,
+                        uri=settings.graphiti_uri,
+                        user=settings.graphiti_user,
+                        password=settings.graphiti_password.get_secret_value(),
+                        max_calls=max_calls,
+                    )
+                    execution = GraphitiProcessBackend(builds, backend)
+                else:
+                    from hmph.mem0_backend import Mem0Backend
+
+                    backend = Mem0Backend(
+                        settings.deepseek_api_key,
+                        database_url=settings.database_url.get_secret_value(),
+                        max_calls=max_calls,
+                    )
+                    execution = ProcessBackend(builds, backend)
+                worker = FrameworkWorker(builds, execution)
+                print(f"{backend_name} shadow worker running; explicit builds may call DeepSeek.")
                 if once:
                     await worker.run_once()
                 else:
@@ -65,8 +82,28 @@ async def run_database_command(name, *, max_calls=64, once=False):
                 "state-worker": build_state_worker,
                 "worker": build_worker,
             }[name]
+            reader = None
+            if name == "worker" and settings.graphiti_reader_python:
+                from hmph.graphiti_reader import GraphitiSourceReader
+
+                reader = GraphitiSourceReader(
+                    settings.graphiti_reader_python,
+                    uri=settings.graphiti_uri,
+                    user=settings.graphiti_user,
+                    password=settings.graphiti_password.get_secret_value(),
+                )
+                conversation.source_reader = reader
+                try:
+                    await reader.warmup()
+                    print("Local memory reader initialized; build selection remains explicit.")
+                except Exception:
+                    print("Local memory reader unavailable; using authoritative baseline fallback.")
             worker = factory(conversation, settings)
-            await worker.run_forever()
+            try:
+                await worker.run_forever()
+            finally:
+                if reader:
+                    await reader.close()
     finally:
         await database.close()
 
@@ -142,8 +179,9 @@ def main():
     commands.add_parser("memory-worker", help="Run sourced memory extraction independently")
     commands.add_parser("state-worker", help="Maintain grounded short-term state and watermarks")
     framework = commands.add_parser(
-        "framework-worker", help="Run opt-in persistent Mem0 shadow builds"
+        "framework-worker", help="Run opt-in persistent native shadow builds"
     )
+    framework.add_argument("--backend", choices=("mem0", "graphiti"), default="mem0")
     framework.add_argument(
         "--max-calls",
         type=int,
@@ -217,6 +255,7 @@ def main():
                     args.command,
                     max_calls=getattr(args, "max_calls", 64),
                     once=getattr(args, "once", False),
+                    backend_name=getattr(args, "backend", "mem0"),
                 )
             )
         except KeyboardInterrupt:

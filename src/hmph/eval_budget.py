@@ -117,7 +117,7 @@ class RunBudget:
     def bind(self, case_id, profile, stage):
         if (
             not isinstance(case_id, str)
-            or re.fullmatch(r"case-[0-9]{3}", case_id) is None
+            or re.fullmatch(r"(?:case-|p2-(?:dev|holdout)-)[0-9]{3}", case_id) is None
             or profile not in {"raw", "mem0", "graphiti"}
             or stage not in {"writer", "reader"}
         ):

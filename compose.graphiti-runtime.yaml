@@ -1,0 +1,29 @@
+name: hmph-graphiti-runtime
+services:
+  graphdb:
+    image: neo4j:5.26-community@sha256:249a1ec6e3c52d82101a5ed33d6ed2b5ed5b0017b21a28c0bfebc335e87fb177
+    container_name: hmph-graphiti-runtime
+    labels:
+      hmph.purpose: graphiti-persistent-runtime
+    ports:
+      - "127.0.0.1:17688:7687"
+      - "127.0.0.1:17475:7474"
+    environment:
+      NEO4J_AUTH: neo4j/hmph_graphiti_runtime_local_only
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+    mem_limit: 1536m
+    cpus: 2
+    volumes:
+      - graphiti_runtime_data:/data
+    tmpfs:
+      - /logs:rw,size=64m
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "hmph_graphiti_runtime_local_only", "RETURN 1"]
+      interval: 3s
+      timeout: 10s
+      start_period: 20s
+      retries: 20
+volumes:
+  graphiti_runtime_data:

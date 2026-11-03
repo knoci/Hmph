@@ -3,11 +3,14 @@
 import asyncio
 from collections.abc import AsyncGenerator
 from typing import Literal, Protocol
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from hmph.companion_policy import CompanionPlan
 from hmph.dialogue_types import ShortTermContext
 from hmph.memory_types import MemoryView
+from hmph.preference_types import ExpressionPreferences
 from hmph.working_memory import EvidenceWorkspace, RawEvidence
 
 FAKE_SENTENCES = ("哼，收到啦。", "我现在使用的是测试模型，还没有接入真实记忆。")
@@ -27,6 +30,8 @@ class GenerationRequest(BaseModel):
     short_term: ShortTermContext = Field(default_factory=ShortTermContext)
     raw_evidence: tuple[RawEvidence, ...] = ()
     workspace: EvidenceWorkspace | None = None
+    preferences: ExpressionPreferences = Field(default_factory=ExpressionPreferences)
+    companion: CompanionPlan | None = None
 
 
 class ModelUsage(BaseModel):
@@ -47,6 +52,13 @@ class GuardReview(BaseModel):
     allowed: bool
     reason: Literal["ok", "attack", "dependency", "distress", "fabricated_action", "other"]
     usage: ModelUsage | None = None
+    mentions: tuple["SourceMention", ...] = Field(default=(), max_length=2)
+
+
+class SourceMention(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    source_id: UUID
+    quote: str = Field(min_length=2, max_length=80)
 
 
 class ModelGateway(Protocol):

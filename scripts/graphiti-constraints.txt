@@ -1,5 +1,5 @@
 # Observed Graphiti native environment: Windows CPython 3.12.6.
-# Install the fixed Graphiti checkout separately; see native-references.md.
+# Install the fixed Graphiti checkout separately; see docs/research/framework-references.md.
 annotated-types==0.8.0
 anyio==4.16.0
 backoff==2.2.1
@@ -47,5 +47,6 @@ tokenizers==0.23.3
 tqdm==4.70.1
 typing-extensions==4.16.0
 typing-inspection==0.4.4
+tzdata==2026.6
 urllib3==2.8.0
 win32-setctime==1.2.1

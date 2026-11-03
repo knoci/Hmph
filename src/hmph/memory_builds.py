@@ -26,6 +26,7 @@ from hmph.models import (
     MemoryBuildSource,
     MemoryDeletion,
     MemoryDeletionSpace,
+    MemoryNativeSource,
     MemorySpace,
     MemoryTask,
     Message,
@@ -168,6 +169,9 @@ class MemoryBuilds:
     async def _retire(session, ids):
         if not ids:
             return
+        from hmph.online_memory import invalidate_reads
+
+        await invalidate_reads(session, ids)
         await session.execute(
             update(MemoryBuild)
             .where(MemoryBuild.id.in_(ids))
@@ -183,7 +187,7 @@ class MemoryBuilds:
         async with self.db.sessions() as session:
             build = await session.scalar(
                 select(MemoryBuild)
-                .join(Pair)
+                .join(Pair, MemoryBuild.pair_id == Pair.id)
                 .where(MemoryBuild.id == build_id, Pair.owner_id == owner_id)
             )
             if build is None:
@@ -207,7 +211,7 @@ class MemoryBuilds:
         async with self.db.sessions() as session:
             build = await session.scalar(
                 select(MemoryBuild)
-                .join(Pair)
+                .join(Pair, MemoryBuild.pair_id == Pair.id)
                 .where(MemoryBuild.id == build_id, Pair.owner_id == owner_id)
             )
             if build is None:
@@ -256,7 +260,7 @@ class MemoryBuilds:
         async with self.db.sessions.begin() as session:
             pair = await session.scalar(
                 select(Pair)
-                .join(MemoryBuild)
+                .join(MemoryBuild, MemoryBuild.pair_id == Pair.id)
                 .where(
                     MemoryBuild.status == "queued",
                     MemoryBuild.backend == backend,
@@ -369,9 +373,29 @@ class MemoryBuilds:
     async def reserve_execution(self, lease, identity):
         async with self.db.sessions.begin() as session:
             _, _, space, _ = await self._lease(session, lease)
-            if space.execution is not None or space.quiesced or identity.pid is not None:
+            if (
+                space.execution is not None
+                or space.quiesced
+                or identity.pid is not None
+                or identity.protocol != f"{lease.backend}-spawn-v1"
+            ):
                 raise DomainError("framework_execution_conflict")
             space.execution = identity.model_dump(mode="json")
+
+    async def register_native_sources(self, lease, sources):
+        """The writer binds native episode IDs before native ingestion, under its fence."""
+        expected = {(s.message_id, s.revision, s.source_order) for s in lease.sources}
+        actual = {(s.message_id, s.message_revision, s.source_order) for s in sources}
+        if (
+            actual != expected
+            or len(sources) != len(expected)
+            or len({s.native_id for s in sources}) != len(sources)
+            or any(s.space_id != lease.space_id for s in sources)
+        ):
+            raise DomainError("invalid_native_source_mapping")
+        async with self.db.sessions.begin() as session:
+            await self._lease(session, lease)
+            session.add_all(sources)
 
     async def start_execution(self, lease, reserved, running):
         async with self.db.sessions.begin() as session:
@@ -438,8 +462,17 @@ class MemoryBuilds:
                 for space, build in rows
             ]
 
-    async def confirm_execution_stopped(self, lease, expected, *, usage=None):
+    async def confirm_execution_stopped(
+        self, lease, expected, *, usage=None, stop_proof="process_lock_and_database_barrier"
+    ):
         """Trusted supervisor holds the OS lock and has drained backend operations."""
+        required = (
+            "process_lock_and_neo4j_fence"
+            if lease.backend == "graphiti"
+            else "process_lock_and_database_barrier"
+        )
+        if stop_proof != required or expected.protocol != f"{lease.backend}-spawn-v1":
+            raise DomainError("framework_stop_proof_required")
         async with self.db.sessions.begin() as session:
             await session.scalar(select(Pair).where(Pair.id == lease.pair_id).with_for_update())
             space = await session.scalar(
@@ -460,7 +493,7 @@ class MemoryBuilds:
             ):
                 raise DomainError("stale_framework_lease")
             space.quiesced = True
-            space.stop_proof = "process_lock_and_database_barrier"
+            space.stop_proof = stop_proof
             if usage is not None:
                 space.usage = BuildUsage.model_validate(usage).model_dump()
 
@@ -671,6 +704,9 @@ class MemoryBuilds:
             if space is None:
                 return False
             space.status, space.cleaned_at = "cleaned", now
+            await session.execute(
+                delete(MemoryNativeSource).where(MemoryNativeSource.space_id == space.id)
+            )
             space.cleanup_worker_id, space.cleanup_until, space.error_code = None, None, None
             await session.flush()
             receipts = list(
