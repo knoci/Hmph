@@ -1,4 +1,57 @@
 import httpx
+import pytest
+
+
+async def test_memory_selection_and_explanation_routes_require_auth_and_revision(conversation):
+    from uuid import uuid4
+
+    from hmph.api import create_app
+    from hmph.config import Settings
+
+    token = "test-only-token-at-least-32-characters"
+    app = create_app(
+        Settings(
+            api_token=token,
+            request_digest_key="test-only-digest-key-at-least-32-characters",
+            _env_file=None,
+        ),
+        conversation=conversation,
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            assert (await client.get("/api/memory-selection")).status_code == 401
+            assert (
+                await client.put(
+                    "/api/memory-selection", json={"request_id": "select", "expected_revision": 1}
+                )
+            ).status_code == 401
+            client.headers["Authorization"] = "Bearer " + token
+            await client.post("/api/conversations", json={"request_id": "chat"})
+            assert (await client.get("/api/memory-selection")).json() == {
+                "mode": "lexical",
+                "revision": 1,
+                "build_id": None,
+                "available": True,
+            }
+            selected = await client.put(
+                "/api/memory-selection",
+                json={"request_id": "select", "expected_revision": 1, "build_id": None},
+            )
+            assert selected.status_code == 200 and selected.json()["revision"] == 2
+            assert (
+                await client.put(
+                    "/api/memory-selection", json={"request_id": "stale", "expected_revision": 1}
+                )
+            ).status_code == 409
+            assert (
+                await client.put(
+                    "/api/memory-selection",
+                    json={"request_id": "bad", "expected_revision": 2, "build_id": str(uuid4())},
+                )
+            ).json()["error"]["code"] == "memory_build_unavailable"
+            assert (await client.get(f"/api/turns/{uuid4()}/memory-context")).status_code == 404
 
 
 async def test_http_acceptance_and_cursor_replay_with_an_independent_worker(conversation):
@@ -60,7 +113,10 @@ async def test_api_requires_credentials_and_labels_fake_mode(conversation):
             assert (await client.get("/health")).json()["model_mode"] == "fake"
 
 
-async def test_framework_build_http_is_authenticated_idempotent_and_shadow_only(conversation):
+@pytest.mark.parametrize("backend_name", ["mem0", "graphiti"])
+async def test_framework_build_http_is_authenticated_idempotent_and_shadow_only(
+    conversation, backend_name
+):
     from hmph.api import create_app
     from hmph.config import Settings
 
@@ -82,7 +138,7 @@ async def test_framework_build_http_is_authenticated_idempotent_and_shadow_only(
                 await client.post("/api/memory-builds", json={"request_id": "build"})
             ).status_code == 401
             client.headers["Authorization"] = "Bearer test-only-token-at-least-32-characters"
-            body = {"request_id": "build", "backend": "mem0"}
+            body = {"request_id": "build", "backend": backend_name}
             created = await client.post("/api/memory-builds", json=body)
             assert created.status_code == 202
             build = created.json()

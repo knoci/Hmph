@@ -5,6 +5,18 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import pytest
 
 
+def test_p2_trajectory_has_shared_writer_reader_budget_and_rejects_unbounded_ids(tmp_path):
+    from hmph.eval_budget import BudgetExceeded, RunBudget
+
+    budget = RunBudget(tmp_path / "p2.sqlite", max_calls=3, max_input_bytes=100, per_case_calls=2)
+    budget.bind("p2-dev-001", "graphiti", "writer").acquire(10)
+    budget.bind("p2-dev-001", "graphiti", "reader").acquire(10)
+    with pytest.raises(BudgetExceeded, match="case_call_budget"):
+        budget.bind("p2-dev-001", "graphiti", "reader").acquire(10)
+    with pytest.raises(ValueError, match="Invalid evaluation budget binding"):
+        budget.bind("arbitrary-personal-content", "graphiti", "writer")
+
+
 def reserve_in_process(path):
     from hmph.eval_budget import BudgetExceeded, RunBudget
 

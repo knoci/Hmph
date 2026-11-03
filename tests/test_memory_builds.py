@@ -2,6 +2,28 @@ from hmph.model_gateway import FakeModel
 from hmph.worker import Worker
 
 
+def test_graphiti_source_observation_uses_the_original_local_calendar():
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from hmph.graphiti_backend import source_body
+    from hmph.memory_build_types import BuildSource
+
+    source = BuildSource(
+        message_id=uuid4(),
+        revision=1,
+        source_order=1,
+        content="我明天去面试。",
+        observed_at=datetime(2026, 11, 2, 17, tzinfo=UTC),
+        source_timezone="Asia/Hong_Kong",
+    )
+    assert "2026-11-03T01:00:00+08:00" in source_body(source)
+    assert "Asia/Hong_Kong" in source_body(source)
+    assert "local timezone unknown" in source_body(
+        source.model_copy(update={"source_timezone": None})
+    )
+
+
 async def test_retired_supervised_attempt_cannot_register_a_late_child(conversation):
     from uuid import uuid4
 

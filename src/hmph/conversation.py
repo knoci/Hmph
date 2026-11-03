@@ -20,7 +20,7 @@ from hmph.contracts import (
 )
 from hmph.database import Database
 from hmph.dialogue import queue_dialogue, short_term_context, state_sources
-from hmph.model_gateway import ChatMessage, GenerationRequest
+from hmph.model_gateway import ChatMessage, ContextOrigin, GenerationRequest
 from hmph.models import (
     Character,
     Chat,
@@ -802,6 +802,19 @@ class Conversation:
                 turn.companion_plan = {**turn.companion_plan, "withheld_preferences": ["nickname"]}
             return GenerationRequest(
                 messages=tuple(chosen),
+                history_origins=tuple(
+                    ContextOrigin(
+                        message_id=row.id,
+                        message_revision=row.revision,
+                        start_offset=row.start_offset,
+                        end_offset=row.end_offset,
+                    )
+                    for row in reversed(source_rows)
+                ),
+                reference_time=turn.created_at.astimezone(ZoneInfo(turn.source_timezone))
+                if turn.source_timezone
+                else turn.created_at,
+                source_timezone=turn.source_timezone,
                 evidence=tuple(evidence),
                 short_term=short_term,
                 raw_evidence=tuple(raw_evidence),

@@ -129,6 +129,7 @@ class DeepSeekModel:
         model: str = "deepseek-flash",
         max_tokens: int = 256,
         transport: httpx.AsyncBaseTransport | None = None,
+        temperature: float | None = None,
     ):
         if not api_key.get_secret_value().strip():
             raise ValueError("DeepSeek credential is required")
@@ -138,6 +139,9 @@ class DeepSeekModel:
         self.model = model
         self.max_tokens = max_tokens
         self.transport = transport
+        if temperature is not None and not 0 <= temperature <= 2:
+            raise ValueError("Invalid model sampling temperature")
+        self.temperature = temperature
 
     def _client(self):
         return httpx.AsyncClient(
@@ -149,6 +153,7 @@ class DeepSeekModel:
 
     def _body(self, messages, *, stream, max_tokens):
         return {
+            **({"temperature": self.temperature} if self.temperature is not None else {}),
             "model": self.model,
             "messages": messages,
             "stream": stream,
@@ -227,6 +232,13 @@ class DeepSeekModel:
                 "若输入仅提示边界变更，就尊重设置，不复述或追问受限详情。"
                 + json.dumps(request.companion.model_context(), ensure_ascii=False)
             )
+        if request.reference_time is not None:
+            body["messages"][0]["content"] += (
+                "\n本轮消息观察时间（用于解释本轮相对时间，不是历史事件发生时间）："
+                + request.reference_time.isoformat()
+                + "；时区："
+                + (request.source_timezone or "unknown")
+            )
         body["stream_options"] = {"include_usage": True}
         if len(json.dumps(body, ensure_ascii=False).encode("utf-8")) > 16384:
             raise ProviderError("provider_input_limit")
@@ -284,6 +296,10 @@ class DeepSeekModel:
             "workspace": request.workspace.model_dump(mode="json") if request.workspace else None,
             "raw_evidence": [source.model_dump(mode="json") for source in request.raw_evidence],
             "candidate": candidate,
+            "reference_time": request.reference_time.isoformat()
+            if request.reference_time
+            else None,
+            "source_timezone": request.source_timezone,
             "expression_preferences": request.preferences.model_dump(),
             "companion_plan": request.companion.model_context() if request.companion else None,
         }

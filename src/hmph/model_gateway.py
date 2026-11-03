@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -32,6 +33,17 @@ class GenerationRequest(BaseModel):
     workspace: EvidenceWorkspace | None = None
     preferences: ExpressionPreferences = Field(default_factory=ExpressionPreferences)
     companion: CompanionPlan | None = None
+    reference_time: datetime | None = None
+    source_timezone: str | None = None
+    history_origins: tuple["ContextOrigin", ...] = ()
+
+
+class ContextOrigin(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    message_id: UUID
+    message_revision: int
+    start_offset: int | None
+    end_offset: int | None
 
 
 class ModelUsage(BaseModel):

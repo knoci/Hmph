@@ -64,6 +64,7 @@ class GraphitiBackend:
         password=RUNTIME_PASSWORD,
         max_calls=64,
         delegate=None,
+        call_budget=None,
     ):
         if not 1 <= max_calls <= 128:
             raise ValueError("Invalid framework call budget")
@@ -89,6 +90,7 @@ class GraphitiBackend:
             raise RuntimeError("Native Graphiti checkout must match its pinned revision")
         self.uri, self.user, self.password = local_uri(uri), user, password
         self.key, self.max_calls, self.delegate = key, max_calls, delegate
+        self.call_budget = call_budget
         self.database_url, self.database_schema = database_url, database_schema
         self.execution_id = None
         self.usage = empty_usage()
@@ -193,7 +195,11 @@ class GraphitiBackend:
         os.environ["EMBEDDING_DIM"] = "384"
         self.usage = empty_usage()
         transport = AsyncReferenceTransport(
-            self.key, model=lease.model, max_calls=self.max_calls, delegate=self.delegate
+            self.key,
+            model=lease.model,
+            max_calls=self.max_calls,
+            delegate=self.delegate,
+            budget=self.call_budget,
         )
         processed, changes = 0, 0
         graph = None

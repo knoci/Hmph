@@ -334,6 +334,8 @@ async def project_context(session, pair, turn, query, rows, candidates, short_te
                 role=row.role,
                 content=content,
                 turn_id=row.turn_id,
+                start_offset=span[0] if span else None,
+                end_offset=span[1] if span else None,
             )
         )
     from hmph.models import TurnSourceUse
