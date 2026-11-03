@@ -5,6 +5,20 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import pytest
 
 
+def test_trajectory_author_has_a_separate_bounded_ledger_identity(tmp_path):
+    from hmph.eval_budget import RunBudget
+
+    budget = RunBudget(
+        tmp_path / "author.sqlite", max_calls=1, max_input_bytes=4096, per_case_calls=1
+    )
+    bound = budget.bind("p2-holdout-001", "author", "trajectory_author")
+    bound.acquire(10)
+    row = budget.snapshot()["calls"][0]
+    assert row["profile"] == "author" and row["stage"] == "trajectory_author"
+    with pytest.raises(ValueError):
+        budget.bind("p2-holdout-001", "author", "gold_audit")
+
+
 def test_p2_trajectory_has_shared_writer_reader_budget_and_rejects_unbounded_ids(tmp_path):
     from hmph.eval_budget import BudgetExceeded, RunBudget
 

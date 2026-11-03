@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from importlib.util import find_spec
 
 import httpx
 import pytest
@@ -45,15 +46,27 @@ def test_prepared_plan_rejects_selection_drift_and_bounds_targeted_dev():
         protocol_limits("p2d-holdout", profiles)
 
 
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "lexical",
+        pytest.param(
+            "graphiti",
+            marks=pytest.mark.skipif(
+                find_spec("graphiti_core") is None, reason="native environment"
+            ),
+        ),
+    ],
+)
 async def test_product_runner_verifies_forgetting_when_extraction_returns_no_entries(
-    conversation, tmp_path
+    conversation, tmp_path, profile
 ):
     from hmph.config import Settings
     from hmph.product_eval import smoke_case
     from scripts.product_run import Services, run_case, scenario
 
     budget = RunBudget(tmp_path / "calls.sqlite", max_calls=30, max_input_bytes=1000000)
-    services = Services(SecretStr("mock"), budget, "p2-dev-999", "lexical", mock=True)
+    services = Services(SecretStr("mock"), budget, "p2-dev-999", profile, mock=True)
     original = services.mock_provider
 
     def provider(stage):

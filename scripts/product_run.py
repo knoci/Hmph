@@ -687,7 +687,7 @@ async def main(args):
 
     environment = {d.metadata["Name"]: d.version for d in distributions()}
     plan = {
-        "schema_version": "hmph-product-plan-v3",
+        "schema_version": "hmph-product-plan-v4",
         "protocol": args.protocol,
         "created_at": datetime.now(UTC).isoformat(),
         "dataset_sha256": checksum,
@@ -705,6 +705,11 @@ async def main(args):
         "code_hashes": hashes(),
         "environment": environment,
         "scoring": "p2d-product-answer-and-gold-blind-grounding-v3",
+        "source_ranking": (
+            "shared-bm25-word-cjk-stop-v2; graphiti adds canonical lexical complement"
+        ),
+        "mentions_protocol": "independently literal source_quote and published quote",
+        "forget_condition": "memory target, or actual original source when no entries exist",
         "stop_policy": {
             "futility_enabled": args.protocol == "p2d-holdout" and not args.smoke,
             "manual": "STOP file or Ctrl+C; deny next HTTP; drain in-flight; verify cleanup",

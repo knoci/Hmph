@@ -137,8 +137,12 @@ class RunBudget:
         audit = (
             isinstance(case_id, str)
             and re.fullmatch(r"p2-holdout-[0-9]{3}", case_id)
-            and profile == "audit"
-            and stage == "gold_audit"
+            and (
+                profile == "audit"
+                and stage == "gold_audit"
+                or profile == "author"
+                and stage == "trajectory_author"
+            )
         )
         if (
             not isinstance(case_id, str)
