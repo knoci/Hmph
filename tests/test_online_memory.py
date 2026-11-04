@@ -20,7 +20,7 @@ async def say(conversation, identity, text, key):
 async def ready_graph(conversation, identity):
     builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
     build = await builds.request(
-        identity.owner_id, identity.character_id, uuid4().hex, backend="graphiti"
+        identity.owner_id, identity.character_id, uuid4().hex, backend="graphiti", force=True
     )
     lease = await builds.claim("test-writer", backend="graphiti")
     ids = [str(uuid4()) for _ in lease.sources]

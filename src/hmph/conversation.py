@@ -412,6 +412,9 @@ class Conversation:
             )
             try:
                 await apply_controls(session, pair, turn, user_message)
+                from hmph.shared_threads import apply_thread_command
+
+                await apply_thread_command(session, pair, turn, user_message)
             except DomainError as error:
                 await self._terminal(session, turn, "failed", error.code)
                 return None
@@ -636,7 +639,9 @@ class Conversation:
             )
             audit = None
             if ticket is None:
-                candidates = await retrieve(session, turn, rows[0].content, short_term)
+                candidates = await retrieve(
+                    session, turn, rows[0].content, short_term, preferences=pair.preferences
+                )
             else:
                 candidates, audit = await expand_sources(
                     session,
@@ -648,10 +653,22 @@ class Conversation:
                     budget=evidence_budget,
                 )
             from hmph.companion import project_context, repaired
+            from hmph.shared_threads import prepare_thread
+
+            shared_thread = await prepare_thread(
+                session, pair, turn, lease.user_content, candidates
+            )
 
             inspected_rows = {row.id: row.source_seq for row in rows}
             rows, candidates, short_term, companion_plan = await project_context(
-                session, pair, turn, lease.user_content, rows, candidates, short_term
+                session,
+                pair,
+                turn,
+                lease.user_content,
+                rows,
+                candidates,
+                short_term,
+                shared_thread=shared_thread,
             )
             turn.companion_plan = {
                 **companion_plan.model_dump(mode="json"),
@@ -676,6 +693,11 @@ class Conversation:
                 raw_evidence.append(source)
                 evidence_bytes += size
             chosen = []
+            if companion_plan.shared_thread and not any(
+                str(s.message_id) == companion_plan.shared_thread["source_id"] for s in raw_evidence
+            ):
+                companion_plan = companion_plan.model_copy(update={"shared_thread": None})
+                turn.companion_plan = {**turn.companion_plan, "shared_thread": None}
             source_rows = []
             remaining = 5000 - evidence_bytes - state_bytes
             for row in rows:
@@ -726,6 +748,7 @@ class Conversation:
                 - len(raw_evidence),
             )
             workspace.policy_filtered_sources = len(inspected_rows) - len(rows)
+            workspace.query_hint_source_ids = candidates.query_hint_source_ids
             if workspace.policy_filtered_sources:
                 workspace.coverage = "partial"
             if audit is not None:
@@ -745,6 +768,17 @@ class Conversation:
                     "retrieval_status": "baseline",
                     "config_revision": pair.memory_config_revision,
                 }
+            turn.memory_context = {
+                **turn.memory_context,
+                "workspace": {
+                    "intent": workspace.plan.intent,
+                    "coverage": workspace.coverage,
+                    "evidence_count": len(evidence) + len(raw_evidence),
+                    "query_count": workspace.query_count,
+                    "state_hint_count": len(workspace.query_hint_source_ids),
+                    "pending_gap": short_term.pending_gap,
+                },
+            }
             for source in raw_evidence:
                 await session.execute(
                     insert(TurnSourceUse)
@@ -762,6 +796,24 @@ class Conversation:
                     .values(turn_id=turn.id, message_id=signal.id, message_revision=signal.revision)
                     .on_conflict_do_nothing()
                 )
+            if companion_plan.shared_thread:
+                from hmph.models import SharedThreadSource
+
+                for source_id in await session.scalars(
+                    select(SharedThreadSource.message_id).where(
+                        SharedThreadSource.thread_id == UUID(companion_plan.shared_thread["id"])
+                    )
+                ):
+                    source = await session.get(Message, source_id)
+                    if source.deleted:
+                        raise DomainError("source_invalidated")
+                    await session.execute(
+                        insert(TurnSourceUse)
+                        .values(
+                            turn_id=turn.id, message_id=source.id, message_revision=source.revision
+                        )
+                        .on_conflict_do_nothing()
+                    )
             for anchor in state_sources(short_term.data).values():
                 await session.execute(
                     insert(TurnSourceUse)

@@ -101,6 +101,30 @@ class Turn(Base):
     companion_plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
+class SharedThread(Base):
+    __tablename__ = "shared_threads"
+    __table_args__ = (
+        UniqueConstraint("pair_id", "topic"),
+        CheckConstraint(
+            "status IN ('open','paused','resolved','dropped')", name="shared_thread_status"
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    pair_id: Mapped[UUID] = mapped_column(ForeignKey("pairs.id"), index=True)
+    topic: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    revision: Mapped[int] = mapped_column(default=1)
+    source_message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"))
+
+
+class SharedThreadSource(Base):
+    __tablename__ = "shared_thread_sources"
+    thread_id: Mapped[UUID] = mapped_column(
+        ForeignKey("shared_threads.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+
+
 class RepairState(Base):
     __tablename__ = "companion_repairs"
     source_message_id: Mapped[UUID] = mapped_column(ForeignKey("messages.id"), primary_key=True)

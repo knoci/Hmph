@@ -636,6 +636,18 @@ class Memory:
 
         while True:
             before = (len(memories), len(messages), len(turns))
+            from hmph.models import SharedThread, SharedThreadSource
+
+            affected_threads = (
+                select(SharedThreadSource.thread_id)
+                .join(SharedThread)
+                .where(SharedThread.pair_id == pair_id, SharedThreadSource.message_id.in_(messages))
+            )
+            messages |= await ids(
+                select(SharedThreadSource.message_id).where(
+                    SharedThreadSource.thread_id.in_(affected_threads)
+                )
+            )
             copies = list(
                 await session.execute(
                     select(
@@ -825,6 +837,18 @@ class Memory:
             from hmph.models import CompanionMention, RepairState
 
             forget_controls(pair, memories)
+            from hmph.models import SharedThread, SharedThreadSource
+
+            await session.execute(
+                delete(SharedThread).where(
+                    SharedThread.pair_id == pair.id,
+                    SharedThread.id.in_(
+                        select(SharedThreadSource.thread_id).where(
+                            SharedThreadSource.message_id.in_(messages)
+                        )
+                    ),
+                )
+            )
             await session.execute(
                 delete(RepairState).where(
                     or_(

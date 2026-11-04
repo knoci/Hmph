@@ -215,7 +215,9 @@ def forget_controls(pair, memories):
         pair.policy_revision += 1
 
 
-async def project_context(session, pair, turn, query, rows, candidates, short_term):
+async def project_context(
+    session, pair, turn, query, rows, candidates, short_term, *, shared_thread=None
+):
     """One projection for every prompt channel, including original message bodies."""
     current = rows[0].id
     ids = {row.id for row in rows}
@@ -235,7 +237,14 @@ async def project_context(session, pair, turn, query, rows, candidates, short_te
     priority = {
         s.message_id: i for i, s in enumerate(s for hit in candidates.memories for s in hit.sources)
     }
-    messages.sort(key=lambda m: (priority.get(m.id, 1000), str(m.id)))
+    messages.sort(
+        key=lambda m: (
+            -1
+            if shared_thread and m.id == shared_thread.source_message_id
+            else priority.get(m.id, 1000),
+            str(m.id),
+        )
+    )
     control_ids = set(
         await session.scalars(
             select(MemorySource.message_id)
@@ -246,6 +255,19 @@ async def project_context(session, pair, turn, query, rows, candidates, short_te
                 MemoryEntry.predicate.in_(
                     ("expression_preferences", "companion_boundary", "companion_repair")
                 ),
+            )
+        )
+    )
+    from hmph.models import SharedThread, SharedThreadSource
+
+    control_ids |= set(
+        await session.scalars(
+            select(SharedThreadSource.message_id)
+            .join(SharedThread)
+            .where(
+                SharedThread.pair_id == pair.id,
+                (SharedThread.status != "open")
+                | (SharedThreadSource.message_id != SharedThread.source_message_id),
             )
         )
     )
@@ -267,6 +289,20 @@ async def project_context(session, pair, turn, query, rows, candidates, short_te
             )
         )
     )
+    if shared_thread and shared_thread.source_message_id in mentioned:
+        # A later explicit resume is fresh user intent; once actually mentioned
+        # again, the ordinary previous-publication suppression applies again.
+        latest_control = await session.scalar(
+            select(Turn.created_at)
+            .join(Message)
+            .join(SharedThreadSource, SharedThreadSource.message_id == Message.id)
+            .where(SharedThreadSource.thread_id == shared_thread.id)
+            .order_by(Turn.created_at.desc())
+            .limit(1)
+        )
+        prior = await session.get(Turn, previous_turn)
+        if latest_control is not None and latest_control > prior.created_at:
+            mentioned.discard(shared_thread.source_message_id)
     recent = {row.id for row in rows}
     cue = short_term.data.response_mode
     if cue:
@@ -291,7 +327,9 @@ async def project_context(session, pair, turn, query, rows, candidates, short_te
         query,
         pair.preferences,
         [
-            SourceCandidate(m.id, m.content, m.id in recent)
+            SourceCandidate(
+                m.id, m.content, m.id in recent or m.id in candidates.query_hint_source_ids
+            )
             for m in messages
             if m.id != current and m.role == "user" and m.id not in control_ids
         ],
@@ -301,7 +339,65 @@ async def project_context(session, pair, turn, query, rows, candidates, short_te
         unclear_repair=bool(turn.companion_plan and turn.companion_plan.get("controls_unclear")),
         mode_hint=cue.mode if cue else None,
         signal_source=cue.evidence.message_id if cue else None,
+        shared_source_id=shared_thread.source_message_id if shared_thread else None,
+        contextual_recall=bool(candidates.query_hint_source_ids),
     )
+    from hmph.shared_threads import interaction_rhythm
+
+    previous_messages = list(
+        await session.scalars(
+            select(Message)
+            .join(Turn)
+            .where(
+                Turn.pair_id == pair.id,
+                Turn.id != turn.id,
+                Turn.published_segments > 0,
+                Message.role == "assistant",
+                Message.deleted.is_(False),
+                Turn.created_at < turn.created_at,
+            )
+            .order_by(Turn.created_at.desc())
+            .limit(2)
+        )
+    )
+    plan = plan.model_copy(
+        update={"rhythm": interaction_rhythm([m.content for m in previous_messages])}
+    )
+    thread_control = (turn.companion_plan or {}).get("thread_control")
+    if thread_control:
+        plan = plan.model_copy(
+            update={
+                "thread_control": thread_control,
+                "shared_thread_action": "pause"
+                if thread_control == "paused"
+                else plan.shared_thread_action,
+            }
+        )
+    from sqlalchemy.dialects.postgresql import insert
+
+    from hmph.models import TurnSourceUse
+
+    for previous in previous_messages:
+        await session.execute(
+            insert(TurnSourceUse)
+            .values(turn_id=turn.id, message_id=previous.id, message_revision=previous.revision)
+            .on_conflict_do_nothing()
+        )
+    if shared_thread and any(
+        d.source_id == shared_thread.source_message_id and d.permission == "mention"
+        for d in plan.memory_use
+    ):
+        plan = plan.model_copy(
+            update={
+                "shared_thread": {
+                    "id": str(shared_thread.id),
+                    "topic": shared_thread.topic,
+                    "source_id": str(shared_thread.source_message_id),
+                    "revision": shared_thread.revision,
+                    "instruction": "合适时自然承接这一项共同计划；不要编造进展或催促。",
+                }
+            }
+        )
     permissions = {d.source_id: d.permission for d in plan.memory_use}
     targets = forbidden_targets(pair.preferences, query)
     spans = {}

@@ -5,6 +5,7 @@ revision/epoch/deletion protocol before this ranker can be enabled online.
 """
 
 import hashlib
+import json
 import math
 import time
 from collections import defaultdict
@@ -63,6 +64,43 @@ class LocalSemanticRanker:
             "personal_data_cache": False,
             "production_enabled": False,
         }
+        self._prepared = None
+
+    @staticmethod
+    def _corpus_key(documents):
+        checksum = hashlib.sha256()
+        for d in documents:
+            identity = [
+                d.source_id,
+                d.session_id,
+                d.timestamp,
+                d.start_offset,
+                d.end_offset,
+                d.content,
+            ]
+            checksum.update(json.dumps(identity, ensure_ascii=False).encode())
+            checksum.update(b"\n")
+        return checksum.hexdigest()
+
+    def prepare_public_index(self, documents):
+        """Explicit public-only, in-memory index. Build cost remains reportable."""
+        if not documents or len(documents) > 20000:
+            raise ValueError("Public index requires 1..20000 passages")
+        key = self._corpus_key(documents)
+        started = time.monotonic()
+        vectors = list(self.model.passage_embed([d.content for d in documents], batch_size=32))
+        if len(vectors) != len(documents):
+            raise RuntimeError("Incomplete embedding batch")
+        self._prepared = (key, vectors)
+        self.index_metrics = {
+            "passages": len(documents),
+            "build_seconds": time.monotonic() - started,
+            "storage": "process_memory_only",
+            "public_only": True,
+        }
+
+    def discard_public_index(self):
+        self._prepared = None
 
     def rank(self, documents, question):
         if not documents:
@@ -74,7 +112,13 @@ class LocalSemanticRanker:
         if not query_norm:
             raise RuntimeError("Invalid query embedding")
         started = time.monotonic()
-        vectors = list(self.model.passage_embed([d.content for d in documents], batch_size=32))
+        prepared = getattr(self, "_prepared", None)
+        if prepared is not None:
+            if prepared[0] != self._corpus_key(documents):
+                raise ValueError("Prepared public corpus changed; discard/rebuild explicitly")
+            vectors = prepared[1]
+        else:
+            vectors = list(self.model.passage_embed([d.content for d in documents], batch_size=32))
         index_seconds = time.monotonic() - started
         started = time.monotonic()
         scores = []
@@ -95,6 +139,6 @@ class LocalSemanticRanker:
             "query_seconds": query_seconds,
             "index_seconds": index_seconds,
             "scoring_seconds": time.monotonic() - started,
-            "index_reused": False,
+            "index_reused": prepared is not None,
         }
         return [index for _, index in sorted(scores, reverse=True)[:80]]

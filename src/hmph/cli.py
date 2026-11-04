@@ -178,6 +178,11 @@ def main():
     commands.add_parser("worker", help="Run the durable generation worker")
     commands.add_parser("memory-worker", help="Run sourced memory extraction independently")
     commands.add_parser("state-worker", help="Maintain grounded short-term state and watermarks")
+    start = commands.add_parser(
+        "start", help="Run the local API and three existing workers together"
+    )
+    start.add_argument("--port", type=int, default=8017)
+    start.add_argument("--stop-file", type=Path, help="Optional local graceful-stop marker")
     framework = commands.add_parser(
         "framework-worker", help="Run opt-in persistent native shadow builds"
     )
@@ -238,6 +243,13 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Input audit passed for {report['case_count']} cases. Quality evaluation: NOT RUN.")
+    elif args.command == "start":
+        from hmph.runtime import run_local
+
+        try:
+            asyncio.run(run_local(port=args.port, stop_file=args.stop_file))
+        except KeyboardInterrupt:
+            print("Stopped.")
     elif args.command == "serve":
         import uvicorn
 

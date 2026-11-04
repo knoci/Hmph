@@ -93,10 +93,15 @@ class MemoryBuilds:
             raise DomainError("not_found", 404)
         return pair
 
-    async def request(self, owner_id, character_id, request_id, *, backend, model="deepseek-flash"):
+    async def request(
+        self, owner_id, character_id, request_id, *, backend, model="deepseek-flash", force=False
+    ):
         if backend not in REVISIONS or model not in MODELS:
             raise DomainError("invalid_framework_config", 422)
-        digest = self.ledger.digest(str(character_id), {"backend": backend, "model": model})
+        body = {"backend": backend, "model": model}
+        if force:
+            body["force"] = True
+        digest = self.ledger.digest(str(character_id), body)
         async with self.db.sessions.begin() as session:
             await self.ledger.owner_lock(session, owner_id)
             existing = await self.ledger.request(
@@ -124,6 +129,36 @@ class MemoryBuilds:
             rows = [(m, order) for m, order in rows if retainable(m.content)]
             if sum(len(m.content.encode()) for m, _ in rows) > MAX_SOURCE_BYTES:
                 raise DomainError("framework_snapshot_too_large", 413)
+            snapshot_digest = self.ledger.digest(
+                str(pair.id), [[str(m.id), m.revision, order] for m, order in rows]
+            )
+            if not force:
+                ready_space = (
+                    select(MemorySpace.id)
+                    .where(
+                        MemorySpace.build_id == MemoryBuild.id,
+                        MemorySpace.status == "ready",
+                        MemorySpace.quiesced.is_(True),
+                    )
+                    .exists()
+                )
+                reusable = await session.scalar(
+                    select(MemoryBuild).where(
+                        MemoryBuild.pair_id == pair.id,
+                        MemoryBuild.backend == backend,
+                        MemoryBuild.backend_revision == REVISIONS[backend],
+                        MemoryBuild.model == model,
+                        MemoryBuild.memory_epoch == pair.memory_epoch,
+                        MemoryBuild.snapshot_digest == snapshot_digest,
+                        MemoryBuild.status == "ready",
+                        ready_space,
+                    )
+                )
+                if reusable is not None:
+                    self.ledger.save(
+                        session, owner_id, "memory.build", request_id, digest, reusable.id
+                    )
+                    return BuildView.model_validate(reusable)
             # Supersede unfinished builds. A previously ready space remains until publication.
             obsolete = list(
                 await session.scalars(
@@ -144,9 +179,7 @@ class MemoryBuilds:
                 model=model,
                 watermark=pair.next_memory_seq - 1,
                 source_count=len(rows),
-                snapshot_digest=self.ledger.digest(
-                    str(pair.id), [[str(m.id), m.revision, order] for m, order in rows]
-                ),
+                snapshot_digest=snapshot_digest,
             )
             pair.next_framework_seq += 1
             session.add(build)
@@ -193,6 +226,78 @@ class MemoryBuilds:
             if build is None:
                 raise DomainError("not_found", 404)
             return BuildView.model_validate(build)
+
+    async def health(self, owner_id, character_id):
+        """Advisory metadata only; never authorizes reads or triggers a build."""
+        async with self.db.sessions() as session:
+            pair = await self._pair(session, owner_id, character_id)
+            build = (
+                await session.get(MemoryBuild, pair.selected_memory_build)
+                if pair.selected_memory_build
+                else None
+            )
+            usable = bool(
+                build
+                and build.pair_id == pair.id
+                and build.memory_epoch == pair.memory_epoch
+                and build.status == "ready"
+                and build.backend == "graphiti"
+                and await session.scalar(
+                    select(MemorySpace.id).where(
+                        MemorySpace.build_id == build.id,
+                        MemorySpace.status == "ready",
+                        MemorySpace.quiesced.is_(True),
+                        MemorySpace.fence == build.fence,
+                    )
+                )
+            )
+            tasks = dict(
+                (
+                    await session.execute(
+                        select(MemoryTask.status, func.count())
+                        .join(Message, Message.id == MemoryTask.source_message_id)
+                        .where(
+                            MemoryTask.pair_id == pair.id,
+                            Message.deleted.is_(False),
+                            MemoryTask.memory_epoch == pair.memory_epoch,
+                        )
+                        .group_by(MemoryTask.status)
+                    )
+                ).all()
+            )
+            delta = (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(MemoryTask)
+                    .join(Message, Message.id == MemoryTask.source_message_id)
+                    .where(
+                        MemoryTask.pair_id == pair.id,
+                        Message.deleted.is_(False),
+                        MemoryTask.source_order > (build.watermark if usable else 0),
+                    )
+                )
+                if usable
+                else None
+            )
+            latest = await session.scalar(
+                select(MemoryBuild)
+                .where(
+                    MemoryBuild.pair_id == pair.id,
+                    MemoryBuild.memory_epoch == pair.memory_epoch,
+                )
+                .order_by(MemoryBuild.generation.desc())
+                .limit(1)
+            )
+            return {
+                "mode": "experimental_index" if usable else "fallback" if build else "baseline",
+                "build_watermark": build.watermark if usable else None,
+                "new_source_count": delta,
+                "pending_extractions": tasks.get("pending", 0) + tasks.get("leased", 0),
+                "failed_extractions": tasks.get("failed", 0),
+                "latest_build_status": latest.status if latest else None,
+                "freshness_semantics": "new_source_count_includes_unindexable_messages",
+                "automatic_framework_maintenance": False,
+            }
 
     async def current(self, owner_id, character_id, *, backend):
         async with self.db.sessions() as session:

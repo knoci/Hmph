@@ -130,7 +130,7 @@ class RunBudget:
     def bind(self, case_id, profile, stage):
         product = (
             isinstance(case_id, str)
-            and re.fullmatch(r"p2-(?:dev|holdout)-[0-9]{3}", case_id)
+            and re.fullmatch(r"(?:p2-(?:dev|holdout)|p5-dev)-[0-9]{3}", case_id)
             and profile in {"lexical", "graphiti"}
             and stage in {"extract", "state", "generation", "guard", "grounding", "answer_judge"}
         )
@@ -146,12 +146,16 @@ class RunBudget:
         )
         if (
             not isinstance(case_id, str)
-            or re.fullmatch(r"(?:case-|p2-(?:dev|holdout)-)[0-9]{3}", case_id) is None
+            or re.fullmatch(r"(?:case-|p2-(?:dev|holdout)-|p5-dev-)[0-9]{3}", case_id) is None
             or not (
                 product
                 or audit
-                or profile in {"raw", "mem0", "graphiti"}
+                or profile in {"raw", "mem0", "graphiti", "timem"}
                 and stage in {"writer", "reader"}
+                or profile in {"raw", "timem", "focused"}
+                and stage == "judge"
+                or profile == "focused"
+                and stage in {"planner", "reader"}
             )
         ):
             raise ValueError("Invalid evaluation budget binding")

@@ -9,6 +9,79 @@ from hmph.model_gateway import FakeModel
 from hmph.worker import Worker
 
 
+async def run_local(*, port=8017, stop_file=None):
+    """Own the API and the three existing workers in one supervised process."""
+    import asyncio
+
+    import uvicorn
+
+    from hmph.api import create_app
+    from hmph.database import Database
+
+    if not 0 <= port <= 65535:
+        raise ValueError("Invalid local port")
+    settings = Settings()
+    database = Database(settings.database_url.get_secret_value(), schema=settings.database_schema)
+    tasks = []
+    server = None
+    try:
+        conversation = Conversation(
+            database,
+            digest_key=settings.request_digest_key.get_secret_value().encode(),
+            turn_timeout=settings.turn_timeout_seconds,
+            source_timezone=settings.source_timezone,
+        )
+        await conversation.bootstrap()
+        app = create_app(settings, conversation=conversation)
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=port,
+                access_log=False,
+                proxy_headers=False,
+                log_level="warning",
+            )
+        )
+        tasks.append(asyncio.create_task(server.serve(), name="hmph-api"))
+        workers = (
+            build_worker(conversation, settings),
+            build_memory_worker(conversation, settings),
+            build_state_worker(conversation, settings),
+        )
+        tasks.extend(
+            asyncio.create_task(w.run_forever(), name=f"hmph-worker-{i}")
+            for i, w in enumerate(workers)
+        )
+        if stop_file is not None:
+
+            async def stop_monitor():
+                while not await asyncio.to_thread(stop_file.exists):  # noqa: ASYNC110 - external file
+                    await asyncio.sleep(0.2)
+                server.should_exit = True
+
+            tasks.append(asyncio.create_task(stop_monitor(), name="hmph-stop"))
+        print(f"Hmph: http://127.0.0.1:{port}/ · {settings.model_mode}", flush=True)
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        failed = any(t.get_name().startswith("hmph-worker-") for t in done)
+        server.should_exit = True
+        if not tasks[0].done():
+            try:
+                await asyncio.wait_for(asyncio.shield(tasks[0]), timeout=5)
+            except TimeoutError:
+                pass
+        if failed:
+            raise RuntimeError("local_worker_stopped")
+    finally:
+        if server is not None:
+            server.should_exit = True
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await database.close()
+
+
 def build_worker(conversation: Conversation, settings: Settings) -> Worker:
     if settings.model_mode == "fake":
         return Worker(

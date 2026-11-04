@@ -24,6 +24,7 @@ from hmph.memory_builds import MemoryBuilds
 from hmph.online_memory import MemorySelection
 from hmph.preference_types import ExpressionPreferences
 from hmph.preferences import Preferences
+from hmph.shared_threads import SharedThreads
 
 
 class WriteBody(BaseModel):
@@ -45,6 +46,7 @@ class ForgetMemory(WriteBody):
 class CreateMemoryBuild(WriteBody):
     character_id: UUID = DEFAULT_CHARACTER
     backend: Literal["mem0", "graphiti"] = "mem0"
+    force: bool = False
 
 
 class LoginBody(BaseModel):
@@ -61,6 +63,17 @@ class SelectMemoryBuild(WriteBody):
     character_id: UUID = DEFAULT_CHARACTER
     expected_revision: int = Field(ge=1)
     build_id: UUID | None = None
+
+
+class CreateSharedThread(WriteBody):
+    conversation_id: UUID
+    topic: str = Field(min_length=1, max_length=120)
+
+
+class UpdateSharedThread(WriteBody):
+    conversation_id: UUID
+    expected_revision: int = Field(ge=1)
+    status: Literal["open", "paused", "resolved", "dropped"]
 
 
 def create_app(settings: Settings | None = None, *, conversation: Conversation | None = None):
@@ -282,6 +295,44 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     async def companion_plan(turn_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]):
         return await conversation.companion_explanation(owner_id, turn_id)
 
+    @app.get("/api/shared-threads")
+    async def shared_threads(
+        owner_id: Annotated[UUID, Depends(require_owner)], character_id: UUID = DEFAULT_CHARACTER
+    ):
+        return await SharedThreads(conversation).read(owner_id, character_id)
+
+    @app.post("/api/shared-threads", status_code=201)
+    async def create_thread(
+        body: CreateSharedThread, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await SharedThreads(conversation).write(
+            owner_id,
+            body.conversation_id,
+            body.request_id,
+            topic=body.topic,
+            model_mode=settings.model_mode,
+        )
+
+    @app.get("/api/shared-threads/{thread_id}/sources")
+    async def shared_thread_sources(
+        thread_id: UUID, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await SharedThreads(conversation).sources(owner_id, thread_id)
+
+    @app.post("/api/shared-threads/{thread_id}")
+    async def update_thread(
+        thread_id: UUID, body: UpdateSharedThread, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await SharedThreads(conversation).write(
+            owner_id,
+            body.conversation_id,
+            body.request_id,
+            thread_id=thread_id,
+            expected_revision=body.expected_revision,
+            status=body.status,
+            model_mode=settings.model_mode,
+        )
+
     @app.post("/api/turns/{turn_id}/cancel")
     async def cancel(
         turn_id: UUID,
@@ -309,8 +360,15 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             body.character_id,
             body.request_id,
             backend=body.backend,
+            force=body.force,
             model=settings.deepseek_model,
         )
+
+    @app.get("/api/memory-health")
+    async def memory_health(
+        owner_id: Annotated[UUID, Depends(require_owner)], character_id: UUID = DEFAULT_CHARACTER
+    ):
+        return await builds.health(owner_id, character_id)
 
     @app.get("/api/memory-selection")
     async def read_memory_selection(

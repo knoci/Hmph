@@ -54,6 +54,9 @@ class CompanionPlan(BaseModel):
     output_limit: int = 256
     max_proactive_memories: int = 1
     signal_source: UUID | None = None
+    shared_thread: dict | None = None
+    rhythm: dict = Field(default_factory=dict)
+    thread_control: Literal["open", "paused", "resolved", "dropped"] | None = None
 
     def model_context(self):
         return {
@@ -165,6 +168,8 @@ def decide(
     unclear_repair=False,
     mode_hint=None,
     signal_source=None,
+    shared_source_id=None,
+    contextual_recall=False,
 ):
     prefs = ExpressionPreferences.model_validate(
         {k: v for k, v in preferences.items() if k in ExpressionPreferences.model_fields}
@@ -186,7 +191,9 @@ def decide(
         and not re.search(r"\b(?:should|could|would|if)\b|如果|假如|应该|建议", query, re.I)
         and any(len(terms.intersection(query_terms(c.text))) >= 2 for c in candidates)
     )
-    recall = (bool(RECALL.search(query)) or grounded_question) and not (close or unclear)
+    recall = (bool(RECALL.search(query)) or grounded_question or contextual_recall) and not (
+        close or unclear
+    )
     help_requested = bool(HELP.search(query)) and not listen
     celebrate = bool(
         re.search(r"好消息|拿到.{0,6}offer|通过.{0,6}考试|升职了|被录取了|庆祝", query, re.I)
@@ -251,7 +258,11 @@ def decide(
             permission, reason = "omit", "repeated"
         elif recall:
             permission, reason = "mention", "requested"
-        elif not proactive and terms.intersection(query_terms(visible)) and not listen:
+        elif (
+            not proactive
+            and not listen
+            and (terms.intersection(query_terms(visible)) or source.id == shared_source_id)
+        ):
             permission, reason, proactive = "mention", "proactive", True
         elif source.recent:
             permission, reason = "context_only", "continuity"

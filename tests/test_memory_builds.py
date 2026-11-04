@@ -60,6 +60,103 @@ async def say(conversation, identity, text, request_id):
     return (await conversation.messages(identity.owner_id, chat.id))[0]
 
 
+async def test_unchanged_ready_snapshot_reuses_build_but_explicit_force_rebuilds(conversation):
+    from sqlalchemy import func, select
+
+    from hmph.memory_builds import MemoryBuilds
+    from hmph.models import MemoryBuild, MemorySpace
+
+    identity = await conversation.bootstrap()
+    await say(conversation, identity, "我喜欢乌龙茶。", "reuse-source")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    first = await builds.request(
+        identity.owner_id, identity.character_id, "first-ready", backend="mem0"
+    )
+    lease = await builds.claim("reuse-only-test", backend="mem0")
+    await builds.quiesce(lease)
+    assert await builds.publish(lease)
+    reused = await builds.request(
+        identity.owner_id, identity.character_id, "reuse-ready", backend="mem0"
+    )
+    assert reused.id == first.id and reused.status == "ready"
+    async with conversation.db.sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(MemoryBuild)) == 1
+        assert await session.scalar(select(func.count()).select_from(MemorySpace)) == 1
+    forced = await builds.request(
+        identity.owner_id, identity.character_id, "forced-ready", backend="mem0", force=True
+    )
+    assert forced.id != first.id and forced.status == "queued"
+
+
+async def test_memory_health_reports_real_watermark_gap_without_building(conversation):
+    from uuid import uuid4
+
+    import pytest
+    from sqlalchemy import select
+
+    from hmph.contracts import DomainError
+    from hmph.memory_builds import MemoryBuilds
+    from hmph.models import MemoryBuild, MemorySpace, Pair
+
+    identity = await conversation.bootstrap()
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    await say(conversation, identity, "我喜欢乌龙茶。", "health-first")
+    status = await builds.health(identity.owner_id, identity.character_id)
+    assert status["mode"] == "baseline" and status["latest_build_status"] is None
+    assert status["pending_extractions"] == 1
+    frozen = await builds.request(
+        identity.owner_id, identity.character_id, "health-build", backend="graphiti"
+    )
+    assert (await builds.health(identity.owner_id, identity.character_id))[
+        "latest_build_status"
+    ] == "queued"
+    # Simulated lifecycle metadata tests advisory display, not Graphiti readiness.
+    async with conversation.db.sessions.begin() as session:
+        build = await session.get(MemoryBuild, frozen.id)
+        build.status = "ready"
+        session.add(
+            MemorySpace(
+                build_id=build.id,
+                status="ready",
+                fence=build.fence,
+                worker_id="health-fixture",
+                quiesced=True,
+            )
+        )
+        pair = await session.scalar(select(Pair).where(Pair.owner_id == identity.owner_id))
+        pair.selected_memory_build = build.id
+    await say(conversation, identity, "最近换成喝红茶。", "health-second")
+    status = await builds.health(identity.owner_id, identity.character_id)
+    assert status["mode"] == "experimental_index" and status["new_source_count"] == 1
+    assert status["build_watermark"] == frozen.watermark
+    assert status["automatic_framework_maintenance"] is False
+    async with conversation.db.sessions.begin() as session:
+        (await session.get(MemoryBuild, frozen.id)).status = "retired"
+    status = await builds.health(identity.owner_id, identity.character_id)
+    assert status["mode"] == "fallback" and status["new_source_count"] is None
+    with pytest.raises(DomainError, match="not_found"):
+        await builds.health(uuid4(), identity.character_id)
+
+
+async def test_changed_sources_do_not_reuse_old_ready_snapshot(conversation):
+    from hmph.memory_builds import MemoryBuilds
+
+    identity = await conversation.bootstrap()
+    await say(conversation, identity, "我喜欢乌龙茶。", "old-reuse-source")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    first = await builds.request(
+        identity.owner_id, identity.character_id, "old-ready", backend="mem0"
+    )
+    lease = await builds.claim("changed-reuse-test", backend="mem0")
+    await builds.quiesce(lease)
+    assert await builds.publish(lease)
+    await say(conversation, identity, "我现在改喝红茶。", "new-reuse-source")
+    updated = await builds.request(
+        identity.owner_id, identity.character_id, "changed-ready", backend="mem0"
+    )
+    assert updated.id != first.id and updated.source_count == 2
+
+
 async def test_build_freezes_retained_user_sources_and_survives_service_restart(conversation):
     from hmph.memory_builds import MemoryBuilds
 
@@ -217,7 +314,7 @@ async def test_new_request_supersedes_inflight_build_and_owner_cannot_read_anoth
     await builds.quiesce(latest)
     assert await builds.publish(latest)
     replacement = await builds.request(
-        identity.owner_id, identity.character_id, "replace", backend="mem0"
+        identity.owner_id, identity.character_id, "replace", backend="mem0", force=True
     )
     assert (
         await builds.current(identity.owner_id, identity.character_id, backend="mem0")

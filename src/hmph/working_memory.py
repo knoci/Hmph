@@ -7,7 +7,7 @@ from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import case, or_, select
 
 from hmph.lexical import bm25_order, tokenize
@@ -32,6 +32,39 @@ class RecallPlan(BaseModel):
     max_queries: int = 2
     candidate_limit: int = 80
     evidence_limit: int = 12
+
+
+class FocusSpan(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    source_id: str = Field(min_length=1, max_length=160)
+    quote: str = Field(min_length=2, max_length=80)
+    slot: Literal["entity", "time", "relation"]
+
+
+class FocusPlan(BaseModel):
+    """One optional literal retrieval bridge, never an answer or inferred fact."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    bridge: FocusSpan | None
+
+
+def focused_query(query, payload, sources):
+    """Validate against the supplied first-pass snippets before expanding a query.
+
+    This research primitive is not connected to the online model-call path.
+    Product callers must additionally validate source revisions/permission.
+    """
+    plan = FocusPlan.model_validate(payload)
+    if plan.bridge is None:
+        return query, None
+    bridge = plan.bridge
+    original = next((s for s in sources if s.source_id == bridge.source_id), None)
+    if original is None or bridge.quote not in original.content:
+        raise ValueError("Unverified retrieval bridge")
+    lookup = query + " " + bridge.quote
+    if len(lookup) > 4000:
+        raise ValueError("Retrieval bridge exceeds input limit")
+    return lookup, bridge.source_id
 
 
 class RawEvidence(BaseModel):
@@ -69,6 +102,7 @@ class EvidenceWorkspace(BaseModel):
     retrieval_status: str = "baseline"
     delta_gap: int = 0
     policy_filtered_sources: int = 0
+    query_hint_source_ids: tuple[UUID, ...] = ()
 
 
 def plan_recall(query):
@@ -196,14 +230,72 @@ class WorkingCandidates:
     raw: list[RawEvidence]
     query_count: int
     candidate_count: int
+    query_hint_source_ids: tuple[UUID, ...] = ()
 
 
-async def retrieve(session, turn, query, short_term):
+async def contextual_query(session, turn, query, short_term, preferences):
+    """Resolve one deictic lookup from current, grounded state. No new inference.
+
+    A lagging state, explicit correction, multiple possible antecedents or a
+    filtered source keeps the original query. Hints locate evidence, not facts.
+    """
+    if (
+        not re.search(r"那家|那次|这件|那个|这事|that (?:company|interview|event)", query, re.I)
+        or re.search(r"改成|不是|取消|换到|instead|correction", query, re.I)
+        or short_term.pending_gap
+        or short_term.processed_through_seq != turn.source_seq - 1
+    ):
+        return query, ()
+    from hmph.companion_policy import SourceCandidate, decide
+    from hmph.models import Message, Turn
+
+    closed = {
+        item.content.message_id for item in short_term.data.open_items if item.status != "open"
+    }
+    anchors = [
+        a for a in (short_term.data.goal, short_term.data.topic) if a and a.message_id not in closed
+    ]
+    # A goal takes precedence only when topic and goal name the same source;
+    # otherwise ambiguity is visible instead of guessed away.
+    unique = {(a.message_id, a.quote): a for a in anchors}
+    if len(unique) != 1:
+        return query, ()
+    anchor = next(iter(unique.values()))
+    original = await session.scalar(
+        select(Message)
+        .join(Turn)
+        .where(
+            Message.id == anchor.message_id,
+            Message.revision == anchor.message_revision,
+            Message.deleted.is_(False),
+            Message.role == "user",
+            Turn.pair_id == turn.pair_id,
+        )
+    )
+    if original is None or anchor.quote not in original.content:
+        return query, ()
+    policy = decide(
+        query,
+        preferences,
+        [SourceCandidate(original.id, original.content, True)],
+        policy_revision=turn.policy_revision,
+    )
+    if not policy.memory_use or policy.memory_use[0].permission == "omit":
+        return query, ()
+    if len(query) + len(anchor.quote) + 1 > 4000:
+        return query, ()
+    return query + " " + anchor.quote, (anchor.message_id,)
+
+
+async def retrieve(session, turn, query, short_term, *, preferences=None):
     plan = plan_recall(query)
+    lookup_query, hint_sources = await contextual_query(
+        session, turn, query, short_term, preferences or {}
+    )
     memories = await Memory.search(
         session,
         turn.pair_id,
-        query,
+        lookup_query,
         reference=turn.created_at,
         source_timezone=turn.source_timezone,
     )
@@ -214,6 +306,8 @@ async def retrieve(session, turn, query, short_term):
     raw, raw_count = [], 0
     rounds = 1
     if missing or plan.intent in ("multi_hop", "enumeration", "temporal"):
-        raw, raw_count = await search_raw(session, turn, query, missing, limit=80 - len(memories))
+        raw, raw_count = await search_raw(
+            session, turn, lookup_query, missing, limit=80 - len(memories)
+        )
         rounds = 2
-    return WorkingCandidates(plan, memories, raw, rounds, len(memories) + raw_count)
+    return WorkingCandidates(plan, memories, raw, rounds, len(memories) + raw_count, hint_sources)
