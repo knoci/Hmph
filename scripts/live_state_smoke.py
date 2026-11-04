@@ -472,6 +472,374 @@ async def recall_demo(directory, execute, *, selected_case=None, selected_profil
     )
 
 
+async def semantic_demo(
+    directory, execute, *, selected_case=None, existing_thread=False, thread_operations=None
+):
+    """New P5-b phrases through real state/generation/review, not a human rating."""
+    import hashlib
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from product_run import CapturingConversation, Services, evaluation_error_code, save
+    from sqlalchemy import select
+
+    from hmph.dialogue import Dialogue
+    from hmph.dialogue_worker import StateWorker
+    from hmph.eval_budget import RunBudget
+    from hmph.memory import Memory
+    from hmph.memory_worker import MemoryWorker
+    from hmph.models import Turn
+    from hmph.product_eval import RunControl
+    from hmph.shared_threads import SharedThreads
+    from hmph.timem_reference import local_test_key
+    from hmph.worker import Worker
+
+    plan = {
+        "purpose": "P5-b new semantic controls and natural pause development",
+        "model": "deepseek-flash",
+        "human_review": "not_run",
+        "selected_cases": [selected_case]
+        if selected_case
+        else ["retention", "thread", "boundary", "fact"],
+        "thread_setup": "existing_explicit_plan" if existing_thread else "implicit_invitation",
+        "thread_operations": thread_operations or ["create", "progress", "pause", "resume"],
+        "database": "postgresql+asyncpg://hmph:hmph_local_only@127.0.0.1:15439/hmph",
+        "cases": {
+            "retention": {
+                "old": "以后请叫我小沐。",
+                "change": (
+                    "往后就用小岚来称呼我吧，别再用小沐了。还有我说烦心事时，"
+                    "希望你今后先陪着听完，不要急着出主意，回复也尽量短一点。"
+                ),
+                "rounds": [1, 5, 20],
+                "new_session": True,
+            },
+            "thread": [
+                "以后陪我一起跟进法语考试，好不好？",
+                "法语考试的第一套模拟题我已经做完了。",
+                "法语考试先搁一搁吧，这阵子别继续追问了。",
+                "我们继续法语考试这件事吧。",
+            ],
+            "boundary": "往后请不要主动聊起松湾项目，我想先缓一缓。",
+            "modes": [
+                "今天只想吐槽一下，别给建议。",
+                "好消息，我通过考试了！",
+                "晚安，今天先这样。",
+            ],
+            "fact": [
+                "我现在住在海城。",
+                "之前说住海城已经过时，我上个月搬到了松湾，现在在松湾住。",
+            ],
+        },
+        "limits": {
+            "max_calls": 16 if selected_case else 64,
+            "max_input_bytes": (256 if selected_case else 1024) * 1024,
+            "per_case_calls": 16,
+        },
+        "stopping": "first technical failure, STOP or budget exhaustion; no paid retry or top-up",
+        "fixture": "seed/filler turns imported without assistant generation; probes are real chat",
+        "hashes": {
+            str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in [
+                Path(__file__),
+                ROOT / "scripts/product_run.py",
+                *ROOT.glob("src/hmph/**/*.py"),
+            ]
+        },
+    }
+    if not execute:
+        directory.mkdir(parents=True, exist_ok=False)
+        save(directory / "plan.json", plan)
+        print("Prepared P5-b new phrases; real calls=0")
+        return
+    if (directory / "report.json").exists() or plan != json.loads(
+        (directory / "plan.json").read_text(encoding="utf-8")
+    ):
+        raise ValueError("Frozen run changed or already started")
+    budget = RunBudget(directory / "calls.sqlite", **plan["limits"])
+    key = local_test_key(ROOT)
+    report = {"status": "running", "cases": [], "human_review": "not_run"}
+
+    def checkpoint():
+        save(directory / "report.json", {**report, "budget": budget.snapshot()})
+
+    checkpoint()
+    try:
+        for index, name in enumerate(("retention", "thread", "boundary", "fact"), 1):
+            if name not in plan["selected_cases"]:
+                continue
+            services = Services(
+                key, budget, f"p5-dev-{index:03}", "lexical", control=RunControl(directory / "STOP")
+            )
+            schema = "semantic_dev_" + uuid4().hex
+            db = Database(plan["database"], schema=schema)
+            admin = create_async_engine(plan["database"])
+            row = {"name": name, "status": "running", "probes": [], "schema_removed": False}
+            report["cases"].append(row)
+            try:
+                async with admin.begin() as connection:
+                    await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+                await db.migrate()
+                conv = CapturingConversation(
+                    db, digest_key=b"synthetic-semantic-only", source_timezone="Asia/Hong_Kong"
+                )
+                identity = await conv.bootstrap()
+                chat = await conv.create_chat(identity.owner_id, identity.character_id, uuid4().hex)
+                state = Dialogue(db)
+                shared = SharedThreads(conv)
+                generator = services.model("generation")
+                worker = Worker(
+                    conv,
+                    generator,
+                    model_mode="deepseek",
+                    model_name=plan["model"],
+                    reviewer=services.model("guard").review,
+                    lease_seconds=30,
+                )
+
+                async def captured_update(lease, *, services=services, row=row):
+                    row.setdefault("state_inputs", []).append(lease.model_dump(mode="json"))
+                    checkpoint()
+                    patch, usage = await services.model("state").update_state(lease)
+                    row.setdefault("state_patches", []).append(
+                        {
+                            "input": lease.model_dump(mode="json"),
+                            "patch": patch.model_dump(mode="json"),
+                        }
+                    )
+                    checkpoint()
+                    return patch, usage
+
+                updater = StateWorker(state, captured_update, model_mode="deepseek")
+                memory = Memory(db, digest_key=conv.digest_key)
+                chat_ref = [chat]
+
+                async def seed(
+                    content, *, services=services, conv=conv, identity=identity, chat_ref=chat_ref
+                ):
+                    services.check_stop()
+                    item = await conv.accept(
+                        identity.owner_id,
+                        chat_ref[0].id,
+                        uuid4().hex,
+                        content,
+                        model_mode="deepseek",
+                    )
+                    lease = await conv.claim("synthetic-import", model_mode="deepseek")
+                    if lease is None:
+                        raise RuntimeError("synthetic_seed_not_claimed")
+                    await conv.finish(lease)
+                    return item
+
+                async def update(
+                    *,
+                    updater=updater,
+                    services=services,
+                    state=state,
+                    identity=identity,
+                    chat_ref=chat_ref,
+                    db=db,
+                    row=row,
+                ):
+                    if not await updater.run_once():
+                        raise RuntimeError("state_not_claimed")
+                    services.check_budget()
+                    current = await state.read(identity.owner_id, chat_ref[0].id)
+                    row.setdefault("state_results", []).append(current.model_dump(mode="json"))
+                    if current.error_code:
+                        checkpoint()
+                        raise RuntimeError("state_failed")
+                    async with db.sessions() as session:
+                        origins = list(
+                            await session.scalars(
+                                select(Turn).where(Turn.conversation_id == chat_ref[0].id)
+                            )
+                        )
+                        row.setdefault("state_controls", []).append(
+                            [
+                                t.companion_plan.get("semantic_control")
+                                for t in origins
+                                if t.companion_plan and t.companion_plan.get("semantic_control")
+                            ]
+                        )
+
+                async def probe(
+                    content,
+                    label,
+                    *,
+                    services=services,
+                    conv=conv,
+                    identity=identity,
+                    chat_ref=chat_ref,
+                    worker=worker,
+                    db=db,
+                    row=row,
+                ):
+                    services.check_stop()
+                    item = await conv.accept(
+                        identity.owner_id,
+                        chat_ref[0].id,
+                        uuid4().hex,
+                        content,
+                        model_mode="deepseek",
+                    )
+                    if not await worker.run_once():
+                        raise RuntimeError("generation_not_claimed")
+                    services.check_budget()
+                    saved = await conv.get_turn(identity.owner_id, item.id)
+                    if saved.status != "completed":
+                        raise RuntimeError("generation_failed")
+                    body = next(
+                        (
+                            m.content
+                            for m in await conv.messages(identity.owner_id, chat_ref[0].id)
+                            if m.turn_id == item.id and m.role == "assistant"
+                        ),
+                        "",
+                    )
+                    async with db.sessions() as session:
+                        persisted = await session.get(Turn, item.id)
+                        usage = persisted.usage
+                    result = {
+                        "label": label,
+                        "input": conv.actual_input.model_dump(mode="json"),
+                        "reply": body,
+                        "usage": usage,
+                    }
+                    row["probes"].append(result)
+                    checkpoint()
+                    return result
+
+                cases = plan["cases"]
+                if name == "retention":
+                    await seed(cases[name]["old"])
+                    await seed(cases[name]["change"])
+                    await update()
+                    for number in range(1, 21):
+                        if number in cases[name]["rounds"]:
+                            await probe("用现在的称呼叫我一声吧，我今天有点累。", f"turn-{number}")
+                        else:
+                            await seed(f"今天第{number}件小事是整理桌面。")
+                    chat = await conv.create_chat(
+                        identity.owner_id, identity.character_id, uuid4().hex
+                    )
+                    chat_ref[0] = chat
+                    await probe("用现在的称呼叫我一声吧，我今天有点累。", "new-session")
+                    row["checks"] = [
+                        p["input"]["preferences"]["nickname"] == "小岚"
+                        and "小岚" in p["reply"]
+                        and "小沐" not in p["reply"]
+                        for p in row["probes"]
+                    ]
+                elif name == "thread":
+                    if existing_thread:
+                        await shared.write(
+                            identity.owner_id, chat.id, uuid4().hex, topic="法语考试"
+                        )
+                    for operation, content in zip(
+                        ("create", "progress", "pause", "resume"), cases[name], strict=True
+                    ):
+                        if operation not in plan["thread_operations"] or (
+                            existing_thread and operation == "create"
+                        ):
+                            continue
+                        if operation == "pause":
+                            await probe(content, "immediate-pause")
+                        else:
+                            await seed(content)
+                        await update()
+                        await probe(
+                            "法语考试我上次做到哪里了？"
+                            if operation == "progress"
+                            else "我回来了。",
+                            operation,
+                        )
+                        row.setdefault("threads", []).append(
+                            await shared.read(identity.owner_id, identity.character_id)
+                        )
+                    row["checks"] = [
+                        len(r["items"]) == 1 and r["items"][0]["status"] == expected
+                        for r, expected in zip(
+                            row["threads"],
+                            [
+                                {
+                                    "create": "open",
+                                    "progress": "open",
+                                    "pause": "paused",
+                                    "resume": "open",
+                                }[operation]
+                                for operation in ("create", "progress", "pause", "resume")
+                                if operation in plan["thread_operations"]
+                                and not (existing_thread and operation == "create")
+                            ],
+                            strict=True,
+                        )
+                    ]
+                    row["checks"].append(
+                        all(
+                            "?" not in p["reply"] and "？" not in p["reply"]
+                            for p in row["probes"]
+                            if p["label"] == "immediate-pause"
+                        )
+                    )
+                elif name == "boundary":
+                    await seed("我最近在做松湾项目。")
+                    await seed(cases[name])
+                    await update()
+                    for label, content in zip(
+                        ("listen", "celebrate", "close"), cases["modes"], strict=True
+                    ):
+                        await probe(content, label)
+                    row["checks"] = [
+                        "松湾项目" not in json.dumps(p["input"], ensure_ascii=False)
+                        and "松湾项目" not in p["reply"]
+                        for p in row["probes"]
+                    ]
+                else:
+                    extractor = MemoryWorker(
+                        memory, services.model("extract").extract, model_mode="deepseek"
+                    )
+                    for content in cases[name]:
+                        await seed(content)
+                        if not await extractor.run_once():
+                            raise RuntimeError("extraction_not_claimed")
+                        services.check_budget()
+                    await probe("我现在住在哪座城市？", "fact-correction")
+                    memories = await memory.entries(identity.owner_id, identity.character_id)
+                    row["memories"] = [m.model_dump(mode="json") for m in memories]
+                    row["checks"] = [
+                        "松湾" in row["probes"][0]["reply"]
+                        and any(
+                            m.predicate == "home_city" and m.value == "松湾" and m.revision >= 2
+                            for m in memories
+                        )
+                    ]
+                row["status"] = "passed" if all(row["checks"]) else "quality_failed"
+            finally:
+                await services.close()
+                await db.close()
+                async with admin.begin() as connection:
+                    await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+                row["schema_removed"] = True
+                await admin.dispose()
+                checkpoint()
+        report["status"] = "completed"
+    except BaseException as error:
+        report["status"] = "failed"
+        report["error_code"] = evaluation_error_code(error)
+    finally:
+        checkpoint()
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "cases": len(report["cases"]),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     modes = parser.add_mutually_exclusive_group(required=True)
@@ -479,14 +847,34 @@ if __name__ == "__main__":
     modes.add_argument(
         "--recall", type=Path, help="new isolated P4-c product development directory"
     )
+    modes.add_argument("--semantic", type=Path, help="new isolated P5-b phrases directory")
+    parser.add_argument("--semantic-case", choices=("retention", "thread", "boundary", "fact"))
+    parser.add_argument("--semantic-existing-thread", action="store_true")
+    parser.add_argument(
+        "--semantic-thread-operations", nargs="+", choices=("create", "progress", "pause", "resume")
+    )
     parser.add_argument("--recall-case", type=int, choices=(1, 2, 3))
     parser.add_argument("--recall-profile", choices=("lexical", "focused"))
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
     if not args.recall and (args.recall_case or args.recall_profile):
         parser.error("Recall selection requires --recall")
+    if args.semantic_case and not args.semantic:
+        parser.error("Semantic selection requires --semantic")
+    if args.semantic_existing_thread and args.semantic_case != "thread":
+        parser.error("Existing thread requires --semantic-case thread")
+    if args.semantic_thread_operations and args.semantic_case != "thread":
+        parser.error("Thread operation selection requires --semantic-case thread")
     asyncio.run(
-        recall_demo(
+        semantic_demo(
+            args.semantic,
+            args.run,
+            selected_case=args.semantic_case,
+            existing_thread=args.semantic_existing_thread,
+            thread_operations=args.semantic_thread_operations,
+        )
+        if args.semantic
+        else recall_demo(
             args.recall,
             args.run,
             selected_case=args.recall_case,

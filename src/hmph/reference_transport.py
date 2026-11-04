@@ -1,7 +1,8 @@
 """Metered, destination-restricted transport for isolated third-party research code.
 
 Native configurations use a harmless placeholder. Only this HTTPS transport adds
-the local credential, and it never persists headers, prompts or provider errors.
+the local credential. Default execution never persists headers or prompts.
+An explicit public-research observer may retain a failed request/choice, without headers.
 """
 
 import asyncio
@@ -48,6 +49,7 @@ class ReferenceTransport(httpx.BaseTransport):
         response_validator=None,
         budget=None,
         stop_file=None,
+        failure_observer=None,
     ):
         self._key = key
         self.model, self.max_calls, self.max_tokens = model, max_calls, max_tokens
@@ -55,6 +57,7 @@ class ReferenceTransport(httpx.BaseTransport):
         self.response_validator = response_validator
         self.budget = budget
         self.stop_file = stop_file
+        self.failure_observer = failure_observer
         self.records = []
         self.budget_exhausted = False
         self._lock = threading.Lock()
@@ -156,6 +159,18 @@ class ReferenceTransport(httpx.BaseTransport):
         except Exception as error:
             code = failure_code(error)
             record.update(status="failed", error_code=code)
+            if self.failure_observer is not None:
+                try:
+                    choices = response.json().get("choices") if response is not None else None
+                    diagnostic = {"reservation": reservation, "request": body, "choices": choices}
+                    # Even an echoed credential must never reach a diagnostic callback.
+                    if self._key.get_secret_value() in json.dumps(diagnostic, ensure_ascii=False):
+                        record["failure_capture"] = "credential_redacted"
+                    else:
+                        self.failure_observer(diagnostic)
+                        record["failure_capture"] = "captured"
+                except Exception:
+                    record["failure_capture"] = "unavailable"
             raise ReferenceCallError(code) from None
         finally:
             if response is not None and record["status"] != "completed":

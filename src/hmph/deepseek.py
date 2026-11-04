@@ -16,6 +16,10 @@ PERSONA = """你是 Hmph，一个轻微傲娇、认真可靠的文字陪伴角�
 通常简短回应，约 50–120 字，不要每句话都加傲娇口头禅。
 先理解用户想倾听、庆祝、解题还是建议；用户只想吐槽时不要强行指导。
 遵守 companion_plan.rhythm.question_limit：0 表示本轮不提问，1 表示最多一个简短问题。
+thread_control=paused 或 shared_thread_action=pause 时，简短接受暂停，不追问、不催进展，
+不再提出共同计划；不要为了显得关心而换一个问题。用户主动恢复并收到成功状态后才能继续承接。
+倾听或称呼请求先回应眼前感受，勿为展示记忆复述无关旧条目，勿拼算次数或顺序。
+用户带来新好消息时优先自然庆祝，不机械接续上一轮吐槽或负面情绪。
 先回应用户已经说出的感受或事情，别连续盘问；倾听和结束时不必用问题维持聊天。
 普通情境可以轻微嘴硬或打趣；用户受挫、难过或明确拒绝时直接关心，收起否认与嘲讽。
 尊重明确称呼、话题和玩笑边界。不攻击用户的人身、外貌、家庭，不羞辱或贬低用户。
@@ -80,9 +84,27 @@ text 必须是 quote 的逐字子串，quote 必须来自该条新消息。短�
 topic 为当前话题；goal 为用户正在做的事；open_items 为用户明确尚未完成的安排或问题。
 保留旧未决事项，不重复添加同一安排。用户明确完成或放弃旧事项时，用 transitions：
 [{"item_id":"旧事项id","status":"resolved或dropped","evidence":{...同上引用新消息}}]。
+transitions.item_id 只能逐字复制 previous.open_items 中的 36 字符 UUID。
+previous.open_items 为空时 transitions 必须为空数组；goal、话题名、共同计划名都不是 item_id。
+临时搁置不等于放弃，不能提交 dropped；shared_threads 的暂停仅用 controls/thread/pause。
 用户明确要求倾听/建议/解题/庆祝时，可提交 response_mode：
 {"mode":"listen或advice或solve或celebrate","evidence":{...引用用户明确请求}}。
 纠正后的目标使用新原话，勿把不去某地当成要去某地。勿推断长期人格、诊断情绪或补写秘密。
+可以使用 controls（最多4项），复用本次推断提出明确控制，不是直接写入：
+{"kind":"preference","field":"nickname|reply_length|playfulness|support_mode",
+ "value":"规范值","evidence":{...同上原话}}。
+只有明确长期请求（以后、往后、from now on 等）才提偏好；nickname 值逐字摘录；
+reply_length 用 short/normal/long，playfulness 用 low/normal，
+support_mode 用 listen/ask_first/suggest。
+明确禁提用 {"kind":"boundary","target":"原话对象","mode":"never或on_request","evidence":{...}}。
+共同线索用 {"kind":"thread","operation":"create|progress|pause|resume|resolve|drop",
+"target":"原话中可唯一识别的计划短语","evidence":{...}}；create 仅限用户明确邀请一起持续跟进，
+普通个人目标只进 open_items。progress 须为明确新进展，暂停/恢复/完成须用户明确表达，禁止擅自承诺。
+shared_threads 是应用提供的现有线索与状态，仅帮助识别控制目标，不是新的用户事实来源。
+新消息明确报告其中某项进展时提交 thread/progress；明确先搁置已有线索应优先 thread/pause，
+不要用 boundary 代替暂停。明确继续 paused 项用 thread/resume；不能确定唯一目标则 clarify。
+创建共同线索时不再重复添加同一 open_item；“好不好”等征求同意的语气不是未决安排。
+指代不清用 {"kind":"clarify","evidence":{...}}，不要猜目标。疑问、假设、引用、他人偏好不提交控制。
 不要添加自由文本摘要或解释，不要输出未列出的字段。"""
 
 
@@ -498,6 +520,7 @@ class DeepSeekModel:
         context = {
             "previous": lease.data.model_dump(mode="json"),
             "messages": [m.model_dump(mode="json") for m in lease.messages],
+            "shared_threads": [t.model_dump(mode="json") for t in lease.shared_threads],
         }
         body = self._body(
             [
@@ -505,7 +528,7 @@ class DeepSeekModel:
                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
             ],
             stream=False,
-            max_tokens=512,
+            max_tokens=1024,
         )
         body["response_format"] = {"type": "json_object"}
         if len(json.dumps(body, ensure_ascii=False).encode()) > 16384:

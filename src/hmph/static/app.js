@@ -94,8 +94,10 @@ async function loadMemoryHealth(){
     const mode=health.mode==="experimental_index"?`已选择实验索引，其快照后有 ${health.new_source_count} 条新原话（并非都需要保存）。`:health.mode==="fallback"?"选定的实验索引暂不可用，回复使用原话检索。":"目前使用原话检索，未启用增强索引。";
     const pending=health.pending_extractions?`还有 ${health.pending_extractions} 项原话等待整理。`:"";
     const failed=health.failed_extractions?`有 ${health.failed_extractions} 项整理失败，可在来源任务中查看。`:"";
-    const building=["queued","building"].includes(health.latest_build_status)?"另有索引正在准备，完成前仍使用当前可用线索。":"";
-    root.textContent=mode+pending+failed+building+"不会自动付费重建索引。";
+    const building=({queued:"候选记忆正在排队整理，期间仍使用当前可用来源。",building:"候选记忆正在整理，期间仍使用当前可用来源。",ready:"候选记忆已整理完成，不会自动改变聊天选择。",failed:"本次候选整理失败，现有可用来源仍保留。",retired:"旧候选已退役，回复使用当前可用来源。"})[health.latest_build_status]||"";
+    const maintenance=health.maintenance;
+    const upkeep=maintenance?.enabled?`后台整理已明确配置，剩余调用预留额度 ${maintenance.remaining_calls}。仅在维护进程运行时处理，结果不自动用于聊天。`:maintenance?.suspended_reason?"后台整理已暂停，请查看构建状态；不会自动追加调用额度。":"后台整理未启用，不会自动付费重建索引。";
+    root.textContent=mode+pending+failed+building+upkeep;
   }catch{root.textContent="暂时无法读取整理进度；仍可查看或忘记记忆。";}
 }
 async function loadMemoryState(){

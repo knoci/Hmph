@@ -31,6 +31,19 @@ class ModeCue(BaseModel):
     evidence: Anchor
 
 
+class ControlCue(BaseModel):
+    """A proposal from the existing state updater, never an active preference."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal["preference", "boundary", "thread", "clarify"]
+    field: Literal["nickname", "reply_length", "playfulness", "support_mode"] | None = None
+    value: str | None = Field(default=None, max_length=40)
+    operation: Literal["create", "progress", "pause", "resume", "resolve", "drop"] | None = None
+    target: str | None = Field(default=None, min_length=1, max_length=120)
+    mode: Literal["never", "on_request"] | None = None
+    evidence: Anchor
+
+
 class StatePatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     topic: Anchor | None = None
@@ -39,6 +52,7 @@ class StatePatch(BaseModel):
     open_items: list[Anchor] = Field(default_factory=list, max_length=6)
     transitions: list[Transition] = Field(default_factory=list, max_length=6)
     response_mode: ModeCue | None = None
+    controls: list[ControlCue] = Field(default_factory=list, max_length=4)
 
 
 class OpenItem(BaseModel):
@@ -71,6 +85,12 @@ class StateMessage(BaseModel):
     content: str
 
 
+class SharedThreadHint(BaseModel):
+    topic: str
+    status: Literal["open", "paused"]
+    revision: int
+
+
 class StateLease(BaseModel):
     conversation_id: UUID
     pair_id: UUID
@@ -81,6 +101,8 @@ class StateLease(BaseModel):
     fence: int
     data: StateData
     messages: tuple[StateMessage, ...]
+    policy_revision: int = 0
+    shared_threads: tuple[SharedThreadHint, ...] = ()
 
 
 class StateResult(BaseModel):

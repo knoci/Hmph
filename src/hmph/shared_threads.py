@@ -4,7 +4,7 @@ import re
 
 from sqlalchemy import func, select
 
-from hmph.companion_policy import CLOSE, LISTEN, SENSITIVE, forbidden_in
+from hmph.companion_policy import CLOSE, LISTEN, PAUSE, SENSITIVE, forbidden_in
 from hmph.contracts import ACTIVE, DomainError
 from hmph.dialogue import queue_dialogue
 from hmph.models import MemoryTask, Message, Pair, SharedThread, SharedThreadSource, Turn
@@ -246,7 +246,7 @@ class SharedThreads:
 
 
 async def prepare_thread(session, pair, turn, query, candidates):
-    if CLOSE.search(query.strip()) or LISTEN.search(query) or SENSITIVE.search(query):
+    if any(pattern.search(query.strip()) for pattern in (CLOSE, LISTEN, PAUSE, SENSITIVE)):
         return None
     threads = list(
         await session.scalars(
@@ -296,15 +296,15 @@ async def prepare_thread(session, pair, turn, query, candidates):
     return None
 
 
-async def apply_thread_command(session, pair, turn, message):
+async def apply_thread_command(session, pair, turn, message, *, proposed=None):
     """Only complete, explicit commands. No quote, hypothesis or implicit pledge."""
-    match = re.fullmatch(
+    match = proposed or re.fullmatch(
         r"(?:请)?(记下|暂停|恢复|完成|放下)共同计划[：:]\s*(.{1,120}?)[。！!]?",
         message.content.strip(),
     )
     if not match:
         return False
-    operation, topic = match.groups()
+    operation, topic = match if proposed else match.groups()
     if not retainable(topic):
         raise DomainError("invalid_thread_topic", 422)
     status = {
@@ -313,10 +313,15 @@ async def apply_thread_command(session, pair, turn, message):
         "恢复": "open",
         "完成": "resolved",
         "放下": "dropped",
+        "进展": None,
     }[operation]
     thread = await session.scalar(
         select(SharedThread).where(SharedThread.pair_id == pair.id, SharedThread.topic == topic)
     )
+    if operation == "进展":
+        if thread is None or thread.status != "open":
+            raise DomainError("thread_transition_conflict")
+        status = thread.status
     if operation == "记下":
         if thread:
             raise DomainError("thread_exists")
@@ -332,7 +337,7 @@ async def apply_thread_command(session, pair, turn, message):
     else:
         if thread is None:
             raise DomainError("thread_not_found", 404)
-        if status not in TRANSITIONS[thread.status]:
+        if operation != "进展" and status not in TRANSITIONS[thread.status]:
             raise DomainError("thread_transition_conflict")
         if (
             await session.scalar(
@@ -345,6 +350,7 @@ async def apply_thread_command(session, pair, turn, message):
             raise DomainError("thread_source_limit", 422)
     if (
         status == "open"
+        and operation != "进展"
         and await session.scalar(
             select(func.count())
             .select_from(SharedThread)
@@ -365,7 +371,7 @@ async def apply_thread_command(session, pair, turn, message):
     task = await session.scalar(
         select(MemoryTask).where(MemoryTask.source_message_id == message.id)
     )
-    if task:
+    if task and proposed is None:
         task.status = "done"
     pair.policy_revision += 1
     turn.policy_revision = pair.policy_revision

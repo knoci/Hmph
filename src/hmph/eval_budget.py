@@ -159,7 +159,7 @@ class RunBudget:
                 or recall_product
                 or profile in {"raw", "mem0", "graphiti", "timem"}
                 and stage in {"writer", "reader"}
-                or profile in {"raw", "timem", "focused"}
+                or profile in {"raw", "timem", "focused", "mem0", "graphiti"}
                 and stage == "judge"
                 or profile == "focused"
                 and stage in {"planner", "reader"}

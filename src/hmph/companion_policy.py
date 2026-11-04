@@ -94,6 +94,9 @@ CLOSE = re.compile(
 LISTEN = re.compile(
     r"只想.{0,4}(?:倾诉|吐槽|说说)|先听我|别.{0,4}(?:建议|办法)|不要.{0,4}建议|不需要建议"
 )
+PAUSE = re.compile(
+    r"先.{0,16}(?:搁一搁|搁置|暂停|放一放|别聊)|(?:别|不要|不再).{0,6}(?:追问|继续聊)"
+)
 HELP = re.compile(r"给我.{0,4}建议|帮我.{0,4}(?:分析|解决|想办法)|该怎么办|how (?:do|can) I", re.I)
 SENSITIVE = re.compile(r"失恋|创伤|自杀|抑郁|病情|性经历|家暴|银行卡|密码|trauma|diagnosis", re.I)
 UNCLEAR = re.compile(r"你.{0,3}(?:又|记|叫|弄|说)错|不是我的|不是我|别再这样")
@@ -175,6 +178,7 @@ def decide(
         {k: v for k, v in preferences.items() if k in ExpressionPreferences.model_fields}
     )
     close, listen = bool(CLOSE.search(query.strip())), bool(LISTEN.search(query))
+    pause = bool(PAUSE.search(query))
     unclear = not repaired and (unclear_repair or bool(UNCLEAR.search(query)))
     # A question about a retrieved event can omit "I/my" entirely. Use the
     # existing query plan and content words, while keeping advice/hypotheses out.
@@ -248,8 +252,8 @@ def decide(
         visible = source.text[slice(*span)] if span else ""
         if span is None:
             permission, reason = "omit", "boundary"
-        elif close or unclear:
-            permission, reason = "omit", "closing" if close else "unclear_repair"
+        elif close or unclear or pause:
+            permission, reason = "omit", "closing" if close or pause else "unclear_repair"
         elif SENSITIVE.search(visible) and not (
             recall and terms.intersection(query_terms(visible))
         ):
@@ -277,7 +281,7 @@ def decide(
         tone="gentle" if gentle else "warm",
         operator="direct_care" if gentle else "none",
         memory_use=tuple(decisions),
-        shared_thread_action="pause" if close else "hold",
+        shared_thread_action="pause" if close or pause else "hold",
         repair_action="applied" if repaired else "clarify" if unclear else "none",
         signal_source=signal_source if used_signal else None,
     )

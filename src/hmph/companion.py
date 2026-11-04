@@ -75,8 +75,8 @@ def parse_controls(text):
     return patch, boundaries
 
 
-async def apply_controls(session, pair, turn, message):
-    patch, boundaries = parse_controls(message.content)
+async def apply_controls(session, pair, turn, message, *, proposed=None):
+    patch, boundaries = parse_controls(message.content) if proposed is None else proposed
     unclear = bool(
         re.fullmatch(r"你又?(?:记|叫|弄|说)错了[。！!]?|别再这样[。！!]?", message.content)
     )
@@ -179,7 +179,11 @@ async def apply_controls(session, pair, turn, message):
                 status="open" if unclear else "corrected",
             )
         )
-    turn.companion_plan = {"controls_applied": not unclear, "controls_unclear": unclear}
+    turn.companion_plan = {
+        **(turn.companion_plan or {}),
+        "controls_applied": not unclear,
+        "controls_unclear": unclear,
+    }
     return not unclear
 
 
@@ -260,6 +264,22 @@ async def project_context(
     )
     from hmph.models import SharedThread, SharedThreadSource
 
+    progress_ids = set(
+        await session.scalars(
+            select(SharedThreadSource.message_id)
+            .join(SharedThread)
+            .join(Message, Message.id == SharedThreadSource.message_id)
+            .join(Turn, Turn.id == Message.turn_id)
+            .where(
+                SharedThread.pair_id == pair.id,
+                SharedThread.status == "open",
+                Turn.companion_plan["semantic_control"]["status"].astext == "applied",
+                Turn.companion_plan["semantic_control"]["proposals"].contains(
+                    [{"kind": "thread", "operation": "progress"}]
+                ),
+            )
+        )
+    )
     control_ids |= set(
         await session.scalars(
             select(SharedThreadSource.message_id)
@@ -270,7 +290,7 @@ async def project_context(
                 | (SharedThreadSource.message_id != SharedThread.source_message_id),
             )
         )
-    )
+    ) - progress_ids
     previous_turn = await session.scalar(
         select(Turn.id)
         .where(
@@ -373,6 +393,8 @@ async def project_context(
                 else plan.shared_thread_action,
             }
         )
+    if plan.shared_thread_action == "pause":
+        plan = plan.model_copy(update={"rhythm": {**plan.rhythm, "question_limit": 0}})
     from sqlalchemy.dialects.postgresql import insert
 
     from hmph.models import TurnSourceUse
@@ -528,6 +550,8 @@ def output_block_reason(pair, turn, query, body):
         return "boundary"
     if plan and plan.act == "close" and re.search(r"[?？]", body):
         return "closing_question"
+    if plan and plan.shared_thread_action == "pause" and re.search(r"[?？]", body):
+        return "paused_question"
     if (
         plan
         and plan.support_mode == "listen"

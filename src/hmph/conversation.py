@@ -426,6 +426,9 @@ class Conversation:
                 select(Message).where(Message.turn_id == turn.id, Message.role == "user")
             )
             try:
+                from hmph.semantic_controls import consume_controls
+
+                await consume_controls(session, pair, turn)
                 await apply_controls(session, pair, turn, user_message)
                 from hmph.shared_threads import apply_thread_command
 
@@ -818,6 +821,7 @@ class Conversation:
                 shared_thread=shared_thread,
             )
             turn.companion_plan = {
+                **(turn.companion_plan or {}),
                 **companion_plan.model_dump(mode="json"),
                 "controls_applied": repaired(turn),
             }

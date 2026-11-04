@@ -68,7 +68,7 @@ def inspect(profile):
     return {"profile": profile, "packages": {name: version(name) for name in packages}}
 
 
-def transport(key, model, budget, case_id, profile, stage, *, validator=None):
+def transport(key, model, budget, case_id, profile, stage, *, validator=None, stop_file=None):
     from hmph.reference_transport import ReferenceTransport
 
     return ReferenceTransport(
@@ -78,10 +78,13 @@ def transport(key, model, budget, case_id, profile, stage, *, validator=None):
         max_tokens=256 if stage == "reader" else 1024,
         response_validator=validator,
         budget=budget.bind(case_id, profile, stage),
+        stop_file=stop_file,
     )
 
 
-def _read_answer(query, evidence, key, model, budget, case_id, profile, max_bytes=12000):
+def _read_answer(
+    query, evidence, key, model, budget, case_id, profile, max_bytes=12000, *, stop_file=None
+):
     import httpx
     from openai import OpenAI
 
@@ -89,7 +92,7 @@ def _read_answer(query, evidence, key, model, budget, case_id, profile, max_byte
     supplied = json.loads(messages[1]["content"])["evidence"]
     ids = {source for item in supplied for source in item["source_ids"]}
     with httpx.Client(
-        transport=transport(key, model, budget, case_id, profile, "reader"),
+        transport=transport(key, model, budget, case_id, profile, "reader", stop_file=stop_file),
         timeout=30,
         follow_redirects=False,
         trust_env=False,
@@ -124,13 +127,14 @@ def read_answer(
     case=None,
     evidence_mode="native",
     max_bytes=12000,
+    stop_file=None,
 ):
     started = time.monotonic()
     try:
         if evidence_mode == "source_only":
             evidence = source_context(case, evidence)
         reply, ids, supplied = _read_answer(
-            query, evidence, key, model, budget, case_id, profile, max_bytes
+            query, evidence, key, model, budget, case_id, profile, max_bytes, stop_file=stop_file
         )
         # Preserve predictions even if native cleanup subsequently fails.
         row.update(reply=reply.model_dump(mode="json"), evidence=supplied)
@@ -140,7 +144,9 @@ def read_answer(
 
 
 @contextlib.contextmanager
-def mem0_context(history, query, key, model, budget, case_id, cleanup, database_url, timings):
+def mem0_context(
+    history, query, key, model, budget, case_id, cleanup, database_url, timings, *, stop_file=None
+):
     began = time.monotonic()
     import httpx
     from openai import OpenAI
@@ -150,7 +156,16 @@ def mem0_context(history, query, key, model, budget, case_id, cleanup, database_
 
     directory = ROOT / "artifacts/references/runs" / ("p1-" + uuid4().hex)
     sources = {s.source_id: s for s in history}
-    writer = transport(key, model, budget, case_id, "mem0", "writer", validator=validate_extraction)
+    writer = transport(
+        key,
+        model,
+        budget,
+        case_id,
+        "mem0",
+        "writer",
+        validator=validate_extraction,
+        stop_file=stop_file,
+    )
     with httpx.Client(
         transport=writer, timeout=30, trust_env=False, follow_redirects=False
     ) as http:
@@ -214,7 +229,20 @@ def mem0_context(history, query, key, model, budget, case_id, cleanup, database_
 
 
 @contextlib.asynccontextmanager
-async def graphiti_context(history, query, key, model, budget, case_id, cleanup, timings):
+async def graphiti_context(
+    history,
+    query,
+    key,
+    model,
+    budget,
+    case_id,
+    cleanup,
+    timings,
+    *,
+    stop_file=None,
+    source_description="synthetic user statement",
+    failure_observer=None,
+):
     began = time.monotonic()
     import httpx
     from graphiti_core.nodes import EpisodeType
@@ -229,6 +257,8 @@ async def graphiti_context(history, query, key, model, budget, case_id, cleanup,
         max_calls=budget.limits["per_case_calls"],
         max_tokens=1024,
         budget=budget.bind(case_id, "graphiti", "writer"),
+        stop_file=stop_file,
+        failure_observer=failure_observer,
     )
     async with httpx.AsyncClient(
         transport=writer, timeout=30, trust_env=False, follow_redirects=False
@@ -246,7 +276,7 @@ async def graphiti_context(history, query, key, model, budget, case_id, cleanup,
                 result = await graph.add_episode(
                     name=source.source_id,
                     episode_body=body,
-                    source_description="synthetic user statement",
+                    source_description=source_description,
                     reference_time=source.observed_at,
                     source=EpisodeType.text,
                     group_id=group,

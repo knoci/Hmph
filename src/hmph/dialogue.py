@@ -13,6 +13,7 @@ from hmph.dialogue_types import (
     GroundedText,
     OpenItem,
     ResponseMode,
+    SharedThreadHint,
     ShortTermContext,
     StateData,
     StateLease,
@@ -20,7 +21,16 @@ from hmph.dialogue_types import (
     StatePatch,
     StateResult,
 )
-from hmph.models import Chat, DialogueSource, DialogueState, DialogueTask, Message, Pair, Turn
+from hmph.models import (
+    Chat,
+    DialogueSource,
+    DialogueState,
+    DialogueTask,
+    Message,
+    Pair,
+    SharedThread,
+    Turn,
+)
 from hmph.source_policy import retainable
 
 
@@ -192,7 +202,19 @@ class Dialogue:
                 )
                 .order_by(Message.source_seq)
             )
+            threads = tuple(
+                SharedThreadHint.model_validate(row, from_attributes=True)
+                for row in await session.scalars(
+                    select(SharedThread)
+                    .where(
+                        SharedThread.pair_id == pair.id, SharedThread.status.in_(("open", "paused"))
+                    )
+                    .order_by(SharedThread.id)
+                    .limit(32)
+                )
+            )
             chosen, used = [], len(StateData.model_validate(state.data).model_dump_json().encode())
+            used += sum(len(t.model_dump_json().encode()) + 1 for t in threads)
             for row in rows:
                 size = len(row.content.encode()) + 160
                 if used + size > 12000:
@@ -219,6 +241,8 @@ class Dialogue:
                 fence=task.fence,
                 data=StateData.model_validate(state.data),
                 messages=tuple(chosen),
+                policy_revision=pair.policy_revision,
+                shared_threads=threads,
             )
 
     async def _lease(self, session, lease):
@@ -305,7 +329,7 @@ class Dialogue:
     async def commit(self, lease: StateLease, patch: StatePatch, *, usage=None):
         async with self.db.sessions.begin() as session:
             try:
-                _, state, task, _ = await self._lease(session, lease)
+                pair, state, task, _ = await self._lease(session, lease)
             except DomainError:
                 return StateResult(status="stale")
             messages = {row.id: row for row in lease.messages}
@@ -373,6 +397,12 @@ class Dialogue:
             data.open_items = opened + closed
             if len(opened) > 12 or len(data.model_dump_json().encode()) > 10000:
                 raise DomainError("state_capacity", 422)
+            if patch.controls and pair.policy_revision == lease.policy_revision:
+                from hmph.semantic_controls import stage_controls
+
+                for cue in patch.controls:
+                    await ground(cue.evidence)
+                await stage_controls(session, pair, lease, patch.controls)
             state.data = data.model_dump(mode="json")
             state.revision += 1
             state.processed_through_seq = lease.through_seq
