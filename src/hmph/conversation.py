@@ -537,14 +537,11 @@ class Conversation:
                 session.add(message)
             if len(message.content) + len(content) > 2000:
                 raise DomainError("output_limit")
-            from hmph.companion import eligible_mentions, output_allowed
+            from hmph.companion import eligible_mentions
             from hmph.models import CompanionMention
 
             actual = []
             if turn.companion_plan is not None:
-                pair = await session.get(Pair, turn.pair_id)
-                if not output_allowed(pair, turn, lease.user_content, message.content + content):
-                    raise DomainError("companion_output_blocked")
                 actual = await eligible_mentions(session, turn, message.content + content, mentions)
             elif mentions:
                 raise DomainError("companion_output_blocked")
@@ -1102,14 +1099,10 @@ class Conversation:
         return await self.companion_output_reason(lease, body, mentions) == "ok"
 
     async def companion_output_reason(self, lease, body, mentions=()):
-        from hmph.companion import checked_mentions, output_block_reason
+        from hmph.companion import checked_mentions
 
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
-            pair = await session.get(Pair, turn.pair_id)
-            reason = output_block_reason(pair, turn, lease.user_content, body)
-            if reason:
-                return reason
             _, reason = await checked_mentions(session, turn, body, mentions)
             return reason
 

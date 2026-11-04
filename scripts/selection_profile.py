@@ -242,6 +242,8 @@ async def graphiti_context(
     stop_file=None,
     source_description="synthetic user statement",
     failure_observer=None,
+    max_output_tokens=1024,
+    network_retries=0,
 ):
     began = time.monotonic()
     import httpx
@@ -255,10 +257,11 @@ async def graphiti_context(
         key,
         model=model,
         max_calls=budget.limits["per_case_calls"],
-        max_tokens=1024,
+        max_tokens=max_output_tokens,
         budget=budget.bind(case_id, "graphiti", "writer"),
         stop_file=stop_file,
         failure_observer=failure_observer,
+        network_retries=network_retries,
     )
     async with httpx.AsyncClient(
         transport=writer, timeout=30, trust_env=False, follow_redirects=False
@@ -269,7 +272,9 @@ async def graphiti_context(
             http_client=http,
             max_retries=0,
         )
-        async with native_graphiti(sdk, model=model, cleanup_audit=cleanup) as (graph, group):
+        async with native_graphiti(
+            sdk, model=model, cleanup_audit=cleanup, max_tokens=max_output_tokens
+        ) as (graph, group):
             mapping, sources = {}, {}
             for source in history:
                 body = source_text(source)

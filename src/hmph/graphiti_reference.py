@@ -127,7 +127,7 @@ async def graph_context(graph, group, query, date, *, max_bytes=12000):
 
 
 @asynccontextmanager
-async def native_graphiti(client, *, model, cleanup_audit=None):
+async def native_graphiti(client, *, model, cleanup_audit=None, max_tokens=1024):
     os.environ["GRAPHITI_TELEMETRY_ENABLED"] = "false"
     os.environ["EMBEDDING_DIM"] = "384"
     from graphiti_core import Graphiti
@@ -141,10 +141,10 @@ async def native_graphiti(client, *, model, cleanup_audit=None):
         model=model,
         small_model=model,
         base_url="https://api.deepseek.com",
-        max_tokens=1024,
+        max_tokens=max_tokens,
     )
     llm = OpenAIGenericClient(
-        config=config, client=client, max_tokens=1024, structured_output_mode="json_object"
+        config=config, client=client, max_tokens=max_tokens, structured_output_mode="json_object"
     )
     graph = Graphiti(
         NEO4J_URI,

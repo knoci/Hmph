@@ -81,7 +81,7 @@ async def test_acknowledgment_of_current_correction_is_not_old_memory_use(conver
     )
     await worker.run_once()
     saved = await conversation.get_turn(identity.owner_id, turn.id)
-    assert saved.status == "completed" and saved.usage["guard_action"] == "allowed"
+    assert saved.status == "completed" and saved.usage["guard_action"] == "annotation_only"
     assert saved.usage["planner"]["attempts"] == 0
     messages = await conversation.messages(identity.owner_id, chat.id)
     assert next(m.content for m in messages if m.role == "assistant") == "那就去远山公司。"

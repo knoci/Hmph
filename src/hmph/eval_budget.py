@@ -148,7 +148,8 @@ class RunBudget:
             isinstance(case_id, str)
             and re.fullmatch(r"case-[0-9]{3}", case_id)
             and profile in {"lexical", "focused"}
-            and stage in {"state", "generation", "guard", "planner", "grounding", "answer_judge"}
+            and stage
+            in {"extract", "state", "generation", "guard", "planner", "grounding", "answer_judge"}
         )
         if (
             not isinstance(case_id, str)

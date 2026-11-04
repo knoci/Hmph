@@ -424,7 +424,9 @@ async def project_context(
     targets = forbidden_targets(pair.preferences, query)
     spans = {}
     for mid, message in originals.items():
-        if mid in control_ids or permissions.get(mid) == "omit":
+        # Old controls stay out of history; a safe current request is still
+        # the user's actual utterance, not a generic instruction to the model.
+        if (mid in control_ids and mid != current) or permissions.get(mid) == "omit":
             continue
         span = safe_excerpt(
             message.content,
@@ -437,10 +439,19 @@ async def project_context(
     safe_rows = []
     for row in rows:
         span = spans.get(row.id)
+        if span is None and row.id in control_ids:
+            # A setting is excluded as a recalled fact, but its safe original
+            # utterance still anchors the conversation it belongs to.
+            span = safe_excerpt(
+                row.content,
+                targets,
+                nickname=pair.preferences.get("nickname"),
+                name_targets=nickname_targets(pair.preferences, query),
+            )
         if span is None:
             if row.id != current:
                 continue
-            content = "[用户表达了互动边界或修正意图，请依据表达计划回应，不复述受限内容。]"
+            content = "[本轮原话已省略；简短回应当前请求，不复述省略内容。]"
         else:
             content = row.content[span[0] : span[1]]
         # Never mutate ORM Message.content: the original is the user's source.
@@ -456,24 +467,10 @@ async def project_context(
                 end_offset=span[1] if span else None,
             )
         )
-    from hmph.models import TurnSourceUse
-
-    omitted = {d.source_id for d in plan.memory_use if d.permission == "omit"} | control_ids
-    assistant_turns = {r.turn_id for r in safe_rows if r.role == "assistant"}
-    if omitted and assistant_turns:
-        blocked = set(
-            await session.scalars(
-                select(TurnSourceUse.turn_id).where(
-                    TurnSourceUse.turn_id.in_(assistant_turns),
-                    TurnSourceUse.message_id.in_(omitted),
-                )
-            )
-        )
-        safe_rows = [r for r in safe_rows if r.role != "assistant" or r.turn_id not in blocked]
-    # A boundary can affect an assistant paraphrase whose words differ. Legacy
-    # replies without sufficient provenance are conservatively omitted too.
-    if targets:
-        safe_rows = [r for r in safe_rows if r.role == "user"]
+    # Mention timing and active expression settings do not invalidate an
+    # already-published assistant reply. Erasing it makes old user questions
+    # look unanswered. Deleted replies are excluded by the source query;
+    # literal excerpts above still use the current expression settings.
     safe_memories = []
     for hit in candidates.memories:
         if hit.predicate in {
@@ -544,27 +541,6 @@ async def project_context(
     return safe_rows, candidates, short_term.model_copy(update={"data": data}), plan
 
 
-def output_block_reason(pair, turn, query, body):
-    plan = plan_view(turn)
-    if forbidden_in(pair.preferences, query, body):
-        return "boundary"
-    if plan and plan.act == "close" and re.search(r"[?？]", body):
-        return "closing_question"
-    if plan and plan.shared_thread_action == "pause" and re.search(r"[?？]", body):
-        return "paused_question"
-    if (
-        plan
-        and plan.support_mode == "listen"
-        and re.search(r"建议你|你应该|你可以试|不妨|you should", body, re.I)
-    ):
-        return "listening_advice"
-    return None
-
-
-def output_allowed(pair, turn, query, body):
-    return output_block_reason(pair, turn, query, body) is None
-
-
 async def eligible_mentions(session, turn, body, mentions):
     result, _ = await checked_mentions(session, turn, body, mentions)
     return result
@@ -620,14 +596,4 @@ async def checked_mentions(session, turn, body, mentions):
     result = list(dict.fromkeys(result))
     if missing_quote - {source_id for source_id, _ in result}:
         return None, "source_quote"
-    if (
-        plan
-        and len(result) > 1
-        and not all(
-            d.reason == "requested"
-            for d in plan.memory_use
-            if d.source_id in {r[0] for r in result}
-        )
-    ):
-        return None, "proactive_limit"
     return list(dict.fromkeys([*current_mentions, *result])), "ok"

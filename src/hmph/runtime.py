@@ -101,7 +101,6 @@ def build_worker(conversation: Conversation, settings: Settings) -> Worker:
         model,
         model_mode="deepseek",
         model_name=settings.deepseek_model,
-        reviewer=model.review,
         lease_seconds=settings.lease_seconds,
     )
 

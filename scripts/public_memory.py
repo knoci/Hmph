@@ -130,9 +130,12 @@ def pack(record):
     return case, mapping
 
 
-def prepare(directory):
+def prepare(directory, repair_from=None):
     directory.mkdir(parents=True, exist_ok=False)
-    records = select_data()
+    previous = (
+        json.loads((repair_from / "plan.json").read_text(encoding="utf-8")) if repair_from else None
+    )
+    records = previous["records"] if previous else select_data()
     files = [
         Path(__file__),
         ROOT / "scripts/selection_profile.py",
@@ -143,7 +146,13 @@ def prepare(directory):
         "purpose": "P4-e two new full-history development examples, not formal acceptance",
         "prepared_at": datetime.now(UTC).isoformat(),
         "model": "deepseek-flash",
-        "profiles": ["raw", "mem0", "graphiti"],
+        "profiles": ["graphiti"] if previous else ["raw", "mem0", "graphiti"],
+        "graphiti_output_tokens": 16384 if previous else 1024,
+        "graphiti_network_retries": 1 if previous else 0,
+        "repair_from": str(repair_from) if previous else None,
+        "repair_reason": "restore pinned author's output cap after two-call truncation diagnosis"
+        if previous
+        else None,
         "records": records,
         "data_hashes": {"LongMemEval": digest(LME), "LoCoMo": digest(LOCOMO)},
         "code_hashes": {str(p.relative_to(ROOT)): digest(p) for p in files},
@@ -276,8 +285,11 @@ async def run_profile(directory, profile):
                         timings,
                         stop_file=directory / "STOP",
                         source_description="public chronological dialogue episode",
+                        max_output_tokens=plan.get("graphiti_output_tokens", 1024),
+                        network_retries=plan.get("graphiti_network_retries", 0),
                         failure_observer=lambda diagnostic: save(
-                            directory / "graphiti-failed-call.json", diagnostic
+                            directory / f"graphiti-failed-call-{diagnostic['reservation']}.json",
+                            diagnostic,
                         ),
                     ) as evidence:
                         reply, allowed, supplied = read_answer(
@@ -339,6 +351,7 @@ async def run_profile(directory, profile):
             }
         )
     )
+    return report["status"]
 
 
 def main():
@@ -346,20 +359,27 @@ def main():
     parser.add_argument("--directory", required=True, type=Path)
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--profile", choices=("raw", "mem0", "graphiti"))
+    parser.add_argument("--repair-from", type=Path)
     args = parser.parse_args()
     if args.profile:
         if not args.run:
             parser.error("Profile requires explicit --run")
-        asyncio.run(run_profile(args.directory, args.profile))
+        status = asyncio.run(run_profile(args.directory, args.profile))
+        if status != "completed":
+            raise SystemExit(1)
     elif not args.run:
-        prepare(args.directory)
+        prepare(args.directory, args.repair_from)
     else:
         interpreters = {
             "raw": "framework-env",
             "mem0": "framework-env",
             "graphiti": "graphiti-runtime-env",
         }
-        for profile, environment in interpreters.items():
+        selected = json.loads((args.directory / "plan.json").read_text(encoding="utf-8"))[
+            "profiles"
+        ]
+        for profile in selected:
+            environment = interpreters[profile]
             subprocess.run(
                 [
                     str(ROOT / f"artifacts/{environment}/Scripts/python.exe"),

@@ -101,7 +101,29 @@ async def test_provider_errors_never_include_key_or_response_body(status, code):
     assert "PRIVATE_ERROR_BODY" not in str(caught.value)
 
 
-async def test_deepseek_worker_reviews_whole_reply_and_retains_usage(conversation):
+async def test_omitted_answer_does_not_merge_old_and_current_user_requests():
+    from hmph.deepseek import DeepSeekModel
+    from hmph.model_gateway import ChatMessage, GenerationRequest
+
+    def endpoint(request):
+        history = json.loads(request.content)["messages"][-3:]
+        assert [m["role"] for m in history] == ["user", "assistant", "user"]
+        assert "应用上下文标记" in history[1]["content"]
+        assert history[-1]["content"] == "我们现在还有什么共同计划？"
+        chunk = {"choices": [{"delta": {"content": "现在没有。"}, "finish_reason": "stop"}]}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+
+    messages = (
+        ChatMessage(role="user", content="给我一句鼓励。"),
+        ChatMessage(role="user", content="我们现在还有什么共同计划？"),
+    )
+    model = DeepSeekModel(SecretStr("recorded-test-only"), transport=httpx.MockTransport(endpoint))
+    output = [d async for d in model.stream(GenerationRequest(messages=messages))]
+    assert "".join(d.text for d in output) == "现在没有。"
+    assert len(messages) == 2
+
+
+async def test_deepseek_worker_retains_optional_annotation_usage(conversation):
     from hmph.deepseek import DeepSeekModel
     from hmph.model_gateway import FakeModel
     from hmph.worker import Worker
@@ -154,7 +176,7 @@ async def test_deepseek_worker_reviews_whole_reply_and_retains_usage(conversatio
     assert messages[-1].content == "你好，阿黎。"
     assert saved.usage["generation"]["total_tokens"] == 16
     assert saved.usage["guard"]["total_tokens"] == 58
-    assert saved.usage["guard_action"] == "allowed"
+    assert saved.usage["guard_action"] == "annotation_only"
 
 
 async def test_generation_request_keeps_current_chat_but_not_other_chat(conversation):
@@ -244,7 +266,7 @@ async def test_closing_generation_closes_the_provider_stream():
     assert closed
 
 
-async def test_blocked_real_reply_is_never_published(conversation):
+async def test_optional_annotation_cannot_veto_real_reply(conversation):
     from hmph.model_gateway import GuardReview, ModelDelta
     from hmph.worker import Worker
 
@@ -262,11 +284,11 @@ async def test_blocked_real_reply_is_never_published(conversation):
     )
     await Worker(conversation, Provider(), model_mode="deepseek", reviewer=reject).run_once()
     messages = await conversation.messages(identity.owner_id, chat.id)
-    assert messages[-1].content == "这条回复暂时无法提供，请稍后再试。"
-    assert "UNAPPROVED_DRAFT" not in str(await conversation.events(identity.owner_id, turn.id))
+    assert messages[-1].content == "UNAPPROVED_DRAFT_SENTINEL"
+    assert (await conversation.get_turn(identity.owner_id, turn.id)).status == "completed"
 
 
-async def test_guard_service_failure_has_technical_failure_not_a_user_violation(conversation):
+async def test_annotation_service_failure_preserves_real_reply(conversation):
     from hmph.deepseek import ProviderError
     from hmph.model_gateway import ModelDelta
     from hmph.worker import Worker
@@ -285,10 +307,12 @@ async def test_guard_service_failure_has_technical_failure_not_a_user_violation(
     )
     await Worker(conversation, Provider(), model_mode="deepseek", reviewer=unavailable).run_once()
     saved = await conversation.get_turn(identity.owner_id, turn.id)
-    assert (saved.status, saved.error_code) == ("failed", "guard_unavailable")
-    assert saved.usage["guard_action"] == "unavailable_fallback"
+    assert (saved.status, saved.error_code) == ("completed", None)
+    assert saved.usage["guard_action"] == "annotation_unavailable"
     assert saved.usage["guard"] is None
-    assert "PRIVATE_UNREVIEWED" not in str(await conversation.events(identity.owner_id, turn.id))
+    assert (await conversation.messages(identity.owner_id, chat.id))[-1].content == (
+        "PRIVATE_UNREVIEWED_SENTINEL"
+    )
 
 
 async def test_deepseek_extracts_structured_proposals_with_bounded_json_request():
@@ -328,7 +352,10 @@ async def test_deepseek_extracts_structured_proposals_with_bounded_json_request(
     assert "test-key-not-real" not in json.dumps(seen)
 
 
-async def test_state_model_uses_only_structured_state_and_approved_source_messages(conversation):
+@pytest.mark.parametrize("transport_tag", [None, "json_object"])
+async def test_state_model_uses_only_structured_state_and_approved_source_messages(
+    conversation, transport_tag
+):
     from hmph.deepseek import DeepSeekModel
     from hmph.dialogue import Dialogue
     from hmph.dialogue_worker import StateWorker
@@ -348,6 +375,7 @@ async def test_state_model_uses_only_structured_state_and_approved_source_messag
                         "message": {
                             "content": json.dumps(
                                 {
+                                    **({"type": transport_tag} if transport_tag else {}),
                                     "goal": {
                                         "message_id": source["id"],
                                         "text": "周五面试",

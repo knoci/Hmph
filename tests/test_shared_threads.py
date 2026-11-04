@@ -15,6 +15,26 @@ async def prepare(conversation, identity, chat, key, text="我回来了。"):
     return lease, await conversation.generation_request(lease)
 
 
+@pytest.mark.parametrize(
+    "query",
+    ["我们现在还有什么共同计划？", "叫我什么、现在在哪工作、我们还在跟进什么计划？"],
+)
+async def test_explicit_plan_question_finds_active_thread_without_its_topic_word(
+    conversation, query
+):
+    identity = await conversation.bootstrap()
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "plan")
+    thread = await SharedThreads(conversation).write(
+        identity.owner_id, chat.id, "create", topic="每周一起聊聊练琴进展"
+    )
+    next_chat = await conversation.create_chat(identity.owner_id, identity.character_id, "next")
+    lease, request = await prepare(conversation, identity, next_chat, "ask", query)
+    assert request.companion.shared_thread is not None
+    assert request.companion.shared_thread["topic"] == thread["topic"]
+    assert any(str(s.message_id) == thread["source_message_id"] for s in request.raw_evidence)
+    await conversation.finish(lease)
+
+
 async def test_shared_plan_survives_sessions_pauses_resumes_and_forgets_all_sources(conversation):
     identity = await conversation.bootstrap()
     chat = await conversation.create_chat(identity.owner_id, identity.character_id, "thread-home")

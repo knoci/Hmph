@@ -260,7 +260,12 @@ async def prepare_thread(session, pair, turn, query, candidates):
         if forbidden_in(pair.preferences, query, thread.topic):
             continue
         if not (
-            RETURNING.search(query) or set(query_terms(query)) & set(query_terms(thread.topic))
+            RETURNING.search(query)
+            or re.search(
+                r"(?:还有|还在|正在|什么|哪些|哪个|记得).{0,12}(?:共同计划|跟进.{0,8}计划)",
+                query,
+            )
+            or set(query_terms(query)) & set(query_terms(thread.topic))
         ):
             continue
         source = await session.get(Message, thread.source_message_id)

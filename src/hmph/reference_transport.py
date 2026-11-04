@@ -15,7 +15,7 @@ from pydantic import SecretStr
 
 
 class ReferenceCallError(Exception):
-    pass
+    retryable_transport = False
 
 
 def failure_code(error):
@@ -158,11 +158,16 @@ class ReferenceTransport(httpx.BaseTransport):
             return response
         except Exception as error:
             code = failure_code(error)
-            record.update(status="failed", error_code=code)
+            record.update(status="failed", error_code=code, exception_type=type(error).__name__)
             if self.failure_observer is not None:
                 try:
                     choices = response.json().get("choices") if response is not None else None
-                    diagnostic = {"reservation": reservation, "request": body, "choices": choices}
+                    diagnostic = {
+                        "reservation": reservation,
+                        "request": body,
+                        "choices": choices,
+                        "exception_type": type(error).__name__,
+                    }
                     # Even an echoed credential must never reach a diagnostic callback.
                     if self._key.get_secret_value() in json.dumps(diagnostic, ensure_ascii=False):
                         record["failure_capture"] = "credential_redacted"
@@ -171,7 +176,9 @@ class ReferenceTransport(httpx.BaseTransport):
                         record["failure_capture"] = "captured"
                 except Exception:
                     record["failure_capture"] = "unavailable"
-            raise ReferenceCallError(code) from None
+            failure = ReferenceCallError(code)
+            failure.retryable_transport = isinstance(error, httpx.TransportError)
+            raise failure from None
         finally:
             if response is not None and record["status"] != "completed":
                 response.close()
@@ -186,7 +193,10 @@ class ReferenceTransport(httpx.BaseTransport):
 class AsyncReferenceTransport(httpx.AsyncBaseTransport):
     """Async SDK adapter sharing the synchronous transport's limits and call ledger."""
 
-    def __init__(self, key, **kwargs):
+    def __init__(self, key, *, network_retries=0, **kwargs):
+        if network_retries not in (0, 1):
+            raise ValueError("Research transport supports at most one network retry")
+        self.network_retries = network_retries
         self._transport = ReferenceTransport(key, **kwargs)
         self.records = self._transport.records
 
@@ -196,7 +206,14 @@ class AsyncReferenceTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request):
         await request.aread()
-        response = await asyncio.to_thread(self._transport.handle_request, request)
+        for attempt in range(self.network_retries + 1):
+            try:
+                response = await asyncio.to_thread(self._transport.handle_request, request)
+                break
+            except ReferenceCallError as error:
+                if not error.retryable_transport or attempt == self.network_retries:
+                    raise
+                await asyncio.sleep(0.2)
         try:
             return httpx.Response(
                 response.status_code,

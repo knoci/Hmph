@@ -12,11 +12,13 @@ from hmph.preferences import Preferences
         ("PRIVATE untrusted provider body", "provider_protocol"),
     ],
 )
-async def test_guard_unavailable_records_safe_provider_code(conversation, error, code):
+async def test_annotation_unavailable_records_code_without_discarding_reply(
+    conversation, error, code
+):
     import json
 
     from hmph.deepseek import ProviderError
-    from hmph.model_gateway import FALLBACK, ModelDelta
+    from hmph.model_gateway import ModelDelta
     from hmph.worker import Worker
 
     identity = await conversation.bootstrap()
@@ -34,10 +36,10 @@ async def test_guard_unavailable_records_safe_provider_code(conversation, error,
 
     await Worker(conversation, Model(), model_mode="deepseek", reviewer=review).run_once()
     result = await conversation.get_turn(identity.owner_id, turn.id)
-    assert result.error_code == "guard_unavailable"
+    assert result.status == "completed" and result.error_code is None
     assert result.usage["guard_error_code"] == code
     assert "PRIVATE" not in json.dumps(result.usage)
-    assert (await conversation.messages(identity.owner_id, chat.id))[-1].content == FALLBACK
+    assert (await conversation.messages(identity.owner_id, chat.id))[-1].content == "你好。"
 
 
 @pytest.mark.parametrize(
@@ -164,13 +166,13 @@ async def test_direct_personal_recall_can_mention_two_valid_sources_after_review
     )
 
 
-async def test_output_rejection_records_reason_without_candidate_or_quote(conversation):
+async def test_listening_preference_does_not_veto_generated_speech(conversation):
     identity = await conversation.bootstrap()
     _, _, lease, _ = await request(conversation, identity, "先听我说，不要给建议。", "listen")
     assert (
-        await conversation.companion_output_reason(lease, "你应该马上离职。") == "listening_advice"
+        await conversation.companion_output_reason(lease, "你应该马上离职。") == "ok"
     )
-    assert not await conversation.check_companion_output(lease, "你应该马上离职。")
+    assert await conversation.check_companion_output(lease, "你应该马上离职。")
 
 
 async def test_memory_entry_id_is_diagnosed_and_never_repaired_into_source_id(conversation):
@@ -294,7 +296,7 @@ def test_event_question_with_matching_content_words_requests_memories_without_fi
     assert advice.act != "recall"
 
 
-async def test_longer_replacement_nickname_is_allowed_but_former_standalone_name_is_blocked(
+async def test_longer_replacement_nickname_is_supplied_without_a_speech_veto(
     conversation,
 ):
     identity = await conversation.bootstrap()
@@ -305,7 +307,7 @@ async def test_longer_replacement_nickname_is_allowed_but_former_standalone_name
     )
     assert context.preferences.nickname == "阿禾同学"
     assert await conversation.check_companion_output(lease, "阿禾同学，收到。")
-    assert not await conversation.check_companion_output(lease, "阿禾，收到。")
+    assert await conversation.check_companion_output(lease, "阿禾，收到。")
     await conversation.finish(lease)
 
 
@@ -326,6 +328,39 @@ async def request(conversation, identity, text, key, *, chat=None):
     turn = await conversation.accept(identity.owner_id, chat.id, key, text)
     lease = await conversation.claim("companion-test")
     return chat, turn, lease, await conversation.generation_request(lease)
+
+
+async def test_current_controls_and_mention_timing_do_not_erase_assistant_history(conversation):
+    identity = await conversation.bootstrap()
+    chat, _, lease, _ = await request(conversation, identity, "以后叫我小沐。", "name")
+    await conversation.publish(lease, 0, "小沐？行，就这么叫了。")
+    await conversation.finish(lease)
+    _, _, lease, context = await request(
+        conversation, identity, "讲个笑话。", "joke", chat=chat
+    )
+    assert any(m.role == "assistant" and "就这么叫了" in m.content for m in context.messages)
+    await conversation.finish(lease)
+    _, _, lease, _ = await request(conversation, identity, "以后叫我小岚。", "rename", chat=chat)
+    await conversation.publish(lease, 0, "小岚，那我换个叫法。")
+    await conversation.finish(lease)
+    _, _, lease, context = await request(
+        conversation, identity, "接着聊。", "continue", chat=chat
+    )
+    assert any(m.role == "assistant" and "换个叫法" in m.content for m in context.messages)
+    assert "小沐" not in context.model_dump_json()
+    await conversation.finish(lease)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["以后请叫我小沐。", "以后请回复简短一点。", "以后请先听我说。"],
+)
+async def test_current_expression_request_is_not_replaced_by_boundary_notice(conversation, text):
+    identity = await conversation.bootstrap()
+    chat, _, lease, context = await request(conversation, identity, text, "expression")
+    assert context.messages[-1].content == text
+    assert (await conversation.messages(identity.owner_id, chat.id))[0].content == text
+    await conversation.finish(lease)
 
 
 async def test_explicit_nickname_repair_applies_to_own_turn_through_twenty_turns_and_new_chat(
@@ -411,7 +446,9 @@ async def test_short_term_listening_signal_survives_without_resending_sensitive_
     await conversation.finish(lease)
 
 
-async def test_current_nickname_correction_blocks_old_generation_before_review(conversation):
+async def test_current_nickname_correction_changes_context_without_replacing_model_reply(
+    conversation,
+):
     import json
 
     import httpx
@@ -420,7 +457,6 @@ async def test_current_nickname_correction_blocks_old_generation_before_review(c
     from hmph.deepseek import DeepSeekModel
     from hmph.memory import Memory
     from hmph.memory_types import MemoryProposal
-    from hmph.model_gateway import FALLBACK
     from hmph.worker import Worker
 
     identity = await conversation.bootstrap()
@@ -440,7 +476,7 @@ async def test_current_nickname_correction_blocks_old_generation_before_review(c
         body = json.loads(request.content)
         seen.append(body)
         assert "小沐" not in json.dumps(body, ensure_ascii=False)
-        assert body["stream"]  # Known forbidden draft must not enter another model call.
+        assert body["stream"]
         return httpx.Response(
             200,
             text="data: "
@@ -455,11 +491,11 @@ async def test_current_nickname_correction_blocks_old_generation_before_review(c
     model = DeepSeekModel(
         SecretStr("companion-test-no-real-key"), transport=httpx.MockTransport(endpoint)
     )
-    await Worker(conversation, model, model_mode="deepseek", reviewer=model.review).run_once()
+    await Worker(conversation, model, model_mode="deepseek").run_once()
     assert len(seen) == 1
-    assert (await conversation.messages(identity.owner_id, chat.id))[-1].content == FALLBACK
+    assert (await conversation.messages(identity.owner_id, chat.id))[-1].content == "小沐，知道啦。"
     saved = await conversation.get_turn(identity.owner_id, turn.id)
-    assert saved.status == "completed" and saved.usage["guard_action"] == "policy_fallback"
+    assert saved.status == "completed" and saved.usage["guard_action"] == "not_requested"
 
 
 async def test_graph_source_on_request_boundary_uses_only_allowed_contiguous_original(conversation):
