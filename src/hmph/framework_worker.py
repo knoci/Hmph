@@ -59,7 +59,7 @@ class FrameworkWorker:
         if cancelled:
             raise asyncio.CancelledError
 
-    async def run_once(self):
+    async def run_once(self, *, schedule_maintenance=True):
         await self.builds.recover_expired(backend=self.backend.backend)
         if hasattr(self.backend, "recover"):
             await self.backend.recover()
@@ -69,6 +69,10 @@ class FrameworkWorker:
         if cleanup is not None:
             await self._cleanup(cleanup)
             return True
+        from hmph.memory_maintenance import MemoryMaintenance
+
+        if schedule_maintenance:
+            await MemoryMaintenance(self.builds).schedule(self.backend.backend)
         lease = await self.builds.claim(
             self.worker_id, backend=self.backend.backend, lease_seconds=self.lease_seconds
         )

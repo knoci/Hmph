@@ -183,7 +183,7 @@ class Mem0Backend:
         transport = ReferenceTransport(
             self.key,
             model=lease.model,
-            max_calls=self.max_calls,
+            max_calls=min(self.max_calls, lease.call_limit or self.max_calls),
             delegate=self.delegate,
             response_validator=validate_extraction,
         )

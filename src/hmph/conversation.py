@@ -1,5 +1,6 @@
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
@@ -44,10 +45,22 @@ from hmph.online_memory import (
 )
 from hmph.persistence import RequestLedger, append_event, terminate_turn
 from hmph.preference_types import expression_preferences
-from hmph.working_memory import build_workspace, retrieve
+from hmph.working_memory import (
+    WorkingCandidates,
+    build_workspace,
+    focused_query,
+    retrieve,
+    search_raw,
+)
 
 DEFAULT_OWNER = UUID("550062e6-03a7-4ff0-bb47-c5eef6515a18")
 DEFAULT_CHARACTER = UUID("af1d4af8-7c4e-49b3-9b42-83d5457bedce")
+
+
+@dataclass
+class _RequestDraft:
+    request: GenerationRequest
+    candidates: WorkingCandidates
 
 
 class Conversation:
@@ -59,6 +72,7 @@ class Conversation:
         turn_timeout: float = 45,
         source_timezone="UTC",
         source_reader=None,
+        recall_planner=None,
     ):
         ZoneInfo(source_timezone)
         self.db = db
@@ -67,6 +81,7 @@ class Conversation:
         self.source_timezone = source_timezone
         self.ledger = RequestLedger(digest_key)
         self.source_reader = source_reader
+        self.recall_planner = recall_planner
 
     async def bootstrap(self, owner_id: UUID = DEFAULT_OWNER) -> Identity:
         if not await self.db.is_current():
@@ -556,6 +571,11 @@ class Conversation:
     ) -> TurnView:
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
+            planner = (turn.memory_context or {}).get("planner")
+            if planner is not None:
+                usage = {**(usage or {}), "planner": planner}
+                if planner.get("attempts") and planner.get("usage") is None:
+                    usage["complete"] = False
             turn.usage = usage
             await self._terminal(session, turn, "failed" if error_code else "completed", error_code)
             await session.flush()
@@ -586,6 +606,126 @@ class Conversation:
         return await self._assemble_request(lease, ticket, native, retrieval_status, started)
 
     async def _assemble_request(self, lease, ticket, native, retrieval_status, started):
+        draft = await self._assemble_draft(
+            lease,
+            ticket,
+            native,
+            retrieval_status,
+            started,
+            candidate_limit=40 if self.recall_planner and ticket is None else 80,
+        )
+        if self.recall_planner is None or ticket is not None:
+            return draft.request
+        return await self._focus_request(lease, draft, started)
+
+    async def _recall_audit(self, lease, audit, *, reserve=False):
+        async with self.db.sessions.begin() as session:
+            turn, _, _ = await self._lease(session, lease)
+            previous = (turn.memory_context or {}).get("planner", {})
+            if reserve and previous.get("attempts", 0):
+                return False
+            turn.memory_context = {**(turn.memory_context or {}), "planner": audit}
+            return True
+
+    async def _focus_request(self, lease, draft, started):
+        from hmph.recall import RecallDecision, RecallError, prepare_recall
+
+        lookup = prepare_recall(draft.request)
+        deadline = started + READ_SECONDS
+        if lookup is None:
+            await self._recall_audit(
+                lease, {"status": "not_needed", "attempts": 0, "usage": None}, reserve=True
+            )
+            return draft.request
+        remaining = 80 - draft.candidates.candidate_count
+        if remaining <= 0 or time.monotonic() >= deadline:
+            await self._recall_audit(
+                lease, {"status": "no_budget", "attempts": 0, "usage": None}, reserve=True
+            )
+            return draft.request
+        audit = {"status": "started", "attempts": 1, "usage": None, "seconds": None}
+        if not await self._recall_audit(lease, audit, reserve=True):
+            return draft.request  # A callback is never retried for the same accepted turn.
+        began = time.monotonic()
+        try:
+            async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                decision = RecallDecision.model_validate(await self.recall_planner(lookup))
+            audit["usage"] = decision.usage.model_dump() if decision.usage is not None else None
+            query, bridge_id = focused_query(
+                lookup.question, decision.plan.model_dump(), lookup.sources
+            )
+            if bridge_id is None:
+                audit["status"] = "no_hint"
+                return draft.request
+            if time.monotonic() >= deadline:
+                audit["status"] = "no_budget"
+                return draft.request
+            async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                async with self.db.sessions.begin() as session:
+                    turn, _, _ = await self._lease(session, lease)
+                    raw, count = await search_raw(session, turn, query, (), limit=remaining)
+                # The bridge remains navigation only; every new source is filtered,
+                # budgeted and registered by the same authoritative assembly below.
+                original = draft.candidates
+                ordered = sorted(original.raw, key=lambda s: str(s.message_id) != bridge_id)
+                seen, merged = set(), []
+                for source in [*ordered[:1], *raw, *ordered[1:]]:
+                    if source.message_id not in seen:
+                        seen.add(source.message_id)
+                        merged.append(source)
+                candidates = WorkingCandidates(
+                    plan=original.plan.model_copy(update={"max_queries": 4}),
+                    memories=original.memories,
+                    raw=merged,
+                    query_count=original.query_count + 1,
+                    candidate_count=original.candidate_count + count,
+                    query_hint_source_ids=tuple(
+                        dict.fromkeys([*original.query_hint_source_ids, UUID(bridge_id)])
+                    ),
+                )
+                focused = await self._assemble_draft(
+                    lease,
+                    None,
+                    None,
+                    None,
+                    started,
+                    candidates_override=candidates,
+                )
+            audit.update(status="applied", source_id=bridge_id, scanned=count)
+            return focused.request
+        except DomainError:
+            raise  # Cancellation, forget or a policy change must not use the old draft.
+        except TimeoutError:
+            audit["status"] = "timeout"
+            return draft.request
+        except RecallError as error:
+            audit["status"] = error.status
+            audit["usage"] = error.usage.model_dump() if error.usage is not None else None
+            return draft.request
+        except (ValueError, TypeError):
+            audit["status"] = "invalid"
+            return draft.request
+        except Exception:
+            audit["status"] = "unavailable"
+            return draft.request
+        finally:
+            audit["seconds"] = round(time.monotonic() - began, 4)
+            # This also revalidates the old draft after a provider failure/timeout.
+            # Cancellation leaves the pre-reserved unknown-usage attempt visible.
+            if not asyncio.current_task().cancelling():
+                await self._recall_audit(lease, audit)
+
+    async def _assemble_draft(
+        self,
+        lease,
+        ticket,
+        native,
+        retrieval_status,
+        started,
+        *,
+        candidates_override=None,
+        candidate_limit=80,
+    ):
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
             pair = await session.get(Pair, turn.pair_id)
@@ -638,9 +778,16 @@ class Conversation:
                 0, min(3300 if ticket is not None else 1500, 5000 - current_size - state_bytes)
             )
             audit = None
-            if ticket is None:
+            if candidates_override is not None:
+                candidates = candidates_override
+            elif ticket is None:
                 candidates = await retrieve(
-                    session, turn, rows[0].content, short_term, preferences=pair.preferences
+                    session,
+                    turn,
+                    rows[0].content,
+                    short_term,
+                    preferences=pair.preferences,
+                    candidate_limit=candidate_limit,
                 )
             else:
                 candidates, audit = await expand_sources(
@@ -749,6 +896,8 @@ class Conversation:
             )
             workspace.policy_filtered_sources = len(inspected_rows) - len(rows)
             workspace.query_hint_source_ids = candidates.query_hint_source_ids
+            if self.recall_planner is not None and ticket is None:
+                workspace.rounds = 2 if candidates_override is not None else 1
             if workspace.policy_filtered_sources:
                 workspace.coverage = "partial"
             if audit is not None:
@@ -777,6 +926,16 @@ class Conversation:
                     "query_count": workspace.query_count,
                     "state_hint_count": len(workspace.query_hint_source_ids),
                     "pending_gap": short_term.pending_gap,
+                },
+            }
+            current = source_rows[0]
+            turn.memory_context = {
+                **turn.memory_context,
+                "current_source": {
+                    "message_id": str(current.id),
+                    "revision": current.revision,
+                    "start_offset": current.start_offset,
+                    "end_offset": current.end_offset,
                 },
             }
             for source in raw_evidence:
@@ -862,7 +1021,7 @@ class Conversation:
             ):
                 effective_preferences = effective_preferences.model_copy(update={"nickname": None})
                 turn.companion_plan = {**turn.companion_plan, "withheld_preferences": ["nickname"]}
-            return GenerationRequest(
+            request = GenerationRequest(
                 messages=tuple(chosen),
                 history_origins=tuple(
                     ContextOrigin(
@@ -898,6 +1057,7 @@ class Conversation:
                     }
                 ),
             )
+            return _RequestDraft(request, candidates)
 
     async def companion_explanation(self, owner_id, turn_id):
         from hmph.models import CompanionMention, RepairState

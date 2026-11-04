@@ -199,7 +199,7 @@ class GraphitiBackend:
         transport = AsyncReferenceTransport(
             self.key,
             model=lease.model,
-            max_calls=self.max_calls,
+            max_calls=min(self.max_calls, lease.call_limit or self.max_calls),
             delegate=self.delegate,
             budget=self.call_budget,
             stop_file=self.stop_file,

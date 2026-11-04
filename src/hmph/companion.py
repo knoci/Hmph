@@ -552,12 +552,32 @@ async def checked_mentions(session, turn, body, mentions):
     plan = plan_view(turn)
     allowed = {d.source_id for d in plan.memory_use if d.permission == "mention"} if plan else set()
     result = []
+    current_mentions = []
     missing_quote = set()
     for hint in mentions:
         if hint.quote not in body:
             continue
         use = await session.get(TurnSourceUse, (turn.id, hint.source_id))
         source = await session.get(Message, hint.source_id)
+        scope = (turn.memory_context or {}).get("current_source", {})
+        start, end = scope.get("start_offset"), scope.get("end_offset")
+        if (
+            source is not None
+            and source.turn_id == turn.id
+            and source.role == "user"
+            and not source.deleted
+            and use is not None
+            and str(source.id) == scope.get("message_id")
+            and source.revision == use.message_revision == scope.get("revision")
+            and type(start) is int
+            and type(end) is int
+            and 0 <= start < end <= len(source.content)
+            and (hint.source_quote or hint.quote) in source.content[start:end]
+        ):
+            # This is acknowledgment of the actual current user input, not a
+            # proactive old-memory use. Keep its publication/deletion lineage.
+            current_mentions.append((source.id, source.revision))
+            continue
         if hint.source_id not in allowed:
             entry = await session.get(MemoryEntry, hint.source_id)
             if entry is not None and entry.pair_id == turn.pair_id:
@@ -586,4 +606,4 @@ async def checked_mentions(session, turn, body, mentions):
         )
     ):
         return None, "proactive_limit"
-    return result, "ok"
+    return list(dict.fromkeys([*current_mentions, *result])), "ok"

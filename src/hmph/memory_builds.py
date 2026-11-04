@@ -7,7 +7,7 @@ No native framework or network operation runs inside these transactions.
 
 from datetime import timedelta
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 
 from hmph.contracts import DomainError
 from hmph.graphiti_reference import GRAPHITI_REVISION
@@ -94,13 +94,23 @@ class MemoryBuilds:
         return pair
 
     async def request(
-        self, owner_id, character_id, request_id, *, backend, model="deepseek-flash", force=False
+        self,
+        owner_id,
+        character_id,
+        request_id,
+        *,
+        backend,
+        model="deepseek-flash",
+        force=False,
+        maintenance_revision=None,
     ):
         if backend not in REVISIONS or model not in MODELS:
             raise DomainError("invalid_framework_config", 422)
         body = {"backend": backend, "model": model}
         if force:
             body["force"] = True
+        if maintenance_revision is not None:
+            body["maintenance_revision"] = maintenance_revision
         digest = self.ledger.digest(str(character_id), body)
         async with self.db.sessions.begin() as session:
             await self.ledger.owner_lock(session, owner_id)
@@ -110,6 +120,13 @@ class MemoryBuilds:
             if existing:
                 return BuildView.model_validate(await session.get(MemoryBuild, existing))
             pair = await self._pair(session, owner_id, character_id, lock=True)
+            policy = None
+            if maintenance_revision is not None:
+                from hmph.memory_maintenance import due_policy
+
+                policy = await due_policy(session, pair, maintenance_revision, backend, model)
+                if policy is None:
+                    return None
             rows = (
                 await session.execute(
                     select(Message, MemoryTask.source_order)
@@ -127,6 +144,22 @@ class MemoryBuilds:
             if len(rows) > MAX_SOURCES:
                 raise DomainError("framework_snapshot_too_large", 413)
             rows = [(m, order) for m, order in rows if retainable(m.content)]
+            if policy is not None:
+                previous = await session.scalar(
+                    select(func.max(MemoryBuild.watermark)).where(
+                        MemoryBuild.pair_id == pair.id,
+                        MemoryBuild.backend == backend,
+                        MemoryBuild.backend_revision == REVISIONS[backend],
+                        MemoryBuild.model == model,
+                        MemoryBuild.memory_epoch == pair.memory_epoch,
+                        or_(
+                            MemoryBuild.maintenance_revision == policy.revision,
+                            MemoryBuild.status == "ready",
+                        ),
+                    )
+                )
+                if sum(order > (previous or 0) for _, order in rows) < policy.minimum_sources:
+                    return None
             if sum(len(m.content.encode()) for m, _ in rows) > MAX_SOURCE_BYTES:
                 raise DomainError("framework_snapshot_too_large", 413)
             snapshot_digest = self.ledger.digest(
@@ -180,7 +213,14 @@ class MemoryBuilds:
                 watermark=pair.next_memory_seq - 1,
                 source_count=len(rows),
                 snapshot_digest=snapshot_digest,
+                maintenance_revision=maintenance_revision,
             )
+            if policy is not None:
+                pair.memory_maintenance = policy.model_copy(
+                    update={
+                        "last_scheduled_at": await session.scalar(select(func.clock_timestamp())),
+                    }
+                ).model_dump(mode="json")
             pair.next_framework_seq += 1
             session.add(build)
             await session.flush()
@@ -229,6 +269,8 @@ class MemoryBuilds:
 
     async def health(self, owner_id, character_id):
         """Advisory metadata only; never authorizes reads or triggers a build."""
+        from hmph.memory_maintenance import MaintenancePolicy
+
         async with self.db.sessions() as session:
             pair = await self._pair(session, owner_id, character_id)
             build = (
@@ -296,7 +338,12 @@ class MemoryBuilds:
                 "failed_extractions": tasks.get("failed", 0),
                 "latest_build_status": latest.status if latest else None,
                 "freshness_semantics": "new_source_count_includes_unindexable_messages",
-                "automatic_framework_maintenance": False,
+                "automatic_framework_maintenance": MaintenancePolicy.model_validate(
+                    pair.memory_maintenance
+                ).enabled,
+                "maintenance": MaintenancePolicy.model_validate(pair.memory_maintenance).model_dump(
+                    mode="json"
+                ),
             }
 
     async def current(self, owner_id, character_id, *, backend):
@@ -396,7 +443,30 @@ class MemoryBuilds:
                 sources = await self._sources(session, build)
             except DomainError:
                 build.status, build.error_code = "failed", "framework_source_changed"
+                if build.maintenance_revision is not None:
+                    from hmph.memory_maintenance import suspend_policy
+
+                    suspend_policy(pair, build.maintenance_revision, "source_changed")
                 return None
+            if build.maintenance_revision is not None:
+                from hmph.memory_maintenance import MaintenancePolicy, suspend_policy
+
+                policy = MaintenancePolicy.model_validate(pair.memory_maintenance)
+                if not policy.enabled or policy.revision != build.maintenance_revision:
+                    await self._retire(session, [build.id])
+                    return None
+                if policy.remaining_calls <= 0:
+                    build.status, build.error_code = "failed", "maintenance_budget"
+                    suspend_policy(pair, policy.revision, "budget_exhausted")
+                    return None
+                limit = min(policy.per_attempt_calls, policy.remaining_calls)
+                pair.memory_maintenance = policy.model_copy(
+                    update={
+                        "remaining_calls": policy.remaining_calls - limit,
+                        "reserved_calls": policy.reserved_calls + limit,
+                    }
+                ).model_dump(mode="json")
+                build.call_limit = limit
             now = await session.scalar(select(func.clock_timestamp()))
             build.status, build.worker_id = "building", worker_id
             build.error_code = None
@@ -417,6 +487,8 @@ class MemoryBuilds:
                 fence=build.fence,
                 worker_id=worker_id,
                 sources=sources,
+                maintenance_revision=build.maintenance_revision,
+                call_limit=build.call_limit,
             )
 
     @staticmethod
@@ -448,6 +520,8 @@ class MemoryBuilds:
             or build.model != lease.model
             or build.lease_until is None
             or build.lease_until <= now
+            or build.maintenance_revision != lease.maintenance_revision
+            or build.call_limit != lease.call_limit
         ):
             raise DomainError("stale_framework_lease")
         return pair, build, space, now
@@ -660,6 +734,11 @@ class MemoryBuilds:
             build.status = "queued" if retryable and build.attempts < 3 else "failed"
             build.worker_id, build.lease_until = None, None
             build.error_code = code
+            if build.status == "failed" and build.maintenance_revision is not None:
+                from hmph.memory_maintenance import suspend_policy
+
+                pair = await session.get(Pair, build.pair_id)
+                suspend_policy(pair, build.maintenance_revision, "build_failed")
             return True
 
     async def recover_expired(self, *, backend):

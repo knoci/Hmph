@@ -349,7 +349,7 @@ async def cleanup_spaces(db, builds, worker):
         await MemoryBuilds._retire(s, ids)
     # Recovery/cleanup does not call any model. A queued failed build is retired above.
     for _ in range(10):
-        await worker.run_once()
+        await worker.run_once(schedule_maintenance=False)
         async with db.sessions() as s:
             pending = list(
                 await s.scalars(select(MemorySpace.id).where(MemorySpace.status != "cleaned"))

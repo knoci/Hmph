@@ -287,7 +287,9 @@ async def contextual_query(session, turn, query, short_term, preferences):
     return query + " " + anchor.quote, (anchor.message_id,)
 
 
-async def retrieve(session, turn, query, short_term, *, preferences=None):
+async def retrieve(session, turn, query, short_term, *, preferences=None, candidate_limit=80):
+    if not 8 <= candidate_limit <= 80:
+        raise ValueError("Invalid retrieval candidate limit")
     plan = plan_recall(query)
     lookup_query, hint_sources = await contextual_query(
         session, turn, query, short_term, preferences or {}
@@ -307,7 +309,7 @@ async def retrieve(session, turn, query, short_term, *, preferences=None):
     rounds = 1
     if missing or plan.intent in ("multi_hop", "enumeration", "temporal"):
         raw, raw_count = await search_raw(
-            session, turn, lookup_query, missing, limit=80 - len(memories)
+            session, turn, lookup_query, missing, limit=candidate_limit - len(memories)
         )
         rounds = 2
     return WorkingCandidates(plan, memories, raw, rounds, len(memories) + raw_count, hint_sources)

@@ -144,12 +144,19 @@ class RunBudget:
                 and stage == "trajectory_author"
             )
         )
+        recall_product = (
+            isinstance(case_id, str)
+            and re.fullmatch(r"case-[0-9]{3}", case_id)
+            and profile in {"lexical", "focused"}
+            and stage in {"state", "generation", "guard", "planner", "grounding", "answer_judge"}
+        )
         if (
             not isinstance(case_id, str)
             or re.fullmatch(r"(?:case-|p2-(?:dev|holdout)-|p5-dev-)[0-9]{3}", case_id) is None
             or not (
                 product
                 or audit
+                or recall_product
                 or profile in {"raw", "mem0", "graphiti", "timem"}
                 and stage in {"writer", "reader"}
                 or profile in {"raw", "timem", "focused"}

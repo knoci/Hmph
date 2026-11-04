@@ -28,6 +28,8 @@ class BuildView(BaseModel):
     source_count: int
     snapshot_digest: str
     attempts: int
+    maintenance_revision: int | None = None
+    call_limit: int | None = None
     error_code: str | None
     created_at: datetime
     ready_at: datetime | None
@@ -56,6 +58,8 @@ class BuildLease(BaseModel):
     fence: int
     worker_id: str
     sources: tuple[BuildSource, ...]
+    maintenance_revision: int | None = Field(default=None, ge=1)
+    call_limit: int | None = Field(default=None, ge=1, le=128)
 
 
 class SpaceView(BaseModel):

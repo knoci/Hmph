@@ -49,6 +49,9 @@ class Pair(Base):
     next_memory_seq: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
     next_framework_seq: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
     memory_config_revision: Mapped[int] = mapped_column(default=1, server_default="1")
+    memory_maintenance: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
     selected_memory_build: Mapped[UUID | None] = mapped_column(
         ForeignKey("memory_builds.id", use_alter=True, name="pair_selected_memory_build")
     )
@@ -349,6 +352,14 @@ class MemoryBuild(Base):
     __tablename__ = "memory_builds"
     __table_args__ = (
         UniqueConstraint("pair_id", "generation"),
+        CheckConstraint(
+            "maintenance_revision IS NULL OR maintenance_revision > 0",
+            name="maintenance_revision_positive",
+        ),
+        CheckConstraint(
+            "call_limit IS NULL OR (call_limit >= 1 AND call_limit <= 128)",
+            name="maintenance_call_limit",
+        ),
         CheckConstraint("backend IN ('mem0','graphiti')", name="memory_build_backend"),
         CheckConstraint(
             "status IN ('queued','building','ready','retired','failed')", name="memory_build_status"
@@ -374,6 +385,8 @@ class MemoryBuild(Base):
     snapshot_digest: Mapped[str] = mapped_column(String(64))
     fence: Mapped[int] = mapped_column(default=0)
     attempts: Mapped[int] = mapped_column(default=0)
+    maintenance_revision: Mapped[int | None] = mapped_column()
+    call_limit: Mapped[int | None] = mapped_column()
     worker_id: Mapped[str | None] = mapped_column(String(100))
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(60))

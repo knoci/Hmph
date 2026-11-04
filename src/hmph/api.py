@@ -21,6 +21,7 @@ from hmph.database import Database
 from hmph.dialogue import Dialogue
 from hmph.memory import Memory
 from hmph.memory_builds import MemoryBuilds
+from hmph.memory_maintenance import MemoryMaintenance
 from hmph.online_memory import MemorySelection
 from hmph.preference_types import ExpressionPreferences
 from hmph.preferences import Preferences
@@ -47,6 +48,17 @@ class CreateMemoryBuild(WriteBody):
     character_id: UUID = DEFAULT_CHARACTER
     backend: Literal["mem0", "graphiti"] = "mem0"
     force: bool = False
+
+
+class ConfigureMaintenance(WriteBody):
+    character_id: UUID = DEFAULT_CHARACTER
+    expected_revision: int = Field(ge=0)
+    enabled: bool = False
+    backend: Literal["mem0", "graphiti"] = "graphiti"
+    cooldown_seconds: int = Field(default=300, ge=1, le=86400)
+    minimum_sources: int = Field(default=8, ge=1, le=100)
+    per_attempt_calls: int = Field(default=64, ge=1, le=128)
+    additional_calls: int = Field(default=0, ge=0, le=4096)
 
 
 class LoginBody(BaseModel):
@@ -154,6 +166,7 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     )
     dialogue = Dialogue(conversation.db)
     builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    maintenance = MemoryMaintenance(builds)
     selection = MemorySelection(conversation.db, digest_key=conversation.digest_key)
     preferences = Preferences(conversation)
     security = HTTPBearer(auto_error=False)
@@ -362,6 +375,30 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             backend=body.backend,
             force=body.force,
             model=settings.deepseek_model,
+        )
+
+    @app.get("/api/memory-maintenance")
+    async def maintenance_policy(
+        owner_id: Annotated[UUID, Depends(require_owner)], character_id: UUID = DEFAULT_CHARACTER
+    ):
+        return await maintenance.read(owner_id, character_id)
+
+    @app.put("/api/memory-maintenance")
+    async def configure_maintenance(
+        body: ConfigureMaintenance, owner_id: Annotated[UUID, Depends(require_owner)]
+    ):
+        return await maintenance.update(
+            owner_id,
+            body.character_id,
+            body.request_id,
+            expected_revision=body.expected_revision,
+            enabled=body.enabled,
+            backend=body.backend,
+            model=settings.deepseek_model,
+            cooldown_seconds=body.cooldown_seconds,
+            minimum_sources=body.minimum_sources,
+            per_attempt_calls=body.per_attempt_calls,
+            additional_calls=body.additional_calls,
         )
 
     @app.get("/api/memory-health")
