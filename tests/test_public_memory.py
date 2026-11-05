@@ -168,6 +168,75 @@ async def test_offline_network_retry_is_bounded_charged_and_excludes_truncation(
     await writer.aclose()
 
 
+async def test_public_product_baseline_shares_recent_turns_without_memory(public_helpers):
+    import json
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from public_product import paired_memory_requests
+
+    from hmph.companion_policy import CompanionPlan
+    from hmph.deepseek import DeepSeekModel
+    from hmph.dialogue_types import ShortTermContext
+    from hmph.model_gateway import ChatMessage, ContextOrigin, GenerationRequest
+    from hmph.preference_types import ExpressionPreferences
+    from hmph.working_memory import RawEvidence
+
+    messages = tuple(
+        ChatMessage(role=role, content=f"{role}-{turn}")
+        for turn in range(6)
+        for role in ("user", "assistant")
+    ) + (ChatMessage(role="user", content="current"),)
+    origins = tuple(
+        ContextOrigin(
+            message_id=uuid4(),
+            message_revision=1,
+            start_offset=0,
+            end_offset=len(message.content),
+        )
+        for message in messages
+    )
+    observed = datetime(2023, 3, 15, tzinfo=UTC)
+    memory = RawEvidence(
+        message_id=uuid4(), message_revision=1, role="user", recorded_at=observed,
+        content="window-external-fact", start_offset=0, end_offset=20, truncated=False,
+    )
+    request = GenerationRequest(
+        messages=messages,
+        history_origins=origins,
+        raw_evidence=(memory,),
+        short_term=ShortTermContext(revision=7),
+        preferences=ExpressionPreferences(nickname="private-nickname"),
+        companion=CompanionPlan(
+            policy_revision=7, act="recall", support_mode="unknown", tone="warm",
+            operator="none", shared_thread={"topic": "window-external-plan"},
+        ),
+        reference_time=observed,
+    )
+    full, recent_only = paired_memory_requests(request)
+    assert full.messages == recent_only.messages == messages[-9:]
+    assert full.history_origins == recent_only.history_origins == origins[-9:]
+    assert full.reference_time == recent_only.reference_time == observed
+
+    calls = []
+
+    def endpoint(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\ndata: [DONE]\n\n',
+        )
+
+    model = DeepSeekModel(SecretStr("mock"), transport=httpx.MockTransport(endpoint))
+    for candidate in (full, recent_only):
+        _ = [delta async for delta in model.stream(candidate)]
+    for marker in ("window-external-fact", "window-external-plan", "private-nickname"):
+        assert marker in json.dumps(calls[0])
+        assert marker not in json.dumps(calls[1])
+    assert calls[0]["messages"][-9:] == calls[1]["messages"][-9:]
+    assert calls[0]["messages"][-1]["content"] == "current"
+
+
 async def test_public_product_import_preserves_clock_and_reaches_existing_read_path(
     conversation, public_helpers
 ):

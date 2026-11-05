@@ -3,6 +3,52 @@ import pytest
 from hmph.contracts import DomainError
 
 
+@pytest.mark.parametrize("still_open", [False, True])
+async def test_forget_does_not_reactivate_an_answered_question(conversation, still_open):
+    from hmph.dialogue import Dialogue
+    from hmph.dialogue_types import Anchor, StatePatch
+    from hmph.memory import Memory
+
+    identity = await conversation.bootstrap()
+    owner = identity.owner_id
+    chat = await conversation.create_chat(owner, identity.character_id, "chat")
+
+    async def complete(request_id, user, reply):
+        await conversation.accept(owner, chat.id, request_id, user)
+        lease = await conversation.claim("generator")
+        await conversation.generation_request(lease)
+        await conversation.publish(lease, 0, reply)
+        await conversation.finish(lease)
+        return (await conversation.messages(owner, chat.id))[-2]
+
+    await complete("practice", "今天练了琴。", "练得挺认真。")
+    poem = await complete("poem", "那首诗叫山居秋暝。", "知道了。")
+    old = await complete("old", "我们现在还有什么共同计划？", "每周聊一次练琴。")
+    goal = Anchor(message_id=old.id, text=old.content, quote=old.content)
+    dialogue = Dialogue(conversation.db)
+    await dialogue.commit(
+        await dialogue.claim("state"),
+        StatePatch(topic=goal, goal=goal, open_items=[goal] if still_open else []),
+    )
+
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    receipt = await memory.forget_source(owner, poem.id, "forget", expected_revision=1)
+    assert receipt.turns == 2
+    assert (await dialogue.read(owner, chat.id)).data.goal.message_id == old.id
+    await conversation.accept(owner, chat.id, "current", "还记得那首诗的题目吗？")
+    request = await conversation.generation_request(await conversation.claim("current"))
+
+    assert [message.content for message in request.messages] == [
+        "今天练了琴。",
+        "练得挺认真。",
+        old.content,
+        "还记得那首诗的题目吗？",
+    ]
+    assert (request.short_term.data.goal is not None) == still_open
+    assert (request.short_term.data.topic is not None) == still_open
+    assert "山居秋暝" not in request.model_dump_json()
+
+
 async def source_turn(conversation, identity, chat, request_id, content):
     turn = await conversation.accept(identity.owner_id, chat.id, request_id, content)
     await conversation.cancel(identity.owner_id, turn.id, request_id)

@@ -100,7 +100,32 @@ async def short_term_context(session, turn, budget=1300):
     def fits(candidate):
         return len(candidate.model_dump_json().encode()) <= budget
 
-    atoms = [("topic", data.topic), ("goal", data.goal)]
+    topic, goal = data.topic, data.goal
+    if (
+        goal is not None
+        and goal.source_seq < turn.source_seq
+        and goal.text.rstrip().endswith(("?", "？"))
+        and not any(
+            item.status == "open" and item.content.message_id == goal.message_id
+            for item in data.open_items
+        )
+    ):
+        answered = await session.scalar(
+            select(Turn.id)
+            .join(Message, Message.turn_id == Turn.id)
+            .where(
+                Message.id == goal.message_id,
+                Turn.conversation_id == turn.conversation_id,
+                Turn.status == "completed",
+                Turn.published_segments > 0,
+            )
+        )
+        # Forgetting can redact the answer while keeping its completed turn.
+        if answered is not None:
+            if topic is not None and topic.message_id == goal.message_id:
+                topic = None
+            goal = None
+    atoms = [("topic", topic), ("goal", goal)]
     if data.response_mode and turn.source_seq <= data.response_mode.expires_after_seq:
         atoms.append(("response_mode", data.response_mode))
     for field, value in atoms:

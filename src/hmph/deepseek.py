@@ -511,7 +511,10 @@ class DeepSeekModel:
     async def update_state(self, lease: StateLease):
         context = {
             "previous": lease.data.model_dump(mode="json"),
-            "messages": [m.model_dump(mode="json") for m in lease.messages],
+            "messages": [
+                message.model_dump(mode="json", exclude={"id"} if message.role != "user" else None)
+                for message in lease.messages
+            ],
             "shared_threads": [t.model_dump(mode="json") for t in lease.shared_threads],
         }
         body = self._body(
@@ -540,7 +543,16 @@ class DeepSeekModel:
                 # valid state JSON. It is transport metadata, not a state key.
                 if isinstance(payload, dict) and payload.get("type") == "json_object":
                     payload.pop("type")
-                patch = StatePatch.model_validate(payload)
+                patch = None
+                transitions = payload.get("transitions") if isinstance(payload, dict) else None
+                if not lease.data.open_items and isinstance(transitions, list) and transitions:
+                    # Rebuilds have no previous items to transition. Keep valid
+                    # updates, while an invalid-only response still fails.
+                    candidate = StatePatch.model_validate({**payload, "transitions": []})
+                    if candidate != StatePatch():
+                        patch = candidate
+                if patch is None:
+                    patch = StatePatch.model_validate(payload)
                 usage = ModelUsage.model_validate(raw["usage"]) if raw.get("usage") else None
                 return patch, usage
         except httpx.TimeoutException:

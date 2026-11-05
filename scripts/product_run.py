@@ -261,6 +261,7 @@ async def maintenance(db, services, failures, progress=lambda _: None):
     dialogue = Dialogue(db)
     while lease := await dialogue.claim("p2d-state", model_mode="deepseek", lease_seconds=60):
         progress("state")
+        patch = None
         try:
             patch, usage = await services.model("state").update_state(lease)
             await dialogue.commit(lease, patch, usage=usage.model_dump() if usage else None)
@@ -271,6 +272,11 @@ async def maintenance(db, services, failures, progress=lambda _: None):
                     "stage": "state",
                     "type": type(error).__name__,
                     "code": evaluation_error_code(error),
+                    "exception_code": getattr(error, "code", None),
+                    "lease_revision": lease.revision,
+                    "lease_through_seq": lease.through_seq,
+                    "lease_fence": lease.fence,
+                    "patch_present": patch is not None,
                 }
             )
             if isinstance(error, ProviderError) and str(error) in {

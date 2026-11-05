@@ -352,6 +352,113 @@ async def test_deepseek_extracts_structured_proposals_with_bounded_json_request(
     assert "test-key-not-real" not in json.dumps(seen)
 
 
+async def test_state_request_exposes_only_user_anchor_ids():
+    from uuid import uuid4
+
+    from hmph.deepseek import DeepSeekModel
+    from hmph.dialogue_types import StateData, StateLease, StateMessage
+
+    user = StateMessage(id=uuid4(), revision=1, source_seq=1, role="user", content="周五面试。")
+    assistant = StateMessage(
+        id=uuid4(), revision=1, source_seq=2, role="assistant", content="记下了。"
+    )
+    lease = StateLease(
+        conversation_id=uuid4(),
+        pair_id=uuid4(),
+        memory_epoch=1,
+        revision=0,
+        through_seq=2,
+        worker_id="test-state",
+        fence=1,
+        data=StateData(),
+        messages=(user, assistant),
+    )
+
+    def endpoint(request):
+        context = json.loads(json.loads(request.content)["messages"][-1]["content"])
+        assert context["messages"][0]["id"] == str(user.id)
+        assert context["messages"][1]["content"] == assistant.content
+        assert "id" not in context["messages"][1]
+        return httpx.Response(
+            200, json={"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}
+        )
+
+    model = DeepSeekModel(SecretStr("mock"), transport=httpx.MockTransport(endpoint))
+    await model.update_state(lease)
+
+
+@pytest.mark.parametrize(
+    ("malformed_item", "usable_goal"), [(False, True), (True, True), (True, False)]
+)
+async def test_state_rebuild_keeps_grounded_goal_when_transition_has_no_target(
+    conversation, malformed_item, usable_goal
+):
+    from hmph.deepseek import DeepSeekModel, ProviderError
+    from hmph.dialogue import Dialogue
+    from hmph.dialogue_types import Anchor, StatePatch
+    from hmph.memory import Memory
+
+    identity = await conversation.bootstrap()
+    owner = identity.owner_id
+    chat = await conversation.create_chat(owner, identity.character_id, "chat")
+
+    async def source(request_id, content):
+        turn = await conversation.accept(owner, chat.id, request_id, content, model_mode="deepseek")
+        await conversation.cancel(owner, turn.id, request_id)
+        return (await conversation.messages(owner, chat.id))[-1]
+
+    old = await source("old", "周五面试。")
+    dialogue = Dialogue(conversation.db)
+    lease = await dialogue.claim("state", model_mode="deepseek")
+    old_goal = Anchor(message_id=old.id, text="周五面试", quote="周五面试")
+    await dialogue.commit(lease, StatePatch(goal=old_goal, open_items=[old_goal]))
+    kept = await source("kept", "还要准备周六的作品展示。")
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    receipt = await memory.forget_source(owner, old.id, "forget", expected_revision=1)
+    assert receipt.dialogue_states == 1
+
+    lease = await dialogue.claim("rebuild", model_mode="deepseek")
+    assert not lease.data.open_items
+    anchor = {"message_id": str(kept.id), "text": "作品展示", "quote": "作品展示"}
+
+    def endpoint(request):
+        body = json.loads(json.loads(request.content)["messages"][-1]["content"])
+        assert [message["id"] for message in body["messages"]] == [str(kept.id)]
+        patch = {
+            **({"goal": anchor} if usable_goal else {}),
+            "transitions": [
+                {
+                    "item_id": "旧事项" if malformed_item else str(old.id),
+                    "status": "dropped",
+                    "evidence": anchor,
+                }
+            ],
+        }
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": json.dumps(patch)}}
+                ]
+            },
+        )
+
+    model = DeepSeekModel(SecretStr("mock"), transport=httpx.MockTransport(endpoint))
+    if not usable_goal:
+        with pytest.raises(ProviderError, match="provider_protocol"):
+            await model.update_state(lease)
+        assert (await dialogue.read(owner, chat.id)).processed_through_seq == 0
+        return
+    patch, _ = await model.update_state(lease)
+    assert (await dialogue.commit(lease, patch)).status == "committed"
+    state = await dialogue.read(owner, chat.id)
+    assert state.processed_through_seq == lease.through_seq == 4
+    assert state.pending_messages == 0
+    assert state.data.goal.message_id == kept.id
+    assert state.data.goal.quote == "作品展示"
+    assert not state.data.open_items
+
+
 @pytest.mark.parametrize("transport_tag", [None, "json_object"])
 async def test_state_model_uses_only_structured_state_and_approved_source_messages(
     conversation, transport_tag

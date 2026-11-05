@@ -1,4 +1,4 @@
-"""P4-e bounded product read-path comparison and three input-channel ablations.
+"""P4-e paired recent-history and product-memory read-path comparison.
 
 Historical documents are imported into an isolated schema, with their original
 observation clocks. No benchmark answer is used in import, learning or generation.
@@ -33,12 +33,36 @@ from hmph.dialogue_types import ShortTermContext  # noqa: E402
 from hmph.dialogue_worker import StateWorker  # noqa: E402
 from hmph.eval_budget import RunBudget  # noqa: E402
 from hmph.memory import Memory  # noqa: E402
-from hmph.model_gateway import FALLBACK  # noqa: E402
 from hmph.models import Chat, MemoryTask, Message, Pair, Turn  # noqa: E402
+from hmph.preference_types import ExpressionPreferences  # noqa: E402
 from hmph.product_eval import RunControl  # noqa: E402
 from hmph.selection_eval import source_text  # noqa: E402
 from hmph.timem_reference import local_test_key  # noqa: E402
 from hmph.worker import Worker  # noqa: E402
+
+
+def paired_memory_requests(request):
+    if request.messages[-1].role != "user":
+        raise ValueError("Paired memory requests require a current user message")
+    user_positions = [i for i, message in enumerate(request.messages) if message.role == "user"]
+    start = user_positions[max(0, len(user_positions) - 5)]
+    full = request.model_copy(
+        update={
+            "messages": request.messages[start:],
+            "history_origins": request.history_origins[start:],
+        }
+    )
+    recent_only = full.model_copy(
+        update={
+            "evidence": (),
+            "raw_evidence": (),
+            "short_term": ShortTermContext(),
+            "workspace": None,
+            "preferences": ExpressionPreferences(),
+            "companion": None,
+        }
+    )
+    return full, recent_only
 
 
 async def import_history(db, chat_id, case):
@@ -106,18 +130,19 @@ async def main(directory, execute):
     ]
     config = {
         "package": "P4-e",
-        "purpose": "product read path and three single-channel ablations",
+        "purpose": "paired product memory baseline",
         "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
         "model": "deepseek-flash",
         "backend": "lexical",
         "temperature": 0,
-        "variants": ["full", "no_long", "no_short", "no_working"],
-        "metric": "guard-allowed semantic answer correctness; one history/question per dataset",
+        "variants": ["recent_only", "full"],
+        "recent_turns": 4,
+        "metric": "semantic answer correctness; one history/question per dataset",
         "interpretation": "development only; inconclusive cannot pass design 10.4",
         "limits": {"max_calls": 1024, "max_input_bytes": 32 * 1024 * 1024, "per_case_calls": 512},
         "database": "postgresql+asyncpg://hmph:hmph_local_only@127.0.0.1:15439/hmph",
         "fixture": "native-matched role/time documents; original clocks; recent-four short state",
-        "ablation": "remove one input channel from same retrieval snapshot; no retraining",
+        "pairing": "same recent turns and query; memory channels present only in full",
         "latency_target_seconds": 45,
         "human_review": "not_run",
         "hashes": {
@@ -232,44 +257,26 @@ async def main(directory, execute):
                     conversation,
                     services.model("generation"),
                     model_mode="deepseek",
-                    reviewer=services.model("guard").review,
                     lease_seconds=30,
                 )
                 heartbeat = asyncio.create_task(worker._heartbeat(lease))
-                request = await conversation.generation_request(lease)
+                request, recent_only = paired_memory_requests(
+                    await conversation.generation_request(lease)
+                )
                 row["actual_input"] = request.model_dump(mode="json")
-                full = None
                 for variant in config["variants"]:
                     services.check_stop()
-                    chosen = request
-                    if variant == "no_long":
-                        chosen = request.model_copy(update={"evidence": ()})
-                    elif variant == "no_short":
-                        chosen = request.model_copy(update={"short_term": ShortTermContext()})
-                    elif variant == "no_working":
-                        chosen = request.model_copy(update={"raw_evidence": (), "workspace": None})
+                    chosen = recent_only if variant == "recent_only" else request
                     began = time.monotonic()
                     body = ""
                     async for delta in services.model("generation").stream(chosen):
                         body += delta.text
                         if len(body) > 2000:
                             raise RuntimeError("output_limit")
-                    review = await services.model("guard").review(chosen, body)
-                    reason = (
-                        await conversation.companion_output_reason(lease, body, review.mentions)
-                        if review.allowed
-                        else "review_denied"
-                    )
-                    allowed = reason == "ok"
-                    answer = body if allowed else FALLBACK
-                    if variant == "full":
-                        full = (answer, review.mentions if allowed else ())
                     answer_row = {
                         "variant": variant,
-                        "reply": answer,
-                        "candidate": body,
-                        "allowed": allowed,
-                        "reason": reason,
+                        "reply": body,
+                        "actual_input": chosen.model_dump(mode="json"),
                         "read_seconds": time.monotonic() - began,
                     }
                     row["answers"].append(answer_row)
@@ -280,7 +287,7 @@ async def main(directory, execute):
                             {
                                 "question": record["question"],
                                 "reference": record["answer"],
-                                "hypothesis": answer,
+                                "hypothesis": body,
                             }
                         ),
                         max_tokens=128,
@@ -288,14 +295,10 @@ async def main(directory, execute):
                     verdict = json.loads(grade)
                     if type(verdict.get("correct")) is not bool:
                         raise ValueError("Invalid correctness grade")
-                    answer_row["correct"] = verdict["correct"] and allowed
+                    answer_row["correct"] = verdict["correct"]
                     services.check_budget()
                     checkpoint()
-                for segment, start in enumerate(range(0, len(full[0]), 256)):
-                    await conversation.publish(
-                        lease, segment, full[0][start : start + 256], mentions=full[1]
-                    )
-                await conversation.finish(lease)
+                await conversation.cancel(identity.owner_id, accepted.id, uuid4().hex)
                 row["status"] = "completed"
             finally:
                 if heartbeat:
