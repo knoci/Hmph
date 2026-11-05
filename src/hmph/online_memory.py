@@ -207,6 +207,9 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
             valid = False
     if not valid:
         status, rows = "invalid_sources", []
+    else:
+        native_rank = {str(source_id): index for index, source_id in enumerate(source_ids)}
+        rows.sort(key=lambda row: native_rank[row[0].native_id])
     selected, used, filtered, truncated = [], 0, 0, 0
     terms = query_terms(query)
     for message, source_turn, task in delta:

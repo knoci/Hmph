@@ -55,12 +55,13 @@ class CompanionPlan(BaseModel):
     max_proactive_memories: int = 1
     signal_source: UUID | None = None
     shared_thread: dict | None = None
+    no_active_shared_thread: bool = False
     rhythm: dict = Field(default_factory=dict)
     thread_control: Literal["open", "paused", "resolved", "dropped"] | None = None
 
     def model_context(self):
         return {
-            **self.model_dump(mode="json", exclude={"memory_use"}),
+            **self.model_dump(mode="json", exclude={"memory_use", "no_active_shared_thread"}),
             "persona": PersonaCore().model_dump(),
             "source_permissions": {
                 str(d.source_id): d.permission for d in self.memory_use if d.permission != "omit"

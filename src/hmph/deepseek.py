@@ -285,6 +285,10 @@ class DeepSeekModel:
                 "当轮称呼或表达方式调整只需自然接话；原话已省略时简短回应，不猜详情、不宣讲规则。"
                 + json.dumps(request.companion.model_context(), ensure_ascii=False)
             )
+            if request.companion.no_active_shared_thread:
+                body["messages"][0]["content"] += (
+                    "\n应用已核实当前没有正在跟进的共同计划。回答本轮计划问题时以此状态为准。"
+                )
         if request.reference_time is not None:
             body["messages"][0]["content"] += (
                 "\n本轮消息观察时间（用于解释本轮相对时间，不是历史事件发生时间）："

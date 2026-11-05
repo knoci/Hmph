@@ -4,7 +4,7 @@ import re
 
 from sqlalchemy import func, select
 
-from hmph.companion_policy import CLOSE, LISTEN, PAUSE, SENSITIVE, forbidden_in
+from hmph.companion_policy import CLOSE, LISTEN, PAUSE, SENSITIVE, forbidden_in, requested
 from hmph.contracts import ACTIVE, DomainError
 from hmph.dialogue import queue_dialogue
 from hmph.models import MemoryTask, Message, Pair, SharedThread, SharedThreadSource, Turn
@@ -13,6 +13,10 @@ from hmph.source_policy import retainable
 from hmph.working_memory import RawEvidence, query_terms
 
 RETURNING = re.compile(r"我回来了|又见面|早上好|晚上好|^你好|^hello\b|^hi\b", re.I)
+THREAD_QUERY = re.compile(
+    r"(?:还有|还在|正在|什么|哪些|哪个|记得).{0,12}(?:共同计划|跟进.{0,8}计划)"
+    r"|(?:共同计划|跟进.{0,8}计划).{0,8}(?:记得|还在|吗|么|呢)"
+)
 TRANSITIONS = {
     "open": {"paused", "resolved", "dropped"},
     "paused": {"open", "resolved", "dropped"},
@@ -247,7 +251,8 @@ class SharedThreads:
 
 async def prepare_thread(session, pair, turn, query, candidates):
     if any(pattern.search(query.strip()) for pattern in (CLOSE, LISTEN, PAUSE, SENSITIVE)):
-        return None
+        return None, False
+    thread_query = bool(THREAD_QUERY.search(query))
     threads = list(
         await session.scalars(
             select(SharedThread)
@@ -261,10 +266,7 @@ async def prepare_thread(session, pair, turn, query, candidates):
             continue
         if not (
             RETURNING.search(query)
-            or re.search(
-                r"(?:还有|还在|正在|什么|哪些|哪个|记得).{0,12}(?:共同计划|跟进.{0,8}计划)",
-                query,
-            )
+            or thread_query
             or set(query_terms(query)) & set(query_terms(thread.topic))
         ):
             continue
@@ -280,7 +282,7 @@ async def prepare_thread(session, pair, turn, query, candidates):
             continue
         if not any(s.message_id == source.id for s in candidates.raw):
             if candidates.candidate_count >= 80:
-                return None
+                return None, False
             candidates.candidate_count += 1
             origin = await session.get(Turn, source.turn_id)
             candidates.raw.insert(
@@ -297,8 +299,8 @@ async def prepare_thread(session, pair, turn, query, candidates):
                     source_timezone=origin.source_timezone,
                 ),
             )
-        return thread
-    return None
+        return thread, False
+    return None, not threads and thread_query and requested(query)
 
 
 async def apply_thread_command(session, pair, turn, message, *, proposed=None):

@@ -802,7 +802,7 @@ class Conversation:
             from hmph.companion import project_context, repaired
             from hmph.shared_threads import prepare_thread
 
-            shared_thread = await prepare_thread(
+            shared_thread, no_active_shared_thread = await prepare_thread(
                 session, pair, turn, lease.user_content, candidates
             )
 
@@ -817,6 +817,8 @@ class Conversation:
                 short_term,
                 shared_thread=shared_thread,
             )
+            if no_active_shared_thread:
+                companion_plan = companion_plan.model_copy(update={"no_active_shared_thread": True})
             turn.companion_plan = {
                 **(turn.companion_plan or {}),
                 **companion_plan.model_dump(mode="json"),

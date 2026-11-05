@@ -265,6 +265,25 @@ async def native_sources(graph, space_id, query):
         )
         ids += [row["uuid"] for row in rows]
         requests += 1
+    ids = list(dict.fromkeys(ids))
+    seeds = ids[:6]
+    if seeds:
+        # Keep the first episode and its connected evidence close in rank.
+        rows, _, _ = await graph.driver.execute_query(
+            "MATCH (seed:Episodic)-[first:MENTIONS]->(entity:Entity) "
+            "WHERE seed.uuid IN $seeds AND seed.group_id=$group "
+            "AND first.group_id=$group AND entity.group_id=$group "
+            "WITH DISTINCT entity ORDER BY entity.uuid LIMIT 12 "
+            "MATCH (neighbor:Episodic)-[second:MENTIONS]->(entity) "
+            "WHERE neighbor.group_id=$group AND second.group_id=$group "
+            "AND NOT neighbor.uuid IN $seeds "
+            "WITH neighbor, count(DISTINCT entity) AS shared "
+            "RETURN neighbor.uuid AS uuid ORDER BY shared DESC, uuid LIMIT 8",
+            seeds=seeds,
+            group=group,
+        )
+        ids = [*seeds, *(row["uuid"] for row in rows), *ids[len(seeds):]]
+        requests += 1
     return NativeSources(
         source_ids=tuple(dict.fromkeys(ids))[:80],
         requests=requests,

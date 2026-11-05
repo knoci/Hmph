@@ -30,8 +30,20 @@ async def test_explicit_plan_question_finds_active_thread_without_its_topic_word
     next_chat = await conversation.create_chat(identity.owner_id, identity.character_id, "next")
     lease, request = await prepare(conversation, identity, next_chat, "ask", query)
     assert request.companion.shared_thread is not None
+    assert not request.companion.no_active_shared_thread
     assert request.companion.shared_thread["topic"] == thread["topic"]
     assert any(str(s.message_id) == thread["source_message_id"] for s in request.raw_evidence)
+    await conversation.finish(lease)
+    receipt = await Memory(conversation.db, digest_key=conversation.digest_key).forget_source(
+        identity.owner_id, UUID(thread["source_message_id"]), "forget", expected_revision=1
+    )
+    assert receipt.status == "completed"
+    lease, request = await prepare(
+        conversation, identity, next_chat, "forgotten", "我们现在还在一起跟进那个计划吗？"
+    )
+    assert request.companion.shared_thread is None
+    assert request.companion.no_active_shared_thread
+    assert thread["topic"] not in request.model_dump_json()
     await conversation.finish(lease)
 
 
