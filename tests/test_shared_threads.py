@@ -86,7 +86,7 @@ async def test_shared_plan_survives_sessions_pauses_resumes_and_forgets_all_sour
     )
     lease, request = await prepare(conversation, identity, next_chat, "paused-return")
     assert request.companion.shared_thread is None
-    assert thread["topic"] not in request.model_dump_json()
+    assert thread["topic"] in request.model_dump_json()
     await conversation.finish(lease)
     thread = await service.write(
         identity.owner_id,
@@ -147,9 +147,8 @@ async def test_shared_plan_revision_ownership_capacity_and_inflight_invalidation
 
 def test_rhythm_counts_actual_questions_and_advice():
     rhythm = interaction_rhythm(["今天怎么样？", "我建议试试看，你想试吗？"])
-    assert rhythm["recent_questions"] == 2 and rhythm["question_limit"] == 0
-    assert rhythm["avoid_repeated_advice"] is True
-    assert interaction_rhythm([])["question_limit"] == 1
+    assert rhythm == {"recent_questions": 2, "recent_advice": 1}
+    assert interaction_rhythm([]) == {"recent_questions": 0, "recent_advice": 0}
 
 
 async def test_explicit_chat_commands_apply_in_own_turn_without_mutating_from_hypotheses(
@@ -169,7 +168,7 @@ async def test_explicit_chat_commands_apply_in_own_turn_without_mutating_from_hy
     )
     assert request.companion.thread_control == "paused"
     assert request.companion.shared_thread_action == "pause"
-    assert "一起练琴" not in request.model_dump_json()
+    assert request.messages[-1].content == "请暂停共同计划：一起练琴。"
     await conversation.finish(lease)
     lease, request = await prepare(
         conversation, identity, chat, "command-hypothesis", "如果恢复共同计划：一起练琴。"

@@ -358,14 +358,24 @@ class Dialogue:
             except DomainError:
                 return StateResult(status="stale")
             messages = {row.id: row for row in lease.messages}
+            data = StateData.model_validate(state.data)
+            previous_sources = state_sources(data)
 
             async def ground(anchor):
                 source = messages.get(anchor.message_id)
-                row = await session.get(Message, anchor.message_id) if source else None
+                previous = previous_sources.get(anchor.message_id)
+                revision = (
+                    source.revision if source else previous.message_revision if previous else None
+                )
+                row = (
+                    await session.get(Message, anchor.message_id) if revision is not None else None
+                )
                 if (
                     row is None
                     or row.deleted
-                    or row.revision != source.revision
+                    or row.revision != revision
+                    or row.conversation_id != lease.conversation_id
+                    or row.source_seq > lease.through_seq
                     or row.role != "user"
                     or anchor.quote not in row.content
                     or not anchor.text.strip()
@@ -384,7 +394,6 @@ class Dialogue:
                     source_seq=row.source_seq,
                 )
 
-            data = StateData.model_validate(state.data)
             if patch.topic:
                 topic = await ground(patch.topic)
                 if data.topic and data.topic.text != topic.text:

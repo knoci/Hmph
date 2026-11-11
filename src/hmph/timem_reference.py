@@ -6,11 +6,19 @@ adapted. Author generation/retrieval methods and prompts remain unchanged.
 
 import asyncio
 import importlib.util
+import re
+import shutil
 import sys
 import types
 from pathlib import Path
 
 TIMEM_REVISION = "7e05ffda855602a378d4f4a45a3e97e1d1ce4cb9"
+
+QUESTION_JOIN = re.compile(
+    r"(?:[,，;；]\s*(?:and\s+|以及|并且)?|\s+and\s+)"
+    r"(?=(?:what|which|who|where|when|why|how)\b|谁|什么|哪个|哪里|何时|怎么|为什么)",
+    re.I,
+)
 
 
 def local_test_key(root):
@@ -25,7 +33,7 @@ def local_test_key(root):
 
 
 class MeteredTiMemLLM:
-    def __init__(self, key, budget, case_id, *, max_tokens=1024, stop_file=None):
+    def __init__(self, key, budget, case_id, *, max_tokens=1024, max_calls=None, stop_file=None):
         import httpx
         from openai import AsyncOpenAI
 
@@ -33,7 +41,9 @@ class MeteredTiMemLLM:
 
         self.transport = AsyncReferenceTransport(
             key,
-            max_calls=budget.limits["per_case_calls"],
+            max_calls=min(
+                max_calls or budget.limits["per_case_calls"], budget.limits["per_case_calls"]
+            ),
             max_tokens=max_tokens,
             budget=budget.bind(case_id, "timem", "writer"),
             stop_file=stop_file,
@@ -148,14 +158,14 @@ class LocalTiMem:
         from fastembed import TextEmbedding
         from qdrant_client import QdrantClient, models
 
-        model = TextEmbedding(
+        self.embedding = TextEmbedding(
             model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             cache_dir="artifacts/models/multilingual-minilm",
             local_files_only=True,
         )
 
         async def embed(text):
-            return (await asyncio.to_thread(lambda: list(model.embed([text]))))[0].tolist()
+            return (await asyncio.to_thread(lambda: list(self.embedding.embed([text]))))[0].tolist()
 
         embedding = types.ModuleType("llm.embedding_service")
         embedding.get_embedding_service = lambda: types.SimpleNamespace(embed_text=embed)
@@ -178,7 +188,12 @@ class LocalTiMem:
         # original public fixture + code/prompt hashes, never extra prompt copies.
         self.generator._append_prompt_log = lambda *args, **kwargs: None
         self.nodes, self.leaf_map = {}, {}
-        self.client = QdrantClient(path=str(directory / "qdrant"))
+        self.snapshot = ()
+        self.directory = await asyncio.to_thread(directory.resolve)
+        self.vector_directory = self.directory / "qdrant"
+        if await asyncio.to_thread(self.vector_directory.resolve) != self.vector_directory:
+            raise ValueError("Unexpected TiMem collection directory")
+        self.client = QdrantClient(path=str(self.vector_directory))
         self.collection = "hmph_timem_research"
         self.client.create_collection(
             self.collection,
@@ -239,10 +254,148 @@ class LocalTiMem:
             raise ValueError("Native hierarchical retrieval failed")
         rows = state.get("hierarchical_results", [])
         ids = [r.get("id") or r.get("memory_id") for r in rows]
-        return ids, sorted({s for n in ids for s in leaf_sources(n, self.nodes, self.leaf_map)})
+        sources = dict.fromkeys(
+            source for node in ids for source in leaf_sources(node, self.nodes, self.leaf_map)
+        )
+        return ids, list(sources)
+
+    async def linked_sources(self, clauses):
+        """Locate each episode and read an original exchange from its TiMem leaf."""
+        import numpy as np
+
+        from hmph.lexical import bm25_order
+
+        def rank():
+            by_id = {str(source.message_id): source for source in self.snapshot}
+            groups = {}
+            for leaves in self.leaf_map.values():
+                groups.update(dict.fromkeys(leaves, leaves))
+
+            selected = []
+            for clause in clauses:
+                ranked = bm25_order(self.snapshot, clause)
+                if not ranked:
+                    return ()
+                anchor = str(self.snapshot[ranked[0]].message_id)
+                leaf = groups.get(anchor)
+                if leaf is None:
+                    return ()
+                position = leaf.index(anchor)
+                tail = leaf[position + 1 : position + 10]
+                exchanges = [
+                    (question, answer)
+                    for question, answer in zip(tail, tail[1:], strict=False)
+                    if "?" in by_id[question].content or "？" in by_id[question].content
+                ]
+                selected.append(anchor)
+                if exchanges:
+                    texts = [
+                        f"{by_id[question].content}\n{by_id[answer].content}"
+                        for question, answer in exchanges
+                    ]
+                    vectors = np.stack(list(self.embedding.embed([clause, *texts])))
+                    lengths = np.maximum(np.linalg.norm(vectors, axis=1), 1e-12)
+                    normalized = vectors / lengths[:, None]
+                    best = int(np.argmax(normalized[1:] @ normalized[0]))
+                    selected.extend(exchanges[best])
+            return tuple(dict.fromkeys(selected))
+
+        return await asyncio.to_thread(rank)
 
     def close(self):
-        self.client.delete_collection(self.collection)
-        empty = self.client.get_collections().collections == []
+        # QdrantLocal.delete_collection can discard its SQLite handle before
+        # closing it and silently leave the locked files behind on Windows.
         self.client.close()
-        return empty
+        self.nodes.clear()
+        self.leaf_map.clear()
+        self.snapshot = ()
+        target = self.vector_directory.resolve()
+        if target != self.vector_directory or target.parent != self.directory:
+            raise ValueError("Unexpected TiMem cleanup directory")
+        if target.exists():
+            shutil.rmtree(target)
+        return not target.exists()
+
+
+class TiMemSupplement:
+    """Isolated second reader, pinned to the same ready snapshot as mem0."""
+
+    def __init__(self, mem0, timem, *, build_id, space_id):
+        self.mem0, self.timem = mem0, timem
+        self.build_id, self.space_id = build_id, space_id
+
+    async def retrieve_sources(self, ticket, query):
+        from itertools import zip_longest
+        from uuid import UUID
+
+        from hmph.online_memory import CANDIDATES, NativeSources, SourceRetrievalError
+
+        if (ticket.build_id, ticket.space_id) != (self.build_id, self.space_id):
+            raise SourceRetrievalError("reader_failed")
+        try:
+            async with asyncio.timeout(1.25):
+                mem0 = await self.mem0.retrieve_sources(ticket, query)
+            mem0_status = "ok" if mem0.source_ids else "empty"
+        except TimeoutError:
+            mem0, mem0_status = NativeSources(requests=None), "timeout"
+        except Exception:
+            mem0, mem0_status = NativeSources(requests=None), "reader_failed"
+        clauses = QUESTION_JOIN.split(query, maxsplit=1)
+        strategy = "hierarchical"
+        timem_requests = 1
+        try:
+            async with asyncio.timeout(1.25):
+                leaves = await self.timem.linked_sources(clauses) if len(clauses) == 2 else ()
+                if leaves:
+                    strategy, timem_requests = "linked_exchanges", 2
+                else:
+                    _, leaves = await self.timem.retrieve(query)
+                timem = tuple(dict.fromkeys(UUID(item) for item in leaves))[:CANDIDATES]
+            timem_status = "ok" if timem else "empty"
+        except TimeoutError:
+            timem, timem_status = (), "timeout"
+        except Exception:
+            timem, timem_status = (), "reader_failed"
+        if not mem0.source_ids and not timem and {mem0_status, timem_status} != {"empty"}:
+            raise SourceRetrievalError("reader_failed")
+        if strategy == "linked_exchanges":
+            merged = dict.fromkeys((*timem, *mem0.source_ids))
+        else:
+            merged = dict.fromkeys(
+                source
+                for pair in zip_longest(mem0.source_ids, timem)
+                for source in pair
+                if source is not None
+            )
+        return NativeSources(
+            source_ids=tuple(merged)[:CANDIDATES],
+            requests=mem0.requests + timem_requests if mem0.requests is not None else None,
+            database_queries=mem0.database_queries,
+            branch_status={"mem0": mem0_status, "timem": timem_status},
+            timem_sources=timem,
+            timem_strategy=strategy,
+        )
+
+
+async def build_snapshot_layers(native, sources):
+    """Generate the component profile from the authoritative, pinned sources."""
+    from datetime import UTC
+    from itertools import groupby
+
+    native.snapshot = tuple(sources)
+    for when, group in groupby(native.snapshot, key=lambda source: source.observed_at):
+        # TiMem's native Memory model stores UTC without a tzinfo suffix.
+        when = when.astimezone(UTC).replace(tzinfo=None)
+        session = list(group)
+        session_id = str(session[0].message_id)
+        text = "\n".join(source.content for source in session)
+        content = await native.generator.generate_l1_content(text)
+        leaf = await native.add(
+            content,
+            level="L1",
+            when=when,
+            session_id=session_id,
+            sources=[str(source.message_id) for source in session],
+        )
+        summary = await native.generator.generate_l2_content([leaf.content])
+        await native.add(summary, level="L2", when=when, session_id=session_id, children=[leaf.id])

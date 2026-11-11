@@ -65,7 +65,7 @@ def paired_memory_requests(request):
     return full, recent_only
 
 
-async def import_history(db, chat_id, case):
+async def import_history(db, chat_id, case, *, format_source=source_text):
     """Fixture import only: canonical sources/tasks, never generated facts or state."""
     async with db.sessions.begin() as session:
         chat = await session.get(Chat, chat_id)
@@ -92,7 +92,7 @@ async def import_history(db, chat_id, case):
                 turn_id=turn.id,
                 source_seq=sequence,
                 role="user",
-                content=source_text(source),
+                content=format_source(source),
                 revision=1,
             )
             turns.append(turn)

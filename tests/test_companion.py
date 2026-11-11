@@ -311,15 +311,15 @@ async def test_longer_replacement_nickname_is_supplied_without_a_speech_veto(
     await conversation.finish(lease)
 
 
-async def test_topic_boundary_also_masks_conflicting_expression_nickname(conversation):
+async def test_topic_preference_remains_dialogue_context(conversation):
     identity = await conversation.bootstrap()
     chat, _, lease, _ = await request(conversation, identity, "以后叫我小木。", "name")
     await conversation.finish(lease)
     _, _, lease, context = await request(
         conversation, identity, "以后不要提小木。", "topic", chat=chat
     )
-    assert "小木" not in context.model_dump_json()
-    assert context.preferences.nickname is None
+    assert context.messages[-1].content == "以后不要提小木。"
+    assert context.preferences.nickname == "小木"
     await conversation.finish(lease)
 
 
@@ -347,7 +347,8 @@ async def test_current_controls_and_mention_timing_do_not_erase_assistant_histor
         conversation, identity, "接着聊。", "continue", chat=chat
     )
     assert any(m.role == "assistant" and "换个叫法" in m.content for m in context.messages)
-    assert "小沐" not in context.model_dump_json()
+    assert context.preferences.nickname == "小岚"
+    assert any(m.role == "assistant" and "就这么叫了" in m.content for m in context.messages)
     await conversation.finish(lease)
 
 
@@ -412,7 +413,7 @@ async def test_asking_about_the_word_goodnight_does_not_close_the_conversation(c
     await conversation.finish(lease)
 
 
-async def test_short_term_listening_signal_survives_without_resending_sensitive_story(conversation):
+async def test_short_term_listening_signal_preserves_original_history(conversation):
     from hmph.dialogue import Dialogue
     from hmph.dialogue_types import Anchor, ModeCue, StatePatch
 
@@ -438,7 +439,7 @@ async def test_short_term_listening_signal_survives_without_resending_sensitive_
     )
     assert context.companion.support_mode == "listen"
     assert context.companion.signal_source == source.id
-    assert "失恋" not in context.model_dump_json()
+    assert any("失恋" in m.content for m in context.messages)
     assert (
         source.id
         in (await conversation.memory_explanation(identity.owner_id, turn.id))["source_ids"]
@@ -475,7 +476,9 @@ async def test_current_nickname_correction_changes_context_without_replacing_mod
     def endpoint(request):
         body = json.loads(request.content)
         seen.append(body)
-        assert "小沐" not in json.dumps(body, ensure_ascii=False)
+        assert "小禾" in body["messages"][0]["content"]
+        assert "小沐" not in body["messages"][0]["content"]
+        assert any(m["content"] == "我叫小沐。" for m in body["messages"][1:])
         assert body["stream"]
         return httpx.Response(
             200,
@@ -498,7 +501,7 @@ async def test_current_nickname_correction_changes_context_without_replacing_mod
     assert saved.status == "completed" and saved.usage["guard_action"] == "not_requested"
 
 
-async def test_graph_source_on_request_boundary_uses_only_allowed_contiguous_original(conversation):
+async def test_graph_source_retains_original_excerpt_with_topic_preference(conversation):
     from test_online_memory import NativeReader, ready_graph
 
     from hmph.conversation import Conversation
@@ -524,15 +527,15 @@ async def test_graph_source_on_request_boundary_uses_only_allowed_contiguous_ori
     _, _, lease, context = await request(
         service, identity, "你记得我喜欢的跑步吗？", "safe", chat=chat
     )
-    assert "失恋" not in context.model_dump_json()
-    assert any(s.content == "我喜欢跑步" for s in context.raw_evidence)
+    assert any("失恋" in m.content for m in context.messages)
+    assert any("我喜欢跑步" in s.content for s in context.raw_evidence)
     await service.finish(lease)
     _, _, lease, context = await request(service, identity, "你记得我那次失恋吗？", "allowed")
     assert any("失恋" in s.content for s in context.raw_evidence)
     await service.finish(lease)
 
 
-async def test_topic_boundary_removes_old_text_from_history_raw_memory_and_state(conversation):
+async def test_topic_preference_and_source_text_remain_available_to_character(conversation):
     from hmph.dialogue import Dialogue
     from hmph.dialogue_types import Anchor, StatePatch
     from hmph.memory import Memory
@@ -558,7 +561,7 @@ async def test_topic_boundary_removes_old_text_from_history_raw_memory_and_state
     _, boundary, lease, context = await request(
         conversation, identity, "以后不要提我的失恋。", "boundary", chat=chat
     )
-    assert "失恋" not in context.model_dump_json()
+    assert context.messages[-1].content == "以后不要提我的失恋。"
     assert context.companion.repair_action == "applied"
     await conversation.finish(lease)
     for index in range(6):
@@ -569,7 +572,7 @@ async def test_topic_boundary_removes_old_text_from_history_raw_memory_and_state
             f"safe-{index}",
             chat=chat if index < 20 else None,
         )
-        assert "失恋" not in context.model_dump_json()
+        assert "失恋" in context.model_dump_json()
         await conversation.finish(lease)
     # The boundary is a removable user instruction, not a hidden permanent blacklist.
     settings = await Preferences(conversation).read(identity.owner_id, identity.character_id)
@@ -599,13 +602,7 @@ async def test_actual_mentions_are_recorded_only_when_published_and_replay_is_id
     _, turn, lease, context = await request(
         conversation, identity, "今天还是喜欢泡茶。", "chat", chat=chat
     )
-    assert (
-        sum(
-            d.permission == "mention" and d.reason == "proactive"
-            for d in context.companion.memory_use
-        )
-        <= 1
-    )
+    assert "source_permissions" not in context.companion.model_context()
     hint = (SourceMention(source_id=source.id, quote="乌龙茶"),)
     assert not (await conversation.companion_explanation(identity.owner_id, turn.id))["mentions"]
     await conversation.publish(lease, 0, "又喝了乌", mentions=hint)
@@ -620,10 +617,8 @@ async def test_actual_mentions_are_recorded_only_when_published_and_replay_is_id
         conversation, identity, "今天还是喜欢泡茶。", "again", chat=chat
     )
     audit = await conversation.companion_explanation(identity.owner_id, lease.turn_id)
-    assert (
-        next(d for d in audit["plan"]["memory_use"] if d["source_id"] == str(source.id))["reason"]
-        == "repeated"
-    )
+    assert audit["plan"]["memory_use"] == []
+    assert any("乌龙茶" in message.content for message in context.messages)
     await conversation.finish(lease)
 
 

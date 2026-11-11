@@ -283,7 +283,7 @@ class MemoryBuilds:
                 and build.pair_id == pair.id
                 and build.memory_epoch == pair.memory_epoch
                 and build.status == "ready"
-                and build.backend == "graphiti"
+                and build.backend in REVISIONS
                 and await session.scalar(
                     select(MemorySpace.id).where(
                         MemorySpace.build_id == build.id,
@@ -699,7 +699,18 @@ class MemoryBuilds:
                 return False
             if not space.quiesced:
                 raise DomainError("framework_writer_not_quiesced")
-            await self._sources(session, build)
+            sources = await self._sources(session, build)
+            if build.backend == "mem0":
+                session.add_all(
+                    MemoryNativeSource(
+                        space_id=space.id,
+                        native_id=str(source.message_id),
+                        message_id=source.message_id,
+                        message_revision=source.revision,
+                        source_order=source.source_order,
+                    )
+                    for source in sources
+                )
             previous = list(
                 await session.scalars(
                     select(MemoryBuild.id).where(

@@ -7,6 +7,7 @@ untrusted until the pair, build, revision, permission and source order agree.
 import asyncio
 import time
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 
 from hmph.contracts import ACTIVE, DomainError
+from hmph.memory import Memory
 from hmph.models import (
     MemoryBuild,
     MemoryBuildSource,
@@ -48,6 +50,9 @@ class NativeSources(BaseModel):
     source_ids: tuple[UUID, ...] = Field(default=(), max_length=CANDIDATES)
     requests: int | None = Field(default=1, ge=0, le=4)
     database_queries: int | None = Field(default=None, ge=0, le=32)
+    branch_status: dict[Literal["mem0", "timem"], str] = Field(default_factory=dict)
+    timem_sources: tuple[UUID, ...] = Field(default=(), max_length=CANDIDATES)
+    timem_strategy: Literal["hierarchical", "linked_exchanges"] | None = None
 
 
 class ReadTicket(BaseModel):
@@ -58,6 +63,7 @@ class ReadTicket(BaseModel):
     space_id: UUID | None
     config_revision: int
     build_watermark: int
+    backend: Literal["graphiti", "mem0"] = "graphiti"
     cutoff: int
     job_fence: int
     valid_until: datetime
@@ -73,6 +79,7 @@ async def pin_read(session, pair, turn, lease):
     }
     ready = await ready_space(session, pair, pair.selected_memory_build)
     build, space = ready if ready else (None, None)
+    selected = build or await session.get(MemoryBuild, pair.selected_memory_build)
     ticket = ReadTicket(
         turn_id=turn.id,
         pair_id=pair.id,
@@ -80,14 +87,16 @@ async def pin_read(session, pair, turn, lease):
         space_id=space.id if space else None,
         config_revision=pair.memory_config_revision,
         build_watermark=build.watermark if build else 0,
+        backend=selected.backend if selected else "graphiti",
         cutoff=pair.next_memory_seq - 1,
         job_fence=lease.fence,
         valid_until=turn.deadline,
     )
     if ready:
-        session.add(MemoryRead(**ticket.model_dump(exclude={"pair_id", "build_watermark"})))
+        session.add(
+            MemoryRead(**ticket.model_dump(exclude={"pair_id", "build_watermark", "backend"}))
+        )
     turn.memory_context = {
-        "backend": "graphiti",
         "retrieval_status": "preparing",
         **ticket.model_dump(mode="json", exclude={"pair_id", "turn_id"}),
     }
@@ -169,9 +178,20 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
     scan_overflow = len(delta) > CANDIDATES
     delta_gap = int(scan_overflow)
     delta = delta[:CANDIDATES]
-    # Reserve half of the shared candidate capacity for exact original-text
-    # matches. A successful semantic search can still omit the decisive source.
-    native_capacity = max(0, (CANDIDATES - len(delta)) // 2)
+    # Native hits locate original messages. Keep independently committed facts
+    # available both alongside those hits and after a native snapshot retires.
+    memories = []
+    if ticket.backend == "mem0":
+        memories = await Memory.search(
+            session,
+            turn.pair_id,
+            query,
+            reference=turn.created_at,
+            source_timezone=turn.source_timezone,
+        )
+    native_capacity = max(0, CANDIDATES - len(delta) - len(memories))
+    if ticket.backend == "graphiti":
+        native_capacity //= 2  # Reserve space for Graphiti's existing lexical complement.
     source_ids = tuple(dict.fromkeys(native.source_ids))[:native_capacity]
     rows = list(
         (
@@ -228,7 +248,7 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
     # same candidate/deadline/context budgets. This adds no framework writer.
     fallback = []
     fallback_scanned = 0
-    if not delta_gap and not filtered:
+    if not delta_gap and not filtered and ticket.backend == "graphiti":
         fallback, fallback_scanned = await search_raw(
             session, turn, query, (), limit=CANDIDATES - len(delta) - len(rows)
         )
@@ -279,10 +299,15 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
             truncated += int(source.truncated)
     # Presentation order reflects observation order, never event-time sorting.
     selected.sort(key=lambda s: s.source_order)
+    selected_native = native_messages.intersection(s.message_id for s in selected)
     audit = {
-        "backend": "graphiti"
-        if status == "ok" and any(m.id in {s.message_id for s in selected} for _, m, _, _ in rows)
-        else "lexical",
+        "backend": ("mem0_timem" if native.branch_status else ticket.backend)
+        if status == "ok" and selected_native
+        else "lexical"
+        if ticket.backend == "graphiti"
+        else "canonical"
+        if memories
+        else "recent_only",
         "retrieval_status": status,
         "delta_gap": delta_gap,
         "delta_scanned": len(delta),
@@ -300,6 +325,9 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         "truncated_sources": truncated,
         "requests": native.requests,
         "database_queries": native.database_queries,
+        "branch_status": native.branch_status,
+        "timem_source_ids": [str(s) for s in native.timem_sources if s in selected_native],
+        "timem_strategy": native.timem_strategy,
         "build_watermark": ticket.build_watermark,
         "cutoff": ticket.cutoff,
         "config_revision": ticket.config_revision,
@@ -308,10 +336,10 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
     }
     return WorkingCandidates(
         plan_recall(query),
-        [],
+        memories,
         selected,
         native.requests if native.requests is not None else 1,
-        len(rows) + len(delta) + fallback_scanned,
+        min(CANDIDATES, len(rows) + len(delta) + fallback_scanned + len(memories)),
     ), audit
 
 
@@ -349,7 +377,7 @@ async def ready_space(session, pair, build_id):
             .where(
                 MemoryBuild.id == build_id,
                 MemoryBuild.pair_id == pair.id,
-                MemoryBuild.backend == "graphiti",
+                MemoryBuild.backend.in_(("graphiti", "mem0")),
                 MemoryBuild.status == "ready",
                 MemoryBuild.memory_epoch == pair.memory_epoch,
                 MemorySpace.status == "ready",
@@ -376,8 +404,9 @@ async def invalidate_reads(session, build_ids):
 
 
 class MemorySelection:
-    def __init__(self, db, *, digest_key):
+    def __init__(self, db, *, digest_key, allow_mem0=False):
         self.db, self.ledger = db, RequestLedger(digest_key)
+        self.allow_mem0 = allow_mem0
 
     async def _pair(self, session, owner_id, character_id, *, lock=False):
         query = select(Pair).where(Pair.owner_id == owner_id, Pair.character_id == character_id)
@@ -387,12 +416,13 @@ class MemorySelection:
         return pair
 
     async def _view(self, session, pair):
-        build = pair.selected_memory_build
+        build_id = pair.selected_memory_build
+        build = await session.get(MemoryBuild, build_id) if build_id else None
         return SelectionView(
-            mode="graphiti_experimental" if build else "lexical",
+            mode=f"{build.backend}_experimental" if build else "lexical",
             revision=pair.memory_config_revision,
-            build_id=build,
-            available=build is None or await ready_space(session, pair, build) is not None,
+            build_id=build_id,
+            available=build_id is None or await ready_space(session, pair, build_id) is not None,
         )
 
     async def get(self, owner_id, character_id):
@@ -425,6 +455,8 @@ class MemorySelection:
                 from hmph.memory_builds import MemoryBuilds
 
                 build, space = await ready_space(session, pair, build_id)
+                if build.backend == "mem0" and not self.allow_mem0:
+                    raise DomainError("memory_build_unavailable")
                 await MemoryBuilds._sources(session, build)
                 mapped = await session.scalar(
                     select(func.count())

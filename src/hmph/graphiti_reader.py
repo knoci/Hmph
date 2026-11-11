@@ -131,6 +131,8 @@ class GraphitiSourceReader:
             await process.wait()
 
     async def retrieve_sources(self, ticket, query):
+        if ticket.backend != "graphiti":
+            raise SourceRetrievalError("reader_failed")
         if self.closed:
             raise SourceRetrievalError("reader_failed")
         if self.recovery and not self.recovery.done():

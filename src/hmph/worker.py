@@ -122,21 +122,12 @@ class Worker:
                     error.code if isinstance(error, ProviderError) else "provider_protocol"
                 )
                 metadata["complete"] = False
-        permissions = (
-            {d.source_id: d.permission for d in request.companion.memory_use}
-            if request.companion
-            else {}
-        )
         # Verbatim known facts have a deterministic witness too. Paraphrases
         # without a validated shared span are deliberately not guessed into the ledger.
         for hit in request.evidence:
             if 2 <= len(hit.value) <= 80 and hit.value in body:
                 for source in hit.sources:
-                    if (
-                        permissions.get(source.message_id) == "mention"
-                        and hit.value in source.quote
-                        and len(mentions) < 12
-                    ):
+                    if hit.value in source.quote and len(mentions) < 12:
                         mentions.append(SourceMention(source_id=source.message_id, quote=hit.value))
         valid_mentions = []
         for hint in mentions:

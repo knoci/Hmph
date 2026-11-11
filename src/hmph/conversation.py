@@ -1016,14 +1016,7 @@ class Conversation:
                     )
                     .on_conflict_do_nothing()
                 )
-            from hmph.companion_policy import forbidden_in
-
             effective_preferences = expression_preferences(pair.preferences)
-            if effective_preferences.nickname and forbidden_in(
-                pair.preferences, lease.user_content, effective_preferences.nickname
-            ):
-                effective_preferences = effective_preferences.model_copy(update={"nickname": None})
-                turn.companion_plan = {**turn.companion_plan, "withheld_preferences": ["nickname"]}
             request = GenerationRequest(
                 messages=tuple(chosen),
                 history_origins=tuple(

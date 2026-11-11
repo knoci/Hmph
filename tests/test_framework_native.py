@@ -109,6 +109,36 @@ async def test_native_worker_persists_a_shadow_build_then_verifies_full_forget(
         "processed_sources": 1,
         "native_changes": 1,
     }
+    from pathlib import Path
+
+    from hmph.conversation import Conversation
+    from hmph.mem0_backend import Mem0SourceReader
+    from hmph.online_memory import MemorySelection
+
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_mem0=True
+    )
+    view = await selection.update(
+        identity.owner_id, identity.character_id, "select-mem0",
+        expected_revision=1, build_id=requested.id,
+    )
+    assert view.mode == "mem0_experimental"
+    service = Conversation(
+        conversation.db,
+        digest_key=conversation.digest_key,
+        source_reader=Mem0SourceReader(
+            conversation.db.url, model_cache=Path("artifacts/models/multilingual-minilm")
+        ),
+    )
+    chat = await service.create_chat(identity.owner_id, identity.character_id, "recall")
+    await service.accept(identity.owner_id, chat.id, "recall", "What is my name?")
+    lease = await service.claim("mem0-reader")
+    request = await service.generation_request(lease)
+    assert request.workspace.backend == "mem0"
+    assert [(source.content, source.source_order) for source in request.raw_evidence] == [
+        ("My name is Mira.", 1)
+    ]
+    await service.finish(lease)
     receipt = await memory.forget(identity.owner_id, fact.id, "forget", expected_revision=1)
     assert receipt.status == "pending_cleanup"
     restarted = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
@@ -138,7 +168,7 @@ async def test_exhausted_native_call_budget_does_not_repeat_paid_builds(
     assert result.status == "failed" and result.attempts == 1 and result.error_code == "call_budget"
     assert not await builds.claim("unexpected-retry", backend="mem0")
     space = (await builds.spaces(identity.owner_id, requested.id))[0]
-    assert space.quiesced and space.usage["attempted_calls"] == 1
+    assert space.quiesced and space.usage["attempted_calls"] == 0
     await FrameworkWorker(builds, backend).run_once()
     assert (await builds.spaces(identity.owner_id, requested.id))[0].status == "cleaned"
     assert not await builds.current(identity.owner_id, identity.character_id, backend="mem0")

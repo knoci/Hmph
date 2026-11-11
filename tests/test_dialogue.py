@@ -77,6 +77,27 @@ async def test_dialogue_state_keeps_grounded_goal_and_contiguous_watermark(conve
     assert view.data.goal.message_revision == 1
 
 
+async def test_state_can_carry_forward_a_verified_plan_source(conversation):
+    from hmph.dialogue import Dialogue
+    from hmph.dialogue_types import Anchor, StatePatch
+
+    identity = await conversation.bootstrap()
+    chat = await conversation.create_chat(identity.owner_id, identity.character_id, "piano")
+    goal = "每天练十分钟"
+    original = await source_turn(conversation, identity, chat, "goal", goal)
+    dialogue = Dialogue(conversation.db)
+    anchor = Anchor(message_id=original.id, text=goal, quote=goal)
+    await dialogue.commit(await dialogue.claim("state-worker"), StatePatch(goal=anchor))
+    progress = await source_turn(conversation, identity, chat, "progress", "今天练了十分钟。")
+    lease = await dialogue.claim("state-worker")
+    assert original.id not in {message.id for message in lease.messages}
+    topic = Anchor(message_id=progress.id, text="练了十分钟", quote="今天练了十分钟。")
+    result = await dialogue.commit(lease, StatePatch(topic=topic, open_items=[anchor]))
+    view = await dialogue.read(identity.owner_id, chat.id)
+    assert result.status == "committed" and view.processed_through_seq == 4
+    assert view.data.open_items[0].content.message_id == original.id
+
+
 async def test_unprocessed_correction_remains_visible_and_old_commit_cannot_advance_watermark(
     conversation,
 ):

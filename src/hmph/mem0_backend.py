@@ -52,7 +52,10 @@ def validate_extraction(payload):
 class Mem0Backend:
     backend = "mem0"
 
-    def __init__(self, key, *, database_url, max_calls=64, delegate=None):
+    def __init__(
+        self, key, *, database_url, max_calls=64, delegate=None, batch_bytes=None,
+        budget=None, stop_file=None,
+    ):
         self.database_url = database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
         if urlsplit(self.database_url).hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Local framework worker requires a loopback database")
@@ -79,6 +82,10 @@ class Mem0Backend:
         ):
             raise RuntimeError("Native Mem0 checkout must match the unmodified pinned revision")
         self.key, self.max_calls, self.delegate = key, max_calls, delegate
+        if batch_bytes is not None and not 1 <= batch_bytes <= 3000:
+            raise ValueError("Invalid Mem0 batch size")
+        self.batch_bytes = batch_bytes
+        self.budget, self.stop_file = budget, stop_file
         self.usage = BuildUsage(
             attempted_calls=0,
             reported_tokens=0,
@@ -170,6 +177,24 @@ class Mem0Backend:
             finally:
                 native.llm.client.close()
 
+    def _batches(self, sources):
+        if self.batch_bytes is None:
+            yield from ((source,) for source in sources)
+            return
+        batch, size = [], 0
+        for source in sources:
+            source_size = len(source.content.encode("utf-8"))
+            if batch and (
+                source.observed_at != batch[0].observed_at
+                or size + source_size + 1 > self.batch_bytes
+            ):
+                yield tuple(batch)
+                batch, size = [], 0
+            size += source_size + bool(batch)
+            batch.append(source)
+        if batch:
+            yield tuple(batch)
+
     async def build(self, lease, checkpoint):
         self.usage = BuildUsage(
             attempted_calls=0,
@@ -186,26 +211,35 @@ class Mem0Backend:
             max_calls=min(self.max_calls, lease.call_limit or self.max_calls),
             delegate=self.delegate,
             response_validator=validate_extraction,
+            budget=self.budget,
+            stop_file=self.stop_file,
         )
         native = None
         processed, changes = 0, 0
         try:
+            batches = tuple(self._batches(lease.sources))
+            if len(batches) > min(self.max_calls, lease.call_limit or self.max_calls):
+                raise FrameworkBuildError("call_budget", retryable=False)
             await checkpoint()
             native = await asyncio.to_thread(self._open, lease, transport)
-            for source in lease.sources:
+            for batch in batches:
                 await checkpoint()
+                source = batch[0]
+                metadata = {
+                    "hmph_source_id": str(source.message_id),
+                    "hmph_source_revision": source.revision,
+                    "hmph_source_order": source.source_order,
+                    "hmph_observed_at": source.observed_at.isoformat(),
+                }
+                if len(batch) > 1:
+                    metadata["hmph_source_ids"] = [str(item.message_id) for item in batch]
                 result = await asyncio.to_thread(
                     native.add,
-                    [{"role": "user", "content": source.content}],
+                    [{"role": "user", "content": "\n".join(item.content for item in batch)}],
                     user_id="pair_" + lease.pair_id.hex,
-                    metadata={
-                        "hmph_source_id": str(source.message_id),
-                        "hmph_source_revision": source.revision,
-                        "hmph_source_order": source.source_order,
-                        "hmph_observed_at": source.observed_at.isoformat(),
-                    },
+                    metadata=metadata,
                 )
-                processed += 1
+                processed += len(batch)
                 changes += len(result.get("results", []))
             if any(r["status"] != "completed" for r in transport.records):
                 raise RuntimeError("Framework provider failed")
@@ -293,3 +327,65 @@ class Mem0Backend:
         if lease.backend != self.backend:
             raise ValueError("Framework backend mismatch")
         await asyncio.to_thread(self._drain_writes, lease)
+
+class Mem0SourceReader:
+    """Read the existing Mem0 vector collection without opening its write stores."""
+
+    def __init__(self, database_url, *, model_cache):
+        from fastembed import TextEmbedding
+
+        self.database_url = database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
+        if urlsplit(self.database_url).hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("Local Mem0 reader requires a loopback database")
+        self.embedding = TextEmbedding(
+            model_name=EMBEDDING_MODEL, cache_dir=str(model_cache), local_files_only=True
+        )
+
+    async def retrieve_sources(self, ticket, query):
+        from hmph.online_memory import CANDIDATES, NativeSources, SourceRetrievalError
+
+        if ticket.backend != "mem0" or ticket.space_id is None:
+            raise SourceRetrievalError("reader_failed")
+        rows = await asyncio.to_thread(self._search, ticket.space_id, ticket.pair_id, query)
+        sources = {}
+        for row in rows:
+            values = row.payload.get("hmph_source_ids")
+            if values is None:
+                values = (row.payload["hmph_source_id"],)
+            if not isinstance(values, (list, tuple)) or not values:
+                raise SourceRetrievalError("reader_failed")
+            for value in values:
+                sources[UUID(value)] = None
+                if len(sources) == CANDIDATES:
+                    break
+            if len(sources) == CANDIDATES:
+                break
+        return NativeSources(source_ids=tuple(sources), requests=1, database_queries=1)
+
+    def _search(self, space_id, pair_id, query):
+        import psycopg
+        from mem0.vector_stores.pgvector import PGVector
+
+        schema = "hmph_m0_" + space_id.hex
+        # This native provider normally lazily creates missing tables. In a ready
+        # space a missing table is an error, and the DB enforces read-only access.
+        vector = PGVector(
+            dbname=None, collection_name=schema, embedding_model_dims=384,
+            user=None, password=None, host=None, port=None, diskann=False, hnsw=False,
+            connection_pool=None,
+            connection_string=psycopg.conninfo.make_conninfo(
+                self.database_url,
+                options=f"-csearch_path={schema},public -cdefault_transaction_read_only=on "
+                        "-cstatement_timeout=2000",
+                connect_timeout=2,
+            ),
+            minconn=0, maxconn=1,
+        )
+        vector._collection_ensured = True
+        try:
+            embedding = next(iter(self.embedding.embed([query.replace("\n", " ")]))).tolist()
+            return vector.search(
+                query, embedding, top_k=12, filters={"user_id": "pair_" + pair_id.hex}
+            )
+        finally:
+            vector.connection_pool.close()

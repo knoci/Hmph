@@ -147,7 +147,7 @@ class RunBudget:
         recall_product = (
             isinstance(case_id, str)
             and re.fullmatch(r"case-[0-9]{3}", case_id)
-            and profile in {"lexical", "focused"}
+            and profile in {"lexical", "focused", "mem0_only", "mem0_timem"}
             and stage
             in {"extract", "state", "generation", "guard", "planner", "grounding", "answer_judge"}
         )

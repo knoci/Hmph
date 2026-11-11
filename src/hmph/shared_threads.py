@@ -4,7 +4,7 @@ import re
 
 from sqlalchemy import func, select
 
-from hmph.companion_policy import CLOSE, LISTEN, PAUSE, SENSITIVE, forbidden_in, requested
+from hmph.companion_policy import requested
 from hmph.contracts import ACTIVE, DomainError
 from hmph.dialogue import queue_dialogue
 from hmph.models import MemoryTask, Message, Pair, SharedThread, SharedThreadSource, Turn
@@ -16,6 +16,9 @@ RETURNING = re.compile(r"我回来了|又见面|早上好|晚上好|^你好|^hel
 THREAD_QUERY = re.compile(
     r"(?:还有|还在|正在|什么|哪些|哪个|记得).{0,12}(?:共同计划|跟进.{0,8}计划)"
     r"|(?:共同计划|跟进.{0,8}计划).{0,8}(?:记得|还在|吗|么|呢)"
+)
+ENGLISH_THREAD_QUESTION = re.compile(
+    r"^\s*(?:are we|do we|what|which)\b[^?]{0,80}\b(?:shared|joint)\s+plans?\b", re.I
 )
 TRANSITIONS = {
     "open": {"paused", "resolved", "dropped"},
@@ -29,11 +32,7 @@ def interaction_rhythm(texts):
     """A bounded view of actual publication, never planned or cancelled drafts."""
     return {
         "recent_questions": sum(bool(re.search(r"[?？]", text)) for text in texts),
-        "question_limit": 0
-        if len(texts) >= 2 and all(re.search(r"[?？]", t) for t in texts)
-        else 1,
-        "avoid_repeated_advice": any(re.search(r"建议|可以试试|不妨", t) for t in texts),
-        "instruction": "先承接本轮表达；避免连续追问和重复建议，用户结束时自然收尾。",
+        "recent_advice": sum(bool(re.search(r"建议|可以试试|不妨", text)) for text in texts),
     }
 
 
@@ -250,9 +249,8 @@ class SharedThreads:
 
 
 async def prepare_thread(session, pair, turn, query, candidates):
-    if any(pattern.search(query.strip()) for pattern in (CLOSE, LISTEN, PAUSE, SENSITIVE)):
-        return None, False
-    thread_query = bool(THREAD_QUERY.search(query))
+    english_question = bool(ENGLISH_THREAD_QUESTION.search(query))
+    thread_query = english_question or bool(THREAD_QUERY.search(query))
     threads = list(
         await session.scalars(
             select(SharedThread)
@@ -262,8 +260,6 @@ async def prepare_thread(session, pair, turn, query, candidates):
         )
     )
     for thread in threads:
-        if forbidden_in(pair.preferences, query, thread.topic):
-            continue
         if not (
             RETURNING.search(query)
             or thread_query
@@ -300,7 +296,7 @@ async def prepare_thread(session, pair, turn, query, candidates):
                 ),
             )
         return thread, False
-    return None, not threads and thread_query and requested(query)
+    return None, not threads and thread_query and (english_question or requested(query))
 
 
 async def apply_thread_command(session, pair, turn, message, *, proposed=None):

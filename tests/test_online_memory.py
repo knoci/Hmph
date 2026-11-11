@@ -92,6 +92,52 @@ class NativeReader:
         return NativeSources(source_ids=tuple(self.ids))
 
 
+async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conversation):
+    from hmph.conversation import Conversation
+    from hmph.memory import Memory
+    from hmph.memory_build_types import CleanupProof
+    from hmph.memory_types import MemoryProposal
+
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    original = await say(conversation, identity, "我在远山设计工作。", "work")
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    await memory.learn(
+        await memory.claim("extract"),
+        [MemoryProposal(predicate="employer", value="远山设计", quote=original.content)],
+    )
+    poem = await say(conversation, identity, "我正在背山居秋暝。", "poem")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    build = await builds.request(owner, character, "build", backend="mem0")
+    build_lease = await builds.claim("native", backend="mem0")
+    await builds.quiesce(build_lease)
+    assert await builds.publish(build_lease)
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_mem0=True
+    )
+    await selection.update(owner, character, "select", expected_revision=1, build_id=build.id)
+    service = Conversation(
+        conversation.db, digest_key=conversation.digest_key, source_reader=NativeReader([poem.id])
+    )
+    for key in ("ready", "after-forget"):
+        chat = await service.create_chat(owner, character, key)
+        await service.accept(owner, chat.id, key, "我现在在哪工作？")
+        lease = await service.claim("reader")
+        request = await service.generation_request(lease)
+        assert any(hit.value == "远山设计" for hit in request.evidence)
+        if key == "after-forget":
+            assert request.workspace.retrieval_status == "build_unavailable"
+            assert "山居秋暝" not in request.model_dump_json()
+        await service.finish(lease)
+        if key == "ready":
+            receipt = await memory.forget_source(owner, poem.id, "forget", expected_revision=1)
+            cleanup = await builds.claim_cleanup("cleanup", backend="mem0")
+            await builds.finish_cleanup(
+                cleanup, CleanupProof(store_empty=True, auxiliary_empty=True)
+            )
+            assert (await memory.deletion(owner, receipt.id)).status == "completed"
+
+
 async def test_successful_graph_result_is_complemented_by_matching_canonical_original(conversation):
     from hmph.conversation import Conversation
 

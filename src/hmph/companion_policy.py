@@ -60,13 +60,11 @@ class CompanionPlan(BaseModel):
     thread_control: Literal["open", "paused", "resolved", "dropped"] | None = None
 
     def model_context(self):
-        return {
-            **self.model_dump(mode="json", exclude={"memory_use", "no_active_shared_thread"}),
-            "persona": PersonaCore().model_dump(),
-            "source_permissions": {
-                str(d.source_id): d.permission for d in self.memory_use if d.permission != "omit"
-            },
-        }
+        return self.model_dump(
+            mode="json",
+            include={"repair_action", "shared_thread", "no_active_shared_thread", "rhythm",
+                     "thread_control"},
+        )
 
 
 @dataclass(frozen=True)
