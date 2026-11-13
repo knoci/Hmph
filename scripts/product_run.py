@@ -234,7 +234,7 @@ class Services:
             await transport.shutdown()
 
 
-async def maintenance(db, services, failures, progress=lambda _: None):
+async def maintenance(db, services, failures, progress=lambda _: None, *, state_failure=None):
     """One attempt per queued source/session, using the product commit interfaces."""
     memory = Memory(db, digest_key=b"evaluation-isolated-schema-only")
     while lease := await memory.claim("p2d-memory", model_mode="deepseek", lease_seconds=60):
@@ -279,6 +279,8 @@ async def maintenance(db, services, failures, progress=lambda _: None):
                     "patch_present": patch is not None,
                 }
             )
+            if state_failure is not None:
+                state_failure(lease, failures[-1])
             if isinstance(error, ProviderError) and str(error) in {
                 "provider_authentication",
                 "provider_balance",

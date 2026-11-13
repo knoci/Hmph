@@ -376,10 +376,14 @@ class ProductTransport(httpx.AsyncBaseTransport):
         self.exhausted = False
         self.max_request_bytes = max_request_bytes
         self.stop_file = stop_file
+        self.capture_response = False
+        self.last_response = None
 
     async def handle_async_request(self, request):
         from hmph.reference_transport import ReferenceCallError, failure_code, http_failure_code
 
+        if self.capture_response:
+            self.last_response = None
         if self.stop_file is not None and self.stop_file.exists():
             raise ReferenceCallError("reference_cancelled")
 
@@ -444,6 +448,8 @@ class ProductTransport(httpx.AsyncBaseTransport):
                 data.extend(chunk)
                 if len(data) > 262144:
                     raise ReferenceCallError("reference_response_limit")
+            if self.capture_response:
+                self.last_response = bytes(data).decode("utf-8", errors="replace")
             if response.status_code == 200:
                 record["failure_phase"] = "response_protocol"
                 payloads = (

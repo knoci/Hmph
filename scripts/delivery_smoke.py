@@ -23,7 +23,7 @@ from sqlalchemy import text  # noqa: E402
 from hmph.config import Settings  # noqa: E402
 from hmph.conversation import DEFAULT_CHARACTER, DEFAULT_OWNER  # noqa: E402
 from hmph.database import Database  # noqa: E402
-from hmph.models import Character, Chat, Message, Owner, Pair, Turn  # noqa: E402
+from hmph.models import Character, Chat, Message, Owner, Turn  # noqa: E402
 from scripts.product_run import save  # noqa: E402
 
 
@@ -156,14 +156,12 @@ async def main(directory):
                 )
             )
             await s.execute(
-                Pair.__table__.insert().values(
-                    id=pair_id,
-                    owner_id=DEFAULT_OWNER,
-                    character_id=DEFAULT_CHARACTER,
-                    preferences={},
-                    policy_revision=1,
-                    memory_epoch=1,
-                )
+                text(
+                    "INSERT INTO pairs "
+                    "(id, owner_id, character_id, preferences, policy_revision, memory_epoch) "
+                    "VALUES (:id, :owner_id, :character_id, '{}'::jsonb, 1, 1)"
+                ),
+                {"id": pair_id, "owner_id": DEFAULT_OWNER, "character_id": DEFAULT_CHARACTER},
             )
             await s.execute(
                 Chat.__table__.insert().values(id=chat_id, pair_id=pair_id, next_source_seq=2)
@@ -208,7 +206,7 @@ async def main(directory):
                     )
                     == "upgrade-preserved-message"
                 )
-            report["checks"]["upgrade_0011_to_0013_preserves_existing_message"] = True
+            report["checks"]["upgrade_from_0011_preserves_existing_message"] = True
             report["checks"]["stale_schema_startup_rejected"] = True
             server = await start("serve", "--port", str(port))
             await ready(client, 200)

@@ -1,10 +1,12 @@
 """P5-c blinded human-review material; never generates or simulates human scores."""
 
 import argparse
+import asyncio
 import hashlib
 import json
 import secrets
 from collections import Counter
+from html import escape
 from pathlib import Path
 
 from hmph.model_gateway import FALLBACK
@@ -19,8 +21,8 @@ body{font:16px/1.65 system-ui;background:#f5f4f1;color:#202521;margin:0}
 main{max-width:1280px;margin:auto;padding:24px}h1{margin:0 0 8px}fieldset,article,details{background:white;border:1px solid #d6ddd7;border-radius:10px;padding:16px;margin:14px 0}
 input,select,button,textarea{font:inherit;padding:7px;border:1px solid #a8b6ae;border-radius:6px}button{cursor:pointer;background:#234f41;color:white}textarea{width:96%;min-height:65px}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.reply{white-space:pre-wrap;border-left:4px solid #487462;padding:14px;background:#f0f5f1}.history{white-space:pre-wrap;max-height:480px;overflow:auto;font-size:14px}.fields label{display:flex;justify-content:space-between;gap:8px;margin:8px 0}.muted{color:#53665b}.nav{display:flex;gap:12px;align-items:center;flex-wrap:wrap}@media(max-width:800px){.columns{grid-template-columns:1fr}}
 </style><main><h1>Hmph 独立盲评</h1>
-<p>请独立完成，不与另一位评审讨论或查看对方答案。左右组别已隐藏；评估实际发布的回复，包含拦截回复，不猜实验组。允许平局和无法判断。</p>
-<p class="muted">30 组来自同一条连续轨迹，提供截至当轮的完整上下文。这次对照改变记忆提及策略；也请检查共同计划和纠错行为。请勿把片段阅读填写为真实试用。</p>
+<p>请独立完成，不与另一位评审讨论或查看对方答案。左右组别已隐藏。允许平局和无法判断。</p>
+<p class="muted">__PAIR_COUNT__ 组来自同一条连续轨迹，提供截至当轮的完整前文。__MECHANISM__ 阅读片段不计为真实试用。</p>
 <fieldset><legend>评审与真实试用记录</legend>
 <label>匿名编号 <input id="rater" placeholder="例如 R1 或 R2" autocomplete="off"></label>
 <label><input id="human" type="checkbox">我是独立真人，以下评分由我本人填写</label><br>
@@ -46,15 +48,16 @@ function valid(p,a){if(!a||!['A','B','tie'].includes(a.preference))return false;
 function progress(){$('progress').textContent=`有效填写 ${pack.pairs.filter(p=>valid(p,answers[p.id])).length} / ${pack.pairs.length}`}
 function show(index){save();current=Math.max(0,Math.min(pack.pairs.length-1,index));loading=true;const p=pack.pairs[current],a=answers[p.id]||{A:{},B:{}};$('cases').value=current;$('case-title').textContent=`第 ${current+1} 组 · ${{C1:'提及与节奏',C2:'共同线索',C3:'称呼与纠错'}[p.family]}`;$('clock').textContent=`记录时间：${p.recorded_at||'见前文'}`;$('question').textContent=p.user;for(const side of ['A','B']){$('reply'+side).textContent=p[side].reply;$('context'+side).textContent=p[side].context;for(const key of [...Object.keys(labels),'facts','boundaries'])$(side+'-'+key).value=a[side]?.[key]||''}$('preference').value=a.preference||'';$('comment').value=a.comment||'';loading=false;progress()}
 $('cases').onchange=()=>show(Number($('cases').value));$('prev').onclick=()=>show(current-1);$('next').onclick=()=>show(current+1);$('preference').onchange=save;$('comment').oninput=save;
-$('download').onclick=()=>{save();const count=pack.pairs.filter(p=>valid(p,answers[p.id])).length,complete=count===30&&$('rater').value.trim()&&$('human').checked;const result={schema:'hmph-human-review-v1',pack_id:pack.id,rater_id:$('rater').value.trim(),human_attestation:$('human').checked,started_at:started,exported_at:new Date().toISOString(),complete:!!complete,valid_pairs:count,trial:{used:$('tried').value==='yes',start:$('trial-start').value,end:$('trial-end').value,notes:$('trial-notes').value},ratings:answers};const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));link.download=`hmph-review-${result.rater_id.replace(/[^a-zA-Z0-9_-]/g,'')||'draft'}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);$('notice').textContent=complete?'本人评分已导出；请交给协调人，不与另一位评审交换答案。':'已导出草稿，尚未满足真人身份与 30 组有效评分要求。'};
+$('download').onclick=()=>{save();const count=pack.pairs.filter(p=>valid(p,answers[p.id])).length,complete=count===pack.pairs.length&&$('rater').value.trim()&&$('human').checked;const result={schema:'hmph-human-review-v1',pack_id:pack.id,rater_id:$('rater').value.trim(),human_attestation:$('human').checked,started_at:started,exported_at:new Date().toISOString(),complete:!!complete,valid_pairs:count,trial:{used:$('tried').value==='yes',start:$('trial-start').value,end:$('trial-end').value,notes:$('trial-notes').value},ratings:answers};const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));link.download=`hmph-review-${result.rater_id.replace(/[^a-zA-Z0-9_-]/g,'')||'draft'}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);$('notice').textContent=complete?'本人评分已导出；请交给协调人，不与另一位评审交换答案。':`已导出草稿，尚未满足真人身份与 ${pack.pairs.length} 组有效评分要求。`};
 $('restore').onchange=async event=>{try{const r=JSON.parse(await event.target.files[0].text());if(r.pack_id!==pack.id||r.schema!=='hmph-human-review-v1')throw Error();if(!confirm('仅恢复你本人填写的草稿，确认继续？'))return;Object.assign(answers,r.ratings);$('rater').value=r.rater_id||'';$('human').checked=!!r.human_attestation;$('tried').value=r.trial?.used?'yes':'no';$('trial-start').value=r.trial?.start||'';$('trial-end').value=r.trial?.end||'';$('trial-notes').value=r.trial?.notes||'';loading=true;show(current);$('notice').textContent='已恢复本人草稿。'}catch{$('notice').textContent='草稿版本或材料编号不匹配，未载入。'}};
 loading=true;show(0);
 </script></main></html>"""  # noqa: E501
 
 
-def prepare(source):
-    output = source.parent / "human-review.html"
-    keyfile = source.parent / "human-review-key.json"
+def prepare(source, *, rounds=None, review_dir=None):
+    review_dir = review_dir or source.parent
+    output = review_dir / "human-review.html"
+    keyfile = review_dir / "human-review-key.json"
     if output.exists() or keyfile.exists():
         raise ValueError("Review pack already frozen; do not reshuffle or overwrite")
     raw = source.read_bytes()
@@ -64,16 +67,22 @@ def prepare(source):
     if any(row.get("reply") == FALLBACK for rows in arms.values() for row in rows):
         raise ValueError("Fix failed conversations before preparing human-review material")
     users = [r for r in arms["off"] if "user" in r]
-    mandatory = [
-        r for r in users if not r["id"].startswith("after-correction-") or r.get("recurrence")
-    ]
     seed = hashlib.sha256(raw).hexdigest()
-    optional = sorted(
-        [r for r in users if r not in mandatory],
-        key=lambda r: hashlib.sha256((seed + r["id"]).encode()).hexdigest(),
-    )
-    chosen = mandatory + optional[: 30 - len(mandatory)]
-    assert len(chosen) == 30
+    if rounds is not None:
+        ids = {f"round-{number:02d}" for number in rounds}
+        chosen = [row for row in users if row["id"] in ids]
+        if len(chosen) != len(rounds):
+            raise ValueError("Review rounds must be distinct and present in the replay")
+    else:
+        mandatory = [
+            r for r in users if not r["id"].startswith("after-correction-") or r.get("recurrence")
+        ]
+        optional = sorted(
+            [r for r in users if r not in mandatory],
+            key=lambda r: hashlib.sha256((seed + r["id"]).encode()).hexdigest(),
+        )
+        chosen = mandatory + optional[: 30 - len(mandatory)]
+        assert len(chosen) == 30
     rng = secrets.SystemRandom()
     rng.shuffle(chosen)
     pairs, mapping = [], {}
@@ -105,16 +114,21 @@ def prepare(source):
         }
         for side in ("A", "B"):
             arm = mapping[identifier][side]
+            answer = next(row for row in arms[arm] if row["id"] == target["id"])
             context = []
-            for previous in arms[arm]:
+            for previous in arms["on"] if report.get("fixed_prefix") else arms[arm]:
                 if previous["id"] == target["id"]:
                     if previous.get("new_chat"):
                         context.append("── 当前回复发生在新会话 ──")
-                    row[side] = {"reply": previous["reply"], "context": "\n\n".join(context)}
+                    if previous.get("forget_source"):
+                        context.append("界面操作：删除诗的来源，回执完成。")
+                    row[side] = {"reply": answer["reply"], "context": "\n\n".join(context)}
                     row["recorded_at"] = previous["input"].get("reference_time")
                     break
                 if previous.get("new_chat"):
                     context.append("── 新会话 ──")
+                if previous.get("forget_source"):
+                    context.append("界面操作：删除诗的来源，回执完成。")
                 if "user" in previous:
                     context.extend(["用户：" + previous["user"], "Hmph：" + previous["reply"]])
                 else:
@@ -125,7 +139,14 @@ def prepare(source):
     encoded = (
         json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c").replace("&", "\\u0026")
     )
-    output.write_text(PAGE.replace("__PACK__", encoded), encoding="utf-8")
+    mechanism = report.get("mechanism", "两边采用不同的记忆提及策略。")
+    page = (
+        PAGE.replace("__MECHANISM__", escape(mechanism))
+        .replace("__PAIR_COUNT__", str(len(pairs)))
+        .replace("__PACK__", encoded)
+    )
+    review_dir.mkdir(parents=True, exist_ok=True)
+    output.write_text(page, encoding="utf-8")
     keyfile.write_text(
         json.dumps(
             {
@@ -135,7 +156,7 @@ def prepare(source):
                 "pairs": mapping,
                 "randomization": "SystemRandom; fixed once; no model grades used for selection",
                 "independent_trajectories": 1,
-                "mechanism": "C1; C2/C3 behavioral inspection only",
+                "mechanism": mechanism,
             },
             ensure_ascii=False,
             indent=2,
@@ -149,10 +170,107 @@ def prepare(source):
     )
 
 
-def analyze(source, paths):
-    coordinator = json.loads((source.parent / "human-review-key.json").read_text(encoding="utf-8"))
+async def replay_self_check(source, output):
+    """Pair published replies with one real replay per frozen generation input."""
+    from product_run import save
+    from pydantic import SecretStr
+
+    from hmph.deepseek import DeepSeekModel
+    from hmph.eval_budget import RunBudget
+    from hmph.model_gateway import GenerationRequest
+    from hmph.product_eval import ProductTransport
+    from hmph.timem_reference import local_test_key
+
+    raw = source.read_bytes()
+    reference = json.loads(raw)
+    original_plan = json.loads((source.parent / "plan.json").read_bytes())
+    rows = reference["rows"]
+    if (
+        reference["status"] != "passed"
+        or not all(reference["acceptance"].values())
+        or not (source.parent / "transcript.txt").is_file()
+        or [row["number"] for row in rows] != list(range(1, 31))
+    ):
+        raise ValueError("A passing self-check and its complete transcript are required")
+    for filename in ("deepseek.py", "companion_policy.py", "model_gateway.py"):
+        path = Path("src", "hmph", filename)
+        if (
+            original_plan["code_sha256"].get(str(path))
+            != hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+        ):
+            raise ValueError("Frozen generation code changed")
+    off, on = [], []
+    report = {
+        "status": "running",
+        "mechanism": "对照使用同一真实前文和证据，只切换近期互动统计。",
+        "fixed_prefix": True,
+        "arms": [{"arm": "off", "rows": off}, {"arm": "on", "rows": on}],
+    }
+    output.parent.mkdir(parents=True, exist_ok=False)
+    limits = {"max_calls": 30, "max_input_bytes": 30 * 16384, "per_case_calls": 30}
+    save(
+        output.parent / "plan.json",
+        {
+            "source_sha256": hashlib.sha256(raw).hexdigest(),
+            "limits": limits,
+            "model": original_plan["model"],
+            "temperature": original_plan["temperature"],
+            "generation_tokens": original_plan["generation_tokens"],
+            "removed_field": "companion.rhythm",
+            "retries": 0,
+        },
+    )
+    budget = RunBudget(output.parent / "budget.sqlite3", **limits)
+    transport = ProductTransport(
+        local_test_key(ROOT), budget=budget.bind("case-001", "mem0_timem", "generation")
+    )
+    model = DeepSeekModel(
+        SecretStr("evaluation-placeholder"),
+        model=original_plan["model"],
+        max_tokens=original_plan["generation_tokens"],
+        temperature=original_plan["temperature"],
+        transport=transport,
+    )
+    try:
+        for row in rows:
+            paired = {
+                "id": f"round-{row['number']:02d}",
+                **{
+                    k: row[k]
+                    for k in ("user", "reply", "input", "new_chat", "forget_source", "required")
+                    if k in row
+                },
+            }
+            on.append(paired)
+            request = GenerationRequest.model_validate(row["input"])
+            if request.companion is None:
+                raise ValueError("Frozen request has no companion context")
+            alternative = request.model_copy(
+                update={"companion": request.companion.model_copy(update={"rhythm": {}})}
+            )
+            pieces = []
+            async with asyncio.timeout(45):
+                async for delta in model.stream(alternative):
+                    pieces.append(delta.text)
+            reply = "".join(pieces)
+            if not reply.strip() or len(reply) > 2000 or reply == FALLBACK:
+                raise ValueError("Invalid replay reply")
+            off.append({**paired, "input": alternative.model_dump(mode="json"), "reply": reply})
+        report["status"] = "completed"
+    except Exception as error:
+        report["status"] = "failed"
+        report["error"] = getattr(error, "code", None) or type(error).__name__
+        raise
+    finally:
+        await transport.shutdown()
+        save(output, {**report, "budget": budget.snapshot()})
+
+
+def analyze(source, paths, *, review_dir=None):
+    review_dir = review_dir or source.parent
+    coordinator = json.loads((review_dir / "human-review-key.json").read_text(encoding="utf-8"))
     if coordinator.get("status") == "withdrawn":
-        raise ValueError("Review pack withdrawn: fix conversation quality before human review")
+        raise ValueError("Review pack withdrawn; use the current review material")
     expected = coordinator["pairs"]
     raters = set()
     results = []
@@ -169,7 +287,7 @@ def analyze(source, paths):
         raters.add(rater)
         ratings = data.get("ratings", {})
         if set(ratings) != set(expected) or data.get("complete") is not True:
-            raise ValueError("Each reviewer must complete the same 30 pairs")
+            raise ValueError(f"Each reviewer must complete the same {len(expected)} pairs")
         votes = Counter()
         scores = {arm: {d: [] for d in DIMENSIONS} for arm in ("off", "on")}
         issues = []
@@ -214,7 +332,7 @@ def analyze(source, paths):
             {
                 "participation_gate": len(raters) >= 2,
                 "raters": len(raters),
-                "pairs_per_rater": 30,
+                "pairs_per_rater": len(expected),
                 "independent_trajectories": 1,
                 "results": results,
                 "decision": "assess P5-c from actual human results; no automatic acceptance",
@@ -229,11 +347,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=SOURCE)
     parser.add_argument("--prepare", action="store_true")
+    parser.add_argument("--from-self-check", type=Path)
     parser.add_argument("--ratings", type=Path, nargs="+")
+    parser.add_argument("--rounds", type=int, nargs="+", help="Use these self-check rounds")
+    parser.add_argument("--review-dir", type=Path, help="Folder for the page and coordinator key")
     args = parser.parse_args()
-    if args.prepare:
-        prepare(args.source)
+    if args.rounds is not None and not args.prepare:
+        parser.error("--rounds requires --prepare")
+    if args.from_self_check:
+        if args.source == SOURCE or args.prepare or args.ratings or args.review_dir:
+            parser.error("Use --from-self-check with --source pointing to a fresh report")
+        asyncio.run(replay_self_check(args.from_self_check, args.source))
+    elif args.prepare:
+        prepare(args.source, rounds=args.rounds, review_dir=args.review_dir)
     elif args.ratings:
-        analyze(args.source, args.ratings)
+        analyze(args.source, args.ratings, review_dir=args.review_dir)
     else:
-        parser.error("Choose --prepare or --ratings")
+        parser.error("Choose --from-self-check, --prepare or --ratings")

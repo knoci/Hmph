@@ -198,6 +198,21 @@ async def run(directory, *, use_candidate=False):
         assert worker.reviewer is None
         # Same real adapter and model, with the existing durable metering transport.
         worker.model = services.model("generation")
+        services.model("state")
+        state_transport = services.transports["state"]
+        state_transport.capture_response = True
+
+        def capture_state_failure(lease, error):
+            filename = f"state-failure-{len(report['background_failures'])}.json"
+            save(
+                directory / filename,
+                {
+                    "failure": error,
+                    "lease": lease.model_dump(mode="json"),
+                    "response": state_transport.last_response,
+                },
+            )
+
         threads = SharedThreads(conversation)
         memory = Memory(db, digest_key=conversation.digest_key)
         poem_source = None
@@ -312,7 +327,9 @@ async def run(directory, *, use_candidate=False):
             )
             if saved.status != "completed":
                 raise RuntimeError("technical_chat_failure")
-            await maintenance(db, services, report["background_failures"])
+            await maintenance(
+                db, services, report["background_failures"], state_failure=capture_state_failure
+            )
             checkpoint()
         rows = report["rows"]
         report["acceptance"] = {

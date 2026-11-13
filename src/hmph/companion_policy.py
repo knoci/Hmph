@@ -60,7 +60,8 @@ class CompanionPlan(BaseModel):
     thread_control: Literal["open", "paused", "resolved", "dropped"] | None = None
 
     def model_context(self):
-        return self.model_dump(
+        # Keep the release prompt on the reviewed arm without recent-interaction statistics.
+        return self.model_copy(update={"rhythm": {}}).model_dump(
             mode="json",
             include={"repair_action", "shared_thread", "no_active_shared_thread", "rhythm",
                      "thread_control"},
