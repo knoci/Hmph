@@ -35,8 +35,13 @@ from hmph.models import (
 )
 from hmph.persistence import RequestLedger
 from hmph.source_policy import retainable
+from hmph.timem_reference import TIMEM_REVISION
 
-REVISIONS = {"mem0": MEM0_REVISION, "graphiti": GRAPHITI_REVISION}
+REVISIONS = {
+    "mem0": MEM0_REVISION,
+    "graphiti": GRAPHITI_REVISION,
+    "mem0_timem": TIMEM_REVISION,
+}
 MODELS = {"deepseek-flash", "deepseek-v4-pro"}
 MAX_SOURCES = 1000
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
@@ -403,6 +408,7 @@ class MemoryBuilds:
                 content=m.content,
                 observed_at=turn.created_at,
                 source_timezone=turn.source_timezone,
+                conversation_id=turn.conversation_id,
             )
             for source, m, turn in rows
         )
@@ -700,7 +706,7 @@ class MemoryBuilds:
             if not space.quiesced:
                 raise DomainError("framework_writer_not_quiesced")
             sources = await self._sources(session, build)
-            if build.backend == "mem0":
+            if build.backend in {"mem0", "mem0_timem"}:
                 session.add_all(
                     MemoryNativeSource(
                         space_id=space.id,

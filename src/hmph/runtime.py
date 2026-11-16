@@ -9,7 +9,7 @@ from hmph.model_gateway import FakeModel
 from hmph.worker import Worker
 
 
-async def run_local(*, port=8017, stop_file=None):
+async def run_local(*, port=8017, stop_file=None, timem_mem0=False):
     """Own the API and the three existing workers in one supervised process."""
     import asyncio
 
@@ -23,6 +23,7 @@ async def run_local(*, port=8017, stop_file=None):
     settings = Settings()
     database = Database(settings.database_url.get_secret_value(), schema=settings.database_schema)
     tasks = []
+    framework = None
     server = None
     try:
         conversation = Conversation(
@@ -32,7 +33,24 @@ async def run_local(*, port=8017, stop_file=None):
             source_timezone=settings.source_timezone,
         )
         await conversation.bootstrap()
-        app = create_app(settings, conversation=conversation)
+        if timem_mem0:
+            from hmph.framework_worker import FrameworkWorker
+            from hmph.memory_builds import MemoryBuilds
+            from hmph.timem_runtime import CombinedBackend, CombinedProcessBackend, CombinedReader
+
+            if settings.model_mode != "deepseek" or settings.deepseek_model != "deepseek-flash":
+                raise ValueError("TiMem + mem0 requires DeepSeek Flash")
+            builds = MemoryBuilds(database, digest_key=conversation.digest_key)
+            backend = CombinedBackend(
+                settings.deepseek_api_key,
+                database_url=database.url,
+                max_calls=settings.timem_build_max_calls,
+            )
+            reader = CombinedReader(builds, backend)
+            await reader.warmup()
+            conversation.source_reader = reader
+            framework = FrameworkWorker(builds, CombinedProcessBackend(builds, backend))
+        app = create_app(settings, conversation=conversation, timem_mem0=timem_mem0)
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
@@ -53,6 +71,12 @@ async def run_local(*, port=8017, stop_file=None):
             asyncio.create_task(w.run_forever(), name=f"hmph-worker-{i}")
             for i, w in enumerate(workers)
         )
+        if framework is not None:
+            tasks.append(
+                asyncio.create_task(
+                    framework.run_forever(schedule_maintenance=False), name="hmph-worker-framework"
+                )
+            )
         if stop_file is not None:
 
             async def stop_monitor():

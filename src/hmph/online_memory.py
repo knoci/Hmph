@@ -52,7 +52,12 @@ class NativeSources(BaseModel):
     database_queries: int | None = Field(default=None, ge=0, le=32)
     branch_status: dict[Literal["mem0", "timem"], str] = Field(default_factory=dict)
     timem_sources: tuple[UUID, ...] = Field(default=(), max_length=CANDIDATES)
-    timem_strategy: Literal["hierarchical", "linked_exchanges"] | None = None
+    timem_strategy: (
+        Literal[
+            "hierarchical", "linked_exchanges", "originals_and_hierarchy", "episodes_and_hierarchy"
+        ]
+        | None
+    ) = None
 
 
 class ReadTicket(BaseModel):
@@ -63,7 +68,7 @@ class ReadTicket(BaseModel):
     space_id: UUID | None
     config_revision: int
     build_watermark: int
-    backend: Literal["graphiti", "mem0"] = "graphiti"
+    backend: Literal["graphiti", "mem0", "mem0_timem"] = "graphiti"
     cutoff: int
     job_fence: int
     valid_until: datetime
@@ -181,7 +186,7 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
     # Native hits locate original messages. Keep independently committed facts
     # available both alongside those hits and after a native snapshot retires.
     memories = []
-    if ticket.backend == "mem0":
+    if ticket.backend in {"mem0", "mem0_timem"}:
         memories = await Memory.search(
             session,
             turn.pair_id,
@@ -377,7 +382,7 @@ async def ready_space(session, pair, build_id):
             .where(
                 MemoryBuild.id == build_id,
                 MemoryBuild.pair_id == pair.id,
-                MemoryBuild.backend.in_(("graphiti", "mem0")),
+                MemoryBuild.backend.in_(("graphiti", "mem0", "mem0_timem")),
                 MemoryBuild.status == "ready",
                 MemoryBuild.memory_epoch == pair.memory_epoch,
                 MemorySpace.status == "ready",
@@ -404,9 +409,10 @@ async def invalidate_reads(session, build_ids):
 
 
 class MemorySelection:
-    def __init__(self, db, *, digest_key, allow_mem0=False):
+    def __init__(self, db, *, digest_key, allow_mem0=False, allow_timem=False):
         self.db, self.ledger = db, RequestLedger(digest_key)
         self.allow_mem0 = allow_mem0
+        self.allow_timem = allow_timem
 
     async def _pair(self, session, owner_id, character_id, *, lock=False):
         query = select(Pair).where(Pair.owner_id == owner_id, Pair.character_id == character_id)
@@ -422,7 +428,11 @@ class MemorySelection:
             mode=f"{build.backend}_experimental" if build else "lexical",
             revision=pair.memory_config_revision,
             build_id=build_id,
-            available=build_id is None or await ready_space(session, pair, build_id) is not None,
+            available=build_id is None
+            or (
+                (build is None or build.backend != "mem0_timem" or self.allow_timem)
+                and await ready_space(session, pair, build_id) is not None
+            ),
         )
 
     async def get(self, owner_id, character_id):
@@ -455,7 +465,9 @@ class MemorySelection:
                 from hmph.memory_builds import MemoryBuilds
 
                 build, space = await ready_space(session, pair, build_id)
-                if build.backend == "mem0" and not self.allow_mem0:
+                if (build.backend == "mem0" and not self.allow_mem0) or (
+                    build.backend == "mem0_timem" and not self.allow_timem
+                ):
                     raise DomainError("memory_build_unavailable")
                 await MemoryBuilds._sources(session, build)
                 mapped = await session.scalar(

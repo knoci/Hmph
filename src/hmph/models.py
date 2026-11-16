@@ -360,7 +360,9 @@ class MemoryBuild(Base):
             "call_limit IS NULL OR (call_limit >= 1 AND call_limit <= 128)",
             name="maintenance_call_limit",
         ),
-        CheckConstraint("backend IN ('mem0','graphiti')", name="memory_build_backend"),
+        CheckConstraint(
+            "backend IN ('mem0','graphiti','mem0_timem')", name="memory_build_backend"
+        ),
         CheckConstraint(
             "status IN ('queued','building','ready','retired','failed')", name="memory_build_status"
         ),

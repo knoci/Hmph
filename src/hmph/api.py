@@ -46,7 +46,7 @@ class ForgetMemory(WriteBody):
 
 class CreateMemoryBuild(WriteBody):
     character_id: UUID = DEFAULT_CHARACTER
-    backend: Literal["mem0", "graphiti"] = "mem0"
+    backend: Literal["mem0", "graphiti", "mem0_timem"] = "mem0"
     force: bool = False
 
 
@@ -88,7 +88,9 @@ class UpdateSharedThread(WriteBody):
     status: Literal["open", "paused", "resolved", "dropped"]
 
 
-def create_app(settings: Settings | None = None, *, conversation: Conversation | None = None):
+def create_app(
+    settings: Settings | None = None, *, conversation: Conversation | None = None, timem_mem0=False
+):
     settings = settings or Settings()
     managed = conversation is None
     if managed:
@@ -167,7 +169,9 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     dialogue = Dialogue(conversation.db)
     builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
     maintenance = MemoryMaintenance(builds)
-    selection = MemorySelection(conversation.db, digest_key=conversation.digest_key)
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=timem_mem0
+    )
     preferences = Preferences(conversation)
     security = HTTPBearer(auto_error=False)
 
@@ -210,7 +214,9 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
             "semantic_retrieval": "evaluation_only",
             "framework_memory": "mem0_shadow_builds",
             "graphiti_memory": "source_reader_experimental",
-            "framework_online": False,
+            "framework_online": timem_mem0,
+            "timem_mem0": timem_mem0,
+            "timem_build_max_calls": settings.timem_build_max_calls if timem_mem0 else None,
             "graphiti_reader_configured": bool(settings.graphiti_reader_python),
             "output_guard": "full_response"
             if settings.model_mode == "deepseek"
@@ -368,6 +374,8 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     async def request_memory_build(
         body: CreateMemoryBuild, owner_id: Annotated[UUID, Depends(require_owner)]
     ):
+        if body.backend == "mem0_timem" and not timem_mem0:
+            raise DomainError("memory_backend_unavailable", 422)
         return await builds.request(
             owner_id,
             body.character_id,
@@ -442,7 +450,7 @@ def create_app(settings: Settings | None = None, *, conversation: Conversation |
     async def current_memory_build(
         owner_id: Annotated[UUID, Depends(require_owner)],
         character_id: UUID = DEFAULT_CHARACTER,
-        backend: Literal["mem0", "graphiti"] = "mem0",
+        backend: Literal["mem0", "graphiti", "mem0_timem"] = "mem0",
     ):
         return await builds.current(owner_id, character_id, backend=backend)
 

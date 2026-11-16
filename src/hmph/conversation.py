@@ -588,13 +588,15 @@ class Conversation:
             pair = await session.get(Pair, turn.pair_id)
             ticket = await pin_read(session, pair, turn, lease)
         native, retrieval_status = (None, None)
+        # Reopening the persistent Qdrant collection has a cold-start cost.
+        deadline = started + (6 if ticket and ticket.backend == "mem0_timem" else READ_SECONDS)
         if ticket is not None:
             native, retrieval_status = await retrieve_native(
-                self.source_reader, ticket, lease.user_content, deadline=started + READ_SECONDS
+                self.source_reader, ticket, lease.user_content, deadline=deadline
             )
         if ticket is not None:
             try:
-                async with asyncio.timeout(max(0, started + READ_SECONDS - time.monotonic())):
+                async with asyncio.timeout(max(0, deadline - time.monotonic())):
                     return await self._assemble_request(
                         lease, ticket, native, retrieval_status, started
                     )

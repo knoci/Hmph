@@ -44,6 +44,7 @@ class BuildSource(BaseModel):
     content: str
     observed_at: datetime
     source_timezone: str | None
+    conversation_id: UUID | None = None
 
 
 class BuildLease(BaseModel):
@@ -78,7 +79,7 @@ class SpaceView(BaseModel):
 
 class WriterIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    protocol: Literal["mem0-spawn-v1", "graphiti-spawn-v1"] = "mem0-spawn-v1"
+    protocol: Literal["mem0-spawn-v1", "graphiti-spawn-v1", "mem0_timem-spawn-v1"] = "mem0-spawn-v1"
     host_id: str = Field(pattern=r"^[a-f0-9]{64}$")
     boot_time: float
     execution_id: UUID

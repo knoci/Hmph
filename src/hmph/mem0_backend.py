@@ -51,6 +51,7 @@ def validate_extraction(payload):
 
 class Mem0Backend:
     backend = "mem0"
+    revision = MEM0_REVISION
 
     def __init__(
         self, key, *, database_url, max_calls=64, delegate=None, batch_bytes=None,
@@ -203,7 +204,7 @@ class Mem0Backend:
             processed_sources=0,
             native_changes=0,
         )
-        if lease.backend_revision != MEM0_REVISION or lease.backend != self.backend:
+        if lease.backend_revision != self.revision or lease.backend != self.backend:
             raise FrameworkBuildError("build_failed", retryable=False)
         transport = ReferenceTransport(
             self.key,
@@ -344,7 +345,7 @@ class Mem0SourceReader:
     async def retrieve_sources(self, ticket, query):
         from hmph.online_memory import CANDIDATES, NativeSources, SourceRetrievalError
 
-        if ticket.backend != "mem0" or ticket.space_id is None:
+        if ticket.backend not in {"mem0", "mem0_timem"} or ticket.space_id is None:
             raise SourceRetrievalError("reader_failed")
         rows = await asyncio.to_thread(self._search, ticket.space_id, ticket.pair_id, query)
         sources = {}

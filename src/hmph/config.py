@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     graphiti_user: str = "neo4j"
     graphiti_password: SecretStr = SecretStr("hmph_graphiti_runtime_local_only")
     graphiti_reader_python: str | None = None
+    timem_build_max_calls: int = Field(default=96, ge=3, le=128)
 
     @field_validator("source_timezone")
     @classmethod

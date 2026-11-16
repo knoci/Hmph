@@ -1,7 +1,7 @@
-"""Isolated fixed-author TiMem components; never imported by the product runtime.
+"""Fixed-author TiMem components shared by research and the opt-in runtime.
 
-Only provider dispatch, transport and local storage/embedding configuration are
-adapted. Author generation/retrieval methods and prompts remain unchanged.
+Author generation and hierarchical recall are retained. Hmph can additionally
+index original messages and follow their source links.
 """
 
 import asyncio
@@ -13,11 +13,20 @@ import types
 from pathlib import Path
 
 TIMEM_REVISION = "7e05ffda855602a378d4f4a45a3e97e1d1ce4cb9"
+SOURCE_COLLECTION = "hmph_timem_originals"
+COMPACT_SOURCE_COUNT = 6
+LONG_SOURCE_COUNT = 9
+LONG_HISTORY_MINIMUM = 64
 
 QUESTION_JOIN = re.compile(
     r"(?:[,，;；]\s*(?:and\s+|以及|并且)?|\s+and\s+)"
     r"(?=(?:what|which|who|where|when|why|how)\b|谁|什么|哪个|哪里|何时|怎么|为什么)",
     re.I,
+)
+QUOTED_PHRASE = re.compile(
+    r'"([^"\n]{2,100})"'
+    r"|(?<!\w)'([^'\n]{2,100})'(?!\w)"
+    r"|“([^”\n]{2,100})”|《([^》\n]{2,100})》"
 )
 
 
@@ -125,6 +134,15 @@ def install_provider(llm):
     sys.modules[dispatch.__name__] = dispatch
 
 
+def install_embedding(embedding):
+    async def embed(text):
+        return (await asyncio.to_thread(lambda: list(embedding.embed([text]))))[0].tolist()
+
+    service = types.ModuleType("llm.embedding_service")
+    service.get_embedding_service = lambda: types.SimpleNamespace(embed_text=embed)
+    sys.modules[service.__name__] = service
+
+
 def leaf_sources(node_id, nodes, leaf_map):
     """Resolve author child links strictly; an unmapped child is a coverage gap."""
     visiting, result = set(), set()
@@ -154,39 +172,32 @@ class LocalTiMem:
     product backend. PG/Redis and production cleanup are intentionally absent.
     """
 
-    async def open(self, directory: Path):
+    async def open(self, directory: Path, *, embedding=None, existing=False):
         from fastembed import TextEmbedding
         from qdrant_client import QdrantClient, models
 
-        self.embedding = TextEmbedding(
+        self.embedding = embedding or TextEmbedding(
             model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             cache_dir="artifacts/models/multilingual-minilm",
             local_files_only=True,
         )
 
-        async def embed(text):
-            return (await asyncio.to_thread(lambda: list(self.embedding.embed([text]))))[0].tolist()
-
-        embedding = types.ModuleType("llm.embedding_service")
-        embedding.get_embedding_service = lambda: types.SimpleNamespace(embed_text=embed)
-        sys.modules[embedding.__name__] = embedding
+        install_embedding(self.embedding)
         from storage.vector_adapter import VectorAdapter
         from storage.vector_store import VectorStore
-        from timem.memory.memory_generator import MemoryGenerator
 
-        self.generator = MemoryGenerator()
-        self.generator.max_retries = 1
+        if not existing:
+            from timem.memory.memory_generator import MemoryGenerator
 
-        async def once(operation, layer, name):
-            return await asyncio.wait_for(operation(), timeout=60)
+            self.generator = MemoryGenerator()
 
-        # Both upstream helpers contain unconditional while True and ignore the
-        # configuration above. Replace retry orchestration, never generation.
-        self.generator._retry_with_exponential_backoff = once
-        self.generator._retry_with_exponential_backoff_for_streaming = once
-        # Author prompt persistence can contain full inputs; research needs only
-        # original public fixture + code/prompt hashes, never extra prompt copies.
-        self.generator._append_prompt_log = lambda *args, **kwargs: None
+            async def once(operation, layer, name):
+                return await asyncio.wait_for(operation(), timeout=60)
+
+            # The upstream helpers retry indefinitely. The transport owns the budget.
+            self.generator._retry_with_exponential_backoff = once
+            self.generator._retry_with_exponential_backoff_for_streaming = once
+            self.generator._append_prompt_log = lambda *args, **kwargs: None
         self.nodes, self.leaf_map = {}, {}
         self.snapshot = ()
         self.directory = await asyncio.to_thread(directory.resolve)
@@ -195,10 +206,15 @@ class LocalTiMem:
             raise ValueError("Unexpected TiMem collection directory")
         self.client = QdrantClient(path=str(self.vector_directory))
         self.collection = "hmph_timem_research"
-        self.client.create_collection(
-            self.collection,
-            vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
-        )
+        if existing:
+            if not self.client.collection_exists(self.collection):
+                self.client.close()
+                raise ValueError("TiMem collection is missing")
+        else:
+            self.client.create_collection(
+                self.collection,
+                vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
+            )
         config = {"collection_name": self.collection, "vector_size": 384, "distance": "Cosine"}
         # Native adapter methods are unchanged; construct with its public config
         # seam, then attach the official Qdrant embedded client to its store.
@@ -208,6 +224,147 @@ class LocalTiMem:
         self.adapter.vector_store.client = self.client
         self.adapter.vector_store._initialized = True
         self.adapter._is_available = True
+
+    async def index_originals(self, sources):
+        from qdrant_client import models
+
+        self.client.create_collection(
+            SOURCE_COLLECTION,
+            vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
+        )
+        for start in range(0, len(sources), 64):
+            batch = sources[start : start + 64]
+            documents = [source.content for source in batch]
+            vectors = await asyncio.to_thread(
+                lambda documents=documents: list(self.embedding.embed(documents))
+            )
+            self.client.upsert(
+                SOURCE_COLLECTION,
+                [
+                    models.PointStruct(id=str(source.message_id), vector=vector.tolist())
+                    for source, vector in zip(batch, vectors, strict=True)
+                ],
+            )
+
+    async def original_sources(self, query):
+        """Rank original messages by semantic matches, shared terms and episode context."""
+        from collections import Counter
+        from math import log1p
+
+        from hmph.lexical import bm25_order, tokenize
+
+        if not self.client.collection_exists(SOURCE_COLLECTION):
+            return ()
+        embedding = await asyncio.to_thread(lambda: next(iter(self.embedding.embed([query]))))
+        hits = self.client.query_points(
+            SOURCE_COLLECTION, query=embedding.tolist(), limit=8, score_threshold=0.30
+        ).points
+        positions = {str(source.message_id): i for i, source in enumerate(self.snapshot)}
+        terms = [set(tokenize(source.content)) for source in self.snapshot]
+        semantic = [positions[str(hit.id)] for hit in hits if str(hit.id) in positions]
+        exact = bm25_order(self.snapshot, query)
+        # Keep evidence for each explicitly named target when vector ranking
+        # otherwise spends the entire budget on one side of a comparison.
+        phrases = list(
+            dict.fromkeys(
+                next(value for value in match.groups() if value).casefold()
+                for match in QUOTED_PHRASE.finditer(query)
+            )
+        )[:3]
+        phrase_sources = []
+        if len(phrases) > 1:
+            for phrase in phrases:
+                matches = [
+                    i
+                    for i, source in enumerate(self.snapshot)
+                    if phrase in source.content.casefold()
+                ]
+                phrase_sources.extend(matches[:2])
+        frequencies = Counter(term for group in terms for term in group)
+        query_terms = set(tokenize(query))
+        links = []
+        for anchor in semantic[:3]:
+            keys = {term for term in terms[anchor] - query_terms if 1 < frequencies[term] <= 4}
+            weights = {term: log1p(len(terms) / frequencies[term]) for term in keys}
+            choices = []
+            for candidate, group in enumerate(terms):
+                shared = group & keys
+                if candidate != anchor and shared:
+                    weight = sum(weights[term] for term in sorted(shared))
+                    choices.append((weight, candidate))
+            if choices:
+                links.append(max(choices, key=lambda item: item[0])[1])
+        anchors = list(dict.fromkeys((*semantic[:2], *exact[:2])))
+        nearby = []
+        for anchor in anchors[:3]:
+            conversation = self.snapshot[anchor].conversation_id
+            if conversation is not None:
+                nearby.extend(
+                    neighbor
+                    for neighbor in (anchor + 1, anchor - 1)
+                    if 0 <= neighbor < len(self.snapshot)
+                    and self.snapshot[neighbor].conversation_id == conversation
+                )
+        ranked = dict.fromkeys(
+            (
+                *phrase_sources,
+                *semantic[:2],
+                *links[:1],
+                *exact[:2],
+                *nearby,
+                *links[1:],
+                *semantic[2:],
+            )
+        )
+        if len(self.snapshot) < LONG_HISTORY_MINIMUM:
+            selected = list(ranked)[:COMPACT_SOURCE_COUNT]
+        else:
+            # Long histories need room for independent episodes. Keep the
+            # rescored anchors and reserve slots for the original semantic order.
+            semantic_order = (*phrase_sources, *semantic[:2], *links, *semantic[2:6])
+            selected = list(dict.fromkeys((*list(ranked)[:5], *semantic_order)))[:LONG_SOURCE_COUNT]
+        return tuple(str(self.snapshot[i].message_id) for i in selected)
+
+    async def episode_sources(self, query):
+        from qdrant_client import models
+
+        from hmph.episode_recall import ACTIVITY_QUERY, PLACE_QUERY, episode_candidates, event_terms
+        from hmph.online_memory import SOURCES
+
+        if len(self.snapshot) < LONG_HISTORY_MINIMUM or not self.client.collection_exists(
+            SOURCE_COLLECTION
+        ):
+            return ()
+        entries, cue = episode_candidates(self.snapshot, query)
+        if len(entries) < 2:
+            return ()
+        by_id = {str(self.snapshot[i].message_id): (self.snapshot[i], bias) for i, bias in entries}
+        vector = await asyncio.to_thread(lambda: next(iter(self.embedding.embed([cue]))))
+        hits = self.client.query_points(
+            SOURCE_COLLECTION,
+            query=vector.tolist(),
+            query_filter=models.Filter(must=[models.HasIdCondition(has_id=list(by_id))]),
+            limit=min(len(entries), 80),
+        ).points
+        ranked = sorted(hits, key=lambda point: point.score + by_id[str(point.id)][1], reverse=True)
+        selected, remainder, counts, events = [], [], {}, []
+        diversify = PLACE_QUERY.search(query) or ACTIVITY_QUERY.search(query)
+        for point in ranked:
+            key = str(point.id)
+            source = by_id[key][0]
+            conversation = source.conversation_id or key
+            terms = event_terms(source.content) if diversify else set()
+            duplicate = any(
+                len(terms & previous) >= max(3, 0.72 * len(terms | previous)) for previous in events
+            )
+            count = counts.get(conversation, 0)
+            if count >= 2 or duplicate:
+                remainder.append(key)
+            else:
+                counts[conversation] = count + 1
+                selected.append(key)
+                events.append(terms)
+        return tuple((*selected, *remainder)[:SOURCES])
 
     async def add(self, content, *, level, when, children=(), sources=(), session_id=None):
         from timem.models.memory import Memory
@@ -320,15 +477,16 @@ class LocalTiMem:
 class TiMemSupplement:
     """Isolated second reader, pinned to the same ready snapshot as mem0."""
 
-    def __init__(self, mem0, timem, *, build_id, space_id):
+    def __init__(self, mem0, timem, *, build_id, space_id, originals=False):
         self.mem0, self.timem = mem0, timem
         self.build_id, self.space_id = build_id, space_id
+        self.originals = originals
 
     async def retrieve_sources(self, ticket, query):
         from itertools import zip_longest
         from uuid import UUID
 
-        from hmph.online_memory import CANDIDATES, NativeSources, SourceRetrievalError
+        from hmph.online_memory import CANDIDATES, SOURCES, NativeSources, SourceRetrievalError
 
         if (ticket.build_id, ticket.space_id) != (self.build_id, self.space_id):
             raise SourceRetrievalError("reader_failed")
@@ -343,6 +501,7 @@ class TiMemSupplement:
         clauses = QUESTION_JOIN.split(query, maxsplit=1)
         strategy = "hierarchical"
         timem_requests = 1
+        originals = ()
         try:
             async with asyncio.timeout(1.25):
                 leaves = await self.timem.linked_sources(clauses) if len(clauses) == 2 else ()
@@ -350,6 +509,15 @@ class TiMemSupplement:
                     strategy, timem_requests = "linked_exchanges", 2
                 else:
                     _, leaves = await self.timem.retrieve(query)
+                if self.originals and strategy == "hierarchical":
+                    episodes = await self.timem.episode_sources(query)
+                    originals = episodes or await self.timem.original_sources(query)
+                    if originals:
+                        timem_requests += 1
+                        strategy = (
+                            "episodes_and_hierarchy" if episodes else "originals_and_hierarchy"
+                        )
+                        leaves = (*originals, *leaves)
                 timem = tuple(dict.fromkeys(UUID(item) for item in leaves))[:CANDIDATES]
             timem_status = "ok" if timem else "empty"
         except TimeoutError:
@@ -358,8 +526,23 @@ class TiMemSupplement:
             timem, timem_status = (), "reader_failed"
         if not mem0.source_ids and not timem and {mem0_status, timem_status} != {"empty"}:
             raise SourceRetrievalError("reader_failed")
+        limit = CANDIDATES
         if strategy == "linked_exchanges":
             merged = dict.fromkeys((*timem, *mem0.source_ids))
+        elif strategy in {"originals_and_hierarchy", "episodes_and_hierarchy"}:
+            direct = tuple(UUID(item) for item in originals)
+            supporting = (
+                source
+                for pair in zip_longest(mem0.source_ids, timem[len(direct) :])
+                for source in pair
+                if source is not None
+            )
+            merged = dict.fromkeys((*direct, *supporting))
+            limit = (
+                SOURCES
+                if len(self.timem.snapshot) >= LONG_HISTORY_MINIMUM
+                else COMPACT_SOURCE_COUNT + 2
+            )
         else:
             merged = dict.fromkeys(
                 source
@@ -368,7 +551,7 @@ class TiMemSupplement:
                 if source is not None
             )
         return NativeSources(
-            source_ids=tuple(merged)[:CANDIDATES],
+            source_ids=tuple(merged)[:limit],
             requests=mem0.requests + timem_requests if mem0.requests is not None else None,
             database_queries=mem0.database_queries,
             branch_status={"mem0": mem0_status, "timem": timem_status},
@@ -377,25 +560,45 @@ class TiMemSupplement:
         )
 
 
-async def build_snapshot_layers(native, sources):
+async def build_snapshot_layers(
+    native, sources, *, episodes=None, checkpoint=None, summarize_leaves=True
+):
     """Generate the component profile from the authoritative, pinned sources."""
     from datetime import UTC
     from itertools import groupby
 
     native.snapshot = tuple(sources)
-    for when, group in groupby(native.snapshot, key=lambda source: source.observed_at):
-        # TiMem's native Memory model stores UTC without a tzinfo suffix.
-        when = when.astimezone(UTC).replace(tzinfo=None)
-        session = list(group)
-        session_id = str(session[0].message_id)
-        text = "\n".join(source.content for source in session)
-        content = await native.generator.generate_l1_content(text)
-        leaf = await native.add(
-            content,
-            level="L1",
+    if episodes is None:
+        episodes = (
+            (tuple(group),)
+            for _, group in groupby(native.snapshot, key=lambda source: source.observed_at)
+        )
+    for episode in episodes:
+        leaves = []
+        session_id = str(episode[0][0].message_id)
+        for batch in episode:
+            if checkpoint is not None:
+                await checkpoint()
+            # TiMem's native Memory model stores UTC without a tzinfo suffix.
+            when = batch[0].observed_at.astimezone(UTC).replace(tzinfo=None)
+            text = "\n".join(source.content for source in batch)
+            content = await native.generator.generate_l1_content(text) if summarize_leaves else text
+            leaves.append(
+                await native.add(
+                    content,
+                    level="L1",
+                    when=when,
+                    session_id=session_id,
+                    sources=[str(source.message_id) for source in batch],
+                )
+            )
+        if checkpoint is not None:
+            await checkpoint()
+        summary = await native.generator.generate_l2_content([leaf.content for leaf in leaves])
+        await native.add(
+            summary,
+            level="L2",
             when=when,
             session_id=session_id,
-            sources=[str(source.message_id) for source in session],
+            children=[leaf.id for leaf in leaves],
         )
-        summary = await native.generator.generate_l2_content([leaf.content])
-        await native.add(summary, level="L2", when=when, session_id=session_id, children=[leaf.id])

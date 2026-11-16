@@ -119,7 +119,7 @@ class FrameworkWorker:
             raise asyncio.CancelledError
         return True
 
-    async def run_forever(self):
+    async def run_forever(self, *, schedule_maintenance=True):
         while True:
-            if not await self.run_once():
+            if not await self.run_once(schedule_maintenance=schedule_maintenance):
                 await asyncio.sleep(self.poll_seconds)

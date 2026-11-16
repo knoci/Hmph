@@ -182,6 +182,7 @@ def main():
         "start", help="Run the local API and three existing workers together"
     )
     start.add_argument("--port", type=int, default=8017)
+    start.add_argument("--timem-mem0", action="store_true", help="Enable local TiMem + mem0 memory")
     start.add_argument("--stop-file", type=Path, help="Optional local graceful-stop marker")
     framework = commands.add_parser(
         "framework-worker", help="Run opt-in persistent native shadow builds"
@@ -247,7 +248,20 @@ def main():
         from hmph.runtime import run_local
 
         try:
-            asyncio.run(run_local(port=args.port, stop_file=args.stop_file))
+            if args.timem_mem0:
+                # Use the existing isolated TiMem environment with the mem0
+                # dependencies on its fallback import path.
+                import sys
+
+                native = Path("artifacts/framework-env/Lib/site-packages").resolve()
+                if native.is_dir():
+                    sys.path.append(str(native))
+                mem0 = Path("artifacts/references/mem0").resolve()
+                if mem0.is_dir():
+                    sys.path.insert(0, str(mem0))
+            asyncio.run(
+                run_local(port=args.port, stop_file=args.stop_file, timem_mem0=args.timem_mem0)
+            )
         except KeyboardInterrupt:
             print("Stopped.")
     elif args.command == "serve":
