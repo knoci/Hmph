@@ -10,6 +10,7 @@ import re
 import shutil
 import sys
 import types
+from contextvars import ContextVar
 from pathlib import Path
 
 TIMEM_REVISION = "7e05ffda855602a378d4f4a45a3e97e1d1ce4cb9"
@@ -17,6 +18,7 @@ SOURCE_COLLECTION = "hmph_timem_originals"
 COMPACT_SOURCE_COUNT = 6
 LONG_SOURCE_COUNT = 9
 LONG_HISTORY_MINIMUM = 64
+_WRITER_PROVIDER = ContextVar("timem_writer_provider", default=None)
 
 QUESTION_JOIN = re.compile(
     r"(?:[,，;；]\s*(?:and\s+|以及|并且)?|\s+and\s+)"
@@ -117,8 +119,16 @@ class MeteredTiMemLLM:
         await self.http.aclose()
 
 
+def _active_writer_provider(provider=None):
+    return _WRITER_PROVIDER.get()
+
+
 def install_provider(llm):
     """Register one external provider without importing unused GPU adapters."""
+    _WRITER_PROVIDER.set(llm)
+    existing = sys.modules.get("llm.llm_manager")
+    if getattr(existing, "get_llm", None) is _active_writer_provider:
+        return
     # Upstream llm/__init__.py eagerly imports the GPU embedding implementation.
     # Load its namespace without those optional exports; base_llm remains native.
     specification = importlib.util.find_spec("llm")
@@ -129,7 +139,7 @@ def install_provider(llm):
     package.__spec__ = specification
     sys.modules["llm"] = package
     dispatch = types.ModuleType("llm.llm_manager")
-    dispatch.get_llm = lambda provider=None: llm
+    dispatch.get_llm = _active_writer_provider
     package.get_llm = dispatch.get_llm
     sys.modules[dispatch.__name__] = dispatch
 
@@ -172,7 +182,7 @@ class LocalTiMem:
     product backend. PG/Redis and production cleanup are intentionally absent.
     """
 
-    async def open(self, directory: Path, *, embedding=None, existing=False):
+    async def open(self, directory: Path, *, embedding=None, existing=False, extend=False):
         from fastembed import TextEmbedding
         from qdrant_client import QdrantClient, models
 
@@ -206,7 +216,7 @@ class LocalTiMem:
             raise ValueError("Unexpected TiMem collection directory")
         self.client = QdrantClient(path=str(self.vector_directory))
         self.collection = "hmph_timem_research"
-        if existing:
+        if existing or extend:
             if not self.client.collection_exists(self.collection):
                 self.client.close()
                 raise ValueError("TiMem collection is missing")
@@ -228,10 +238,11 @@ class LocalTiMem:
     async def index_originals(self, sources):
         from qdrant_client import models
 
-        self.client.create_collection(
-            SOURCE_COLLECTION,
-            vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
-        )
+        if not self.client.collection_exists(SOURCE_COLLECTION):
+            self.client.create_collection(
+                SOURCE_COLLECTION,
+                vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
+            )
         for start in range(0, len(sources), 64):
             batch = sources[start : start + 64]
             documents = [source.content for source in batch]
@@ -246,12 +257,16 @@ class LocalTiMem:
                 ],
             )
 
-    async def original_sources(self, query):
+    async def original_sources(self, query, *, reference_time=None, source_timezone=None):
         """Rank original messages by semantic matches, shared terms and episode context."""
         from collections import Counter
         from math import log1p
 
+        from hmph.event_changes import asks_current_state, withdrawal_focus, withdrawals
         from hmph.lexical import bm25_order, tokenize
+        from hmph.online_memory import SOURCES, UPDATE_CUE
+        from hmph.temporal import query_intervals
+        from hmph.working_memory import plan_recall
 
         if not self.client.collection_exists(SOURCE_COLLECTION):
             return ()
@@ -263,6 +278,26 @@ class LocalTiMem:
         terms = [set(tokenize(source.content)) for source in self.snapshot]
         semantic = [positions[str(hit.id)] for hit in hits if str(hit.id) in positions]
         exact = bm25_order(self.snapshot, query)
+        temporal = []
+        windows = ()
+        if reference_time is not None:
+            windows = query_intervals(query, reference_time, source_timezone)
+            if windows:
+                dated = {
+                    i: query_intervals(
+                        self.snapshot[i].content,
+                        self.snapshot[i].observed_at,
+                        self.snapshot[i].source_timezone,
+                    )
+                    for i in dict.fromkeys((*semantic, *exact[:24]))
+                }
+                for window in windows:
+                    on_date = [
+                        i for i, dates in dated.items() if i not in temporal
+                        and any(d.start < window.end and d.end > window.start for d in dates)
+                    ]
+                    temporal.extend(on_date[:2 if len(windows) == 1 else 1])
+        temporal = list(dict.fromkeys(temporal))[:2]
         # Keep evidence for each explicitly named target when vector ranking
         # otherwise spends the entire budget on one side of a comparison.
         phrases = list(
@@ -282,6 +317,32 @@ class LocalTiMem:
                 phrase_sources.extend(matches[:2])
         frequencies = Counter(term for group in terms for term in group)
         query_terms = set(tokenize(query))
+        changes = []
+        withdrawal_sources = ()
+        conditions = ()
+        scope = set()
+        if not windows and plan_recall(query).intent in {"fact", "multi_hop"}:
+            anchors = list(dict.fromkeys((*semantic[:3], *exact[:3])))
+            withdrawal_sources = tuple(
+                index for prior, update in withdrawals(
+                    self.snapshot, query, anchors=dict.fromkeys((*semantic, *exact[:8]))
+                )
+                for index in (update, prior)
+            )
+            if asks_current_state(query):
+                scope, followups = withdrawal_focus(self.snapshot, query)
+                conditions = tuple(positions[str(item)] for item in followups)[:2]
+            for i, source in enumerate(self.snapshot):
+                if not UPDATE_CUE.search(source.content):
+                    continue
+                shared_query = terms[i] & query_terms
+                related = set().union(*(terms[i] & terms[j] for j in anchors if j < i))
+                rare = {term for term in related if frequencies[term] <= 4}
+                if not ((shared_query and related) or len(rare) >= 2):
+                    continue
+                score = sum(log1p(len(terms) / frequencies[t]) for t in shared_query | rare)
+                changes.append((score, i))
+        change_sources = [index for _, index in sorted(changes, reverse=True)[:2]]
         links = []
         for anchor in semantic[:3]:
             keys = {term for term in terms[anchor] - query_terms if 1 < frequencies[term] <= 4}
@@ -308,6 +369,10 @@ class LocalTiMem:
         ranked = dict.fromkeys(
             (
                 *phrase_sources,
+                *temporal,
+                *withdrawal_sources,
+                *conditions,
+                *change_sources,
                 *semantic[:2],
                 *links[:1],
                 *exact[:2],
@@ -316,12 +381,18 @@ class LocalTiMem:
                 *semantic[2:],
             )
         )
-        if len(self.snapshot) < LONG_HISTORY_MINIMUM:
+        if scope:
+            # PostgreSQL will scope and pack the confirmed event under the same budget.
+            selected = list(ranked)[:SOURCES]
+        elif len(self.snapshot) < LONG_HISTORY_MINIMUM:
             selected = list(ranked)[:COMPACT_SOURCE_COUNT]
         else:
             # Long histories need room for independent episodes. Keep the
             # rescored anchors and reserve slots for the original semantic order.
-            semantic_order = (*phrase_sources, *semantic[:2], *links, *semantic[2:6])
+            semantic_order = (
+                *phrase_sources, *temporal, *withdrawal_sources, *conditions, *change_sources,
+                *semantic[:2], *links, *semantic[2:6],
+            )
             selected = list(dict.fromkeys((*list(ranked)[:5], *semantic_order)))[:LONG_SOURCE_COUNT]
         return tuple(str(self.snapshot[i].message_id) for i in selected)
 
@@ -486,6 +557,7 @@ class TiMemSupplement:
         from itertools import zip_longest
         from uuid import UUID
 
+        from hmph.event_changes import asks_current_state, withdrawal_focus
         from hmph.online_memory import CANDIDATES, SOURCES, NativeSources, SourceRetrievalError
 
         if (ticket.build_id, ticket.space_id) != (self.build_id, self.space_id):
@@ -502,6 +574,7 @@ class TiMemSupplement:
         strategy = "hierarchical"
         timem_requests = 1
         originals = ()
+        timem = ()
         try:
             async with asyncio.timeout(1.25):
                 leaves = await self.timem.linked_sources(clauses) if len(clauses) == 2 else ()
@@ -509,35 +582,63 @@ class TiMemSupplement:
                     strategy, timem_requests = "linked_exchanges", 2
                 else:
                     _, leaves = await self.timem.retrieve(query)
+                timem = tuple(dict.fromkeys(UUID(item) for item in leaves))[:CANDIDATES]
                 if self.originals and strategy == "hierarchical":
+                    timem_requests += 1
                     episodes = await self.timem.episode_sources(query)
-                    originals = episodes or await self.timem.original_sources(query)
-                    if originals:
-                        timem_requests += 1
+                    if episodes:
+                        ranked = episodes
+                    elif ticket.reference_time is not None:
+                        ranked = await self.timem.original_sources(
+                            query,
+                            reference_time=ticket.reference_time,
+                            source_timezone=ticket.source_timezone,
+                        )
+                    else:
+                        ranked = await self.timem.original_sources(query)
+                    if ranked:
+                        direct = tuple(dict.fromkeys(UUID(item) for item in ranked))
+                        timem = tuple(dict.fromkeys((*direct, *timem)))[:CANDIDATES]
+                        originals = direct
                         strategy = (
                             "episodes_and_hierarchy" if episodes else "originals_and_hierarchy"
                         )
-                        leaves = (*originals, *leaves)
-                timem = tuple(dict.fromkeys(UUID(item) for item in leaves))[:CANDIDATES]
             timem_status = "ok" if timem else "empty"
         except TimeoutError:
-            timem, timem_status = (), "timeout"
+            timem_status = "partial_timeout" if timem else "timeout"
         except Exception:
-            timem, timem_status = (), "reader_failed"
-        if not mem0.source_ids and not timem and {mem0_status, timem_status} != {"empty"}:
-            raise SourceRetrievalError("reader_failed")
+            timem_status = "partial_failure" if timem else "reader_failed"
         limit = CANDIDATES
         if strategy == "linked_exchanges":
             merged = dict.fromkeys((*timem, *mem0.source_ids))
-        elif strategy in {"originals_and_hierarchy", "episodes_and_hierarchy"}:
-            direct = tuple(UUID(item) for item in originals)
+        elif strategy == "originals_and_hierarchy":
+            hierarchy = tuple(source for source in timem if source not in originals)
+            merged = dict.fromkeys(
+                source
+                for group in zip_longest(originals, mem0.source_ids, hierarchy)
+                for source in group
+                if source is not None
+            )
+            limit = (
+                SOURCES
+                if len(self.timem.snapshot) >= LONG_HISTORY_MINIMUM
+                else COMPACT_SOURCE_COUNT + 2
+            )
+            if asks_current_state(query):
+                direct_ids = set(originals)
+                scope, _ = withdrawal_focus(
+                    [s for s in self.timem.snapshot if s.message_id in direct_ids], query
+                )
+                if scope:
+                    limit += SOURCES
+        elif strategy == "episodes_and_hierarchy":
             supporting = (
                 source
-                for pair in zip_longest(mem0.source_ids, timem[len(direct) :])
+                for pair in zip_longest(mem0.source_ids, timem[len(originals) :])
                 for source in pair
                 if source is not None
             )
-            merged = dict.fromkeys((*direct, *supporting))
+            merged = dict.fromkeys((*originals, *supporting))
             limit = (
                 SOURCES
                 if len(self.timem.snapshot) >= LONG_HISTORY_MINIMUM

@@ -54,7 +54,7 @@ class ConfigureMaintenance(WriteBody):
     character_id: UUID = DEFAULT_CHARACTER
     expected_revision: int = Field(ge=0)
     enabled: bool = False
-    backend: Literal["mem0", "graphiti"] = "graphiti"
+    backend: Literal["mem0", "graphiti", "mem0_timem"] = "graphiti"
     cooldown_seconds: int = Field(default=300, ge=1, le=86400)
     minimum_sources: int = Field(default=8, ge=1, le=100)
     per_attempt_calls: int = Field(default=64, ge=1, le=128)
@@ -383,6 +383,9 @@ def create_app(
             backend=body.backend,
             force=body.force,
             model=settings.deepseek_model,
+            timem_call_limit=(
+                settings.timem_build_max_calls if body.backend == "mem0_timem" else None
+            ),
         )
 
     @app.get("/api/memory-maintenance")
@@ -395,6 +398,11 @@ def create_app(
     async def configure_maintenance(
         body: ConfigureMaintenance, owner_id: Annotated[UUID, Depends(require_owner)]
     ):
+        if body.backend == "mem0_timem":
+            if not timem_mem0:
+                raise DomainError("memory_backend_unavailable", 422)
+            if body.enabled and not 2 <= body.per_attempt_calls <= settings.timem_build_max_calls:
+                raise DomainError("invalid_maintenance_budget", 422)
         return await maintenance.update(
             owner_id,
             body.character_id,

@@ -212,7 +212,7 @@ def forget_controls(pair, memories):
 
 
 async def project_context(
-    session, pair, turn, query, rows, candidates, short_term, *, shared_thread=None
+    session, pair, turn, query, rows, candidates, short_term, *, shared_threads=()
 ):
     """One projection for every prompt channel, including original message bodies."""
     current = rows[0].id
@@ -244,7 +244,7 @@ async def project_context(
         unclear_repair=bool(turn.companion_plan and turn.companion_plan.get("controls_unclear")),
         mode_hint=cue.mode if cue else None,
         signal_source=cue.evidence.message_id if cue else None,
-        shared_source_id=shared_thread.source_message_id if shared_thread else None,
+        shared_source_id=shared_threads[0].source_message_id if len(shared_threads) == 1 else None,
         contextual_recall=bool(candidates.query_hint_source_ids),
     )
     from hmph.shared_threads import interaction_rhythm
@@ -288,16 +288,21 @@ async def project_context(
             .values(turn_id=turn.id, message_id=previous.id, message_revision=previous.revision)
             .on_conflict_do_nothing()
         )
-    if shared_thread:
+    if shared_threads:
+        contexts = tuple(
+            {
+                "id": str(thread.id),
+                "topic": thread.topic,
+                "source_id": str(thread.source_message_id),
+                "revision": thread.revision,
+                "status": thread.status,
+            }
+            for thread in shared_threads
+        )
         plan = plan.model_copy(
             update={
-                "shared_thread": {
-                    "id": str(shared_thread.id),
-                    "topic": shared_thread.topic,
-                    "source_id": str(shared_thread.source_message_id),
-                    "revision": shared_thread.revision,
-                    "status": shared_thread.status,
-                }
+                "shared_thread": contexts[0] if len(contexts) == 1 else None,
+                "shared_threads": contexts if len(contexts) > 1 else (),
             }
         )
     safe_rows = [

@@ -79,6 +79,7 @@ class RawEvidence(BaseModel):
     truncated: bool
     source_timezone: str | None = None
     source_order: int | None = None
+    conversation_id: UUID | None = Field(default=None, exclude=True)
 
 
 class EvidenceSlot(BaseModel):
@@ -87,6 +88,11 @@ class EvidenceSlot(BaseModel):
     memory_refs: tuple[str, ...] = ()
     supported_source_ids: tuple[UUID, ...] = ()
     candidate_source_ids: tuple[UUID, ...] = ()
+
+
+class WithdrawalEvidence(BaseModel):
+    prior_source_id: UUID
+    withdrawal_source_id: UUID
 
 
 class EvidenceWorkspace(BaseModel):
@@ -103,6 +109,7 @@ class EvidenceWorkspace(BaseModel):
     delta_gap: int = 0
     policy_filtered_sources: int = 0
     query_hint_source_ids: tuple[UUID, ...] = ()
+    withdrawal_evidence: tuple[WithdrawalEvidence, ...] = ()
 
 
 def plan_recall(query):
@@ -233,15 +240,27 @@ class WorkingCandidates:
     query_hint_source_ids: tuple[UUID, ...] = ()
 
 
-async def contextual_query(session, turn, query, short_term, preferences):
+def has_contextual_reference(query):
+    return re.search(r"那家|那次|这件|那个|这事|that (?:company|interview|event)", query, re.I)
+
+
+TOPIC_INTRODUCTION = re.compile(
+    r"\s*(?:我想(?:接着)?聊(?:聊)?|接着聊|说到|说回|关于|let['’]s talk about|I want to talk about)"
+    r"\s*[^。.!！？?\n，,；;]{2,80}[。.!]?\s*",
+    re.I,
+)
+REFERENCE_CHANGE = re.compile(r"改成|不是|取消|换到|instead|correction", re.I)
+
+
+async def contextual_query(session, turn, query, short_term, preferences, *, allow_nested=False):
     """Resolve one deictic lookup from current, grounded state. No new inference.
 
     A lagging state, explicit correction, multiple possible antecedents or a
     filtered source keeps the original query. Hints locate evidence, not facts.
     """
     if (
-        not re.search(r"那家|那次|这件|那个|这事|that (?:company|interview|event)", query, re.I)
-        or re.search(r"改成|不是|取消|换到|instead|correction", query, re.I)
+        not has_contextual_reference(query)
+        or REFERENCE_CHANGE.search(query)
         or short_term.pending_gap
         or short_term.processed_through_seq != turn.source_seq - 1
     ):
@@ -255,12 +274,16 @@ async def contextual_query(session, turn, query, short_term, preferences):
     anchors = [
         a for a in (short_term.data.goal, short_term.data.topic) if a and a.message_id not in closed
     ]
-    # A goal takes precedence only when topic and goal name the same source;
-    # otherwise ambiguity is visible instead of guessed away.
-    unique = {(a.message_id, a.quote): a for a in anchors}
-    if len(unique) != 1:
+    # An overlapping goal and topic can describe the same reference. Preserve
+    # the longer literal span, and leave disjoint anchors unresolved.
+    if len({(a.message_id, a.message_revision) for a in anchors}) != 1:
         return query, ()
-    anchor = next(iter(unique.values()))
+    anchor = max(anchors, key=lambda a: len(a.quote))
+    if any(
+        a.quote != anchor.quote and (not allow_nested or a.quote not in anchor.quote)
+        for a in anchors
+    ):
+        return query, ()
     original = await session.scalar(
         select(Message)
         .join(Turn)
@@ -285,6 +308,46 @@ async def contextual_query(session, turn, query, short_term, preferences):
     if len(query) + len(anchor.quote) + 1 > 4000:
         return query, ()
     return query + " " + anchor.quote, (anchor.message_id,)
+
+
+async def native_contextual_query(session, turn, query, short_term, preferences):
+    lookup = await contextual_query(
+        session, turn, query, short_term, preferences, allow_nested=True
+    )
+    if (
+        lookup[1]
+        or not has_contextual_reference(query)
+        or REFERENCE_CHANGE.search(query)
+        or short_term.pending_gap
+        or short_term.processed_through_seq >= turn.source_seq - 1
+    ):
+        return lookup
+    # The immediately previous user turn can carry an explicit topic before
+    # the state worker catches up. Use the literal statement for retrieval.
+    prior = (
+        await session.execute(
+            select(Message, Turn.status)
+            .join(Turn)
+            .where(
+                Message.conversation_id == turn.conversation_id,
+                Turn.pair_id == turn.pair_id,
+                Message.source_seq == turn.source_seq - 2,
+                Message.role == "user",
+                Message.deleted.is_(False),
+            )
+        )
+    ).one_or_none()
+    if prior is None:
+        return lookup
+    message, status = prior
+    if (
+        status == "completed"
+        and TOPIC_INTRODUCTION.fullmatch(message.content)
+        and retainable(message.content)
+        and len(query) + len(message.content) + 1 <= 4000
+    ):
+        return query + " " + message.content, (message.id,)
+    return lookup
 
 
 async def retrieve(session, turn, query, short_term, *, preferences=None, candidate_limit=80):

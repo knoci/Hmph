@@ -7,6 +7,7 @@ generated PG schema and one directory; cleanup verifies both are absent.
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -20,6 +21,22 @@ import httpx
 from hmph.mem0_reference import EMBEDDING_MODEL, MEM0_REVISION, PLACEHOLDER
 from hmph.memory_build_types import BuildUsage, CleanupProof, FrameworkBuildError
 from hmph.reference_transport import ReferenceTransport
+
+
+def _prepare_pgvector(admin, *, install=False, retiring=None):
+    """Keep the database extension independent of per-build schema lifetimes."""
+    admin.execute("SELECT pg_advisory_xact_lock(hashtext('hmph:pgvector'))")
+    installed = admin.execute(
+        "SELECT n.nspname FROM pg_extension e "
+        "JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'"
+    ).fetchone()
+    if installed is None:
+        if install:
+            admin.execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+        return
+    namespace = installed[0]
+    if namespace == retiring or (install and re.fullmatch(r"hmph_m0_[0-9a-f]{32}", namespace)):
+        admin.execute("ALTER EXTENSION vector SET SCHEMA public")
 
 
 def validate_extraction(payload):
@@ -117,7 +134,12 @@ class Mem0Backend:
 
         writer_connection = make_conninfo(self.database_url, application_name=schema)
         with psycopg.connect(writer_connection, autocommit=True, connect_timeout=5) as admin:
-            admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+            with admin.transaction():
+                _prepare_pgvector(admin, install=True)
+                admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+            if lease.base_space_id is not None:
+                with admin.transaction():
+                    self._copy_base(lease.base_space_id, schema, directory, admin)
         connection = make_conninfo(writer_connection, options=f"-csearch_path={schema},public")
         http = httpx.Client(
             transport=transport, timeout=30, follow_redirects=False, trust_env=False
@@ -165,6 +187,37 @@ class Mem0Backend:
             max_retries=0,
         )
         return native
+
+    def _copy_base(self, space_id, schema, directory, admin):
+        from shutil import copy2, copytree
+        from time import monotonic, sleep
+
+        from psycopg import sql
+
+        from hmph.framework_process import execution_lock
+
+        base, location = self._location(space_id)
+        deadline = monotonic() + 3
+        while True:
+            with execution_lock(self.root, space_id) as acquired:
+                if acquired:
+                    copy2(location / "history.db", directory / "history.db")
+                    copy2(location / "timem.json", directory / "timem.json")
+                    copytree(location / "qdrant", directory / "qdrant")
+                    for suffix in ("", "_entities"):
+                        old = sql.Identifier(base, base + suffix)
+                        if suffix and admin.execute(
+                            "SELECT to_regclass(%s)", (f"{base}.{base}{suffix}",)
+                        ).fetchone()[0] is None:
+                            continue
+                        new = sql.Identifier(schema, schema + suffix)
+                        admin.execute(sql.SQL("CREATE TABLE {} (LIKE {})").format(new, old))
+                        admin.execute(sql.SQL("ALTER TABLE {} ADD PRIMARY KEY (id)").format(new))
+                        admin.execute(sql.SQL("INSERT INTO {} SELECT * FROM {}").format(new, old))
+                    return
+            if monotonic() >= deadline:
+                raise FrameworkBuildError("build_failed", retryable=True)
+            sleep(0.05)
 
     @staticmethod
     def _close(native):
@@ -280,9 +333,11 @@ class Mem0Backend:
             connect_timeout=5,
             options="-clock_timeout=5000 -cstatement_timeout=30000",
         ) as admin:
-            admin.execute(
-                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
-            )
+            with admin.transaction():
+                _prepare_pgvector(admin, retiring=schema)
+                admin.execute(
+                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema))
+                )
             remaining = admin.execute(
                 "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=%s)", (schema,)
             ).fetchone()[0]

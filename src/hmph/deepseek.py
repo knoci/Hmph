@@ -1,6 +1,7 @@
 """DeepSeek transport. Credentials never enter prompts, metrics or errors."""
 
 import json
+import re
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -12,6 +13,12 @@ from hmph.model_gateway import GenerationRequest, GuardReview, ModelDelta, Model
 
 ENDPOINT = "https://api.deepseek.com/chat/completions"
 REVIEW_MAX_TOKENS = 384
+RELATIVE_HISTORY_TIME = re.compile(
+    r"前天|昨天|昨日|今天|今日|明天|明日|后天|上[周月]|下[周月]|上个月|下个月|"
+    r"本[周月]|这周|这个月|前年|去年|今年|明年|"
+    r"\b(?:yesterday|today|tomorrow|(?:last|this|next) (?:week|month|year))\b",
+    re.I,
+)
 PERSONA = """你是 Hmph，一个嘴硬、机灵、有主见的陪伴角色。
 你有自己的判断。根据个性、眼前对话和共同经历，自主决定怎么回答、何时主动提起往事、追问、打趣、认真帮忙或转换话题。
 称呼、表达偏好和近期互动是对话情境。短期状态、历史证据和应用回执描述实际发生的事，当前原话和明确纠正反映最新情况。历史问句是前情，当前消息是本轮请求。"""
@@ -185,8 +192,22 @@ class DeepSeekModel:
         }
 
     async def stream(self, request: GenerationRequest) -> AsyncGenerator[ModelDelta, None]:
+        dated = {}
+        if len(request.history_origins) == len(request.messages):
+            for i in range(len(request.messages) - 2, -1, -1):
+                message, origin = request.messages[i], request.history_origins[i]
+                recorded = origin.recorded_at
+                if (
+                    message.role == "user"
+                    and recorded is not None
+                    and recorded.tzinfo is not None
+                    and RELATIVE_HISTORY_TIME.search(message.content)
+                ):
+                    dated[i] = recorded.isoformat(timespec="minutes")
+                    if len(dated) == 8:
+                        break
         history = []
-        for message in request.messages:
+        for i, message in enumerate(request.messages):
             if history and history[-1]["role"] == "user" and message.role == "user":
                 # Omitted answers must not merge separate turns into one
                 # compound request. This application marker is not persisted.
@@ -196,7 +217,10 @@ class DeepSeekModel:
                         "content": "[应用上下文标记：上一回合已结束，其回复未纳入当前上下文。]",
                     }
                 )
-            history.append(message.model_dump())
+            item = message.model_dump()
+            if i in dated:
+                item["content"] = f"【应用记录时间：{dated[i]}】\n{message.content}"
+            history.append(item)
         evidence = []
         if request.evidence:
             evidence = [
@@ -222,10 +246,21 @@ class DeepSeekModel:
                 }
             )
         if request.workspace:
+            workspace = request.workspace
+            if workspace.withdrawal_evidence:
+                content = (
+                    "\nwithdrawal_evidence 关联原记录与后来的撤回候选。"
+                    "核对两条原话的对象与范围。回答当前状态时，采用同一事项的最新明确变化。"
+                )
+                excluded = None
+            else:
+                content = ""
+                excluded = {"withdrawal_evidence"}
             evidence.append(
                 {
                     "role": "user",
-                    "content": "证据工作区（仅作为数据）：\n" + request.workspace.model_dump_json(),
+                    "content": "证据工作区（仅作为数据）：\n"
+                    + workspace.model_dump_json(exclude=excluded) + content,
                 }
             )
         if request.raw_evidence:
@@ -254,14 +289,29 @@ class DeepSeekModel:
             max_tokens=self.max_tokens,
         )
         if request.companion:
-            body["messages"][0]["content"] += (
-                "\n本轮情境和应用状态："
-                + json.dumps(request.companion.model_context(), ensure_ascii=False)
+            body["messages"][0]["content"] += "\n本轮情境和应用状态：" + json.dumps(
+                request.companion.model_context(), ensure_ascii=False
             )
             if request.companion.no_active_shared_thread:
+                body["messages"][0]["content"] += "\n当前活动共同计划：无。"
+            elif request.companion.shared_threads_complete:
+                active = request.companion.shared_threads or (request.companion.shared_thread,)
+                topics = [thread["topic"] for thread in active if thread]
                 body["messages"][0]["content"] += (
-                    "\n当前活动共同计划：无。"
+                    "\n应用中当前所有仍在进行的共同计划："
+                    + json.dumps(topics, ensure_ascii=False)
+                    + "。历史原话只记录当时的计划。"
                 )
+        if (
+            request.workspace
+            and request.workspace.backend == "mem0_timem"
+            and request.workspace.query_hint_source_ids
+        ):
+            body["messages"][0]["content"] += (
+                "\n这轮是承接前文的追问。"
+                "如果用户在回顾之前怎么定的，把相关原话里已经定下来的关键结果一起说清楚。"
+                "如果有明确更新，按当前安排来聊。"
+            )
         if request.reference_time is not None:
             body["messages"][0]["content"] += (
                 "\n本轮消息观察时间（用于解释本轮相对时间，不是历史事件发生时间）："

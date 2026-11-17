@@ -123,6 +123,41 @@ async def test_omitted_answer_does_not_merge_old_and_current_user_requests():
     assert len(messages) == 2
 
 
+async def test_relative_date_in_recent_history_keeps_its_original_local_day(conversation):
+    from datetime import UTC, datetime
+
+    from hmph.conversation import Conversation
+    from hmph.deepseek import DeepSeekModel
+    from hmph.models import Turn
+
+    service = Conversation(
+        conversation.db, digest_key=conversation.digest_key, source_timezone="Asia/Hong_Kong"
+    )
+    identity = await service.bootstrap()
+    owner = identity.owner_id
+    chat = await service.create_chat(owner, identity.character_id, "calendar")
+    previous = await service.accept(owner, chat.id, "prior", "明天去取版画。")
+    await service.finish(await service.claim("prior"))
+    async with service.db.sessions.begin() as session:
+        (await session.get(Turn, previous.id)).created_at = datetime(2026, 2, 5, 16, 30, tzinfo=UTC)
+    query = "换成绝对日期，那个安排是几月几号？"
+    await service.accept(owner, chat.id, "now", query)
+    lease = await service.claim("now")
+    context = await service.generation_request(lease)
+    assert not context.raw_evidence
+
+    def endpoint(request):
+        messages = json.loads(request.content)["messages"]
+        assert messages[-3]["content"] == "【应用记录时间：2026-02-06T00:30+08:00】\n明天去取版画。"
+        assert messages[-1]["content"] == query
+        chunk = {"choices": [{"delta": {"content": "2月7日。"}, "finish_reason": "stop"}]}
+        return httpx.Response(200, text="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+
+    model = DeepSeekModel(SecretStr("recorded-test-only"), transport=httpx.MockTransport(endpoint))
+    assert "".join([delta.text async for delta in model.stream(context)]) == "2月7日。"
+    await service.finish(lease)
+
+
 async def test_deepseek_worker_retains_optional_annotation_usage(conversation):
     from hmph.deepseek import DeepSeekModel
     from hmph.model_gateway import FakeModel
@@ -437,9 +472,7 @@ async def test_state_rebuild_keeps_grounded_goal_when_transition_has_no_target(
         return httpx.Response(
             200,
             json={
-                "choices": [
-                    {"finish_reason": "stop", "message": {"content": json.dumps(patch)}}
-                ]
+                "choices": [{"finish_reason": "stop", "message": {"content": json.dumps(patch)}}]
             },
         )
 
@@ -487,7 +520,7 @@ async def test_state_model_uses_only_structured_state_and_approved_source_messag
                                         "message_id": source["id"],
                                         "text": "周五面试",
                                         "quote": "周五面试",
-                                    }
+                                    },
                                 }
                             )
                         },

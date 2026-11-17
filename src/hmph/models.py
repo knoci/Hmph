@@ -360,9 +360,7 @@ class MemoryBuild(Base):
             "call_limit IS NULL OR (call_limit >= 1 AND call_limit <= 128)",
             name="maintenance_call_limit",
         ),
-        CheckConstraint(
-            "backend IN ('mem0','graphiti','mem0_timem')", name="memory_build_backend"
-        ),
+        CheckConstraint("backend IN ('mem0','graphiti','mem0_timem')", name="memory_build_backend"),
         CheckConstraint(
             "status IN ('queued','building','ready','retired','failed')", name="memory_build_status"
         ),
@@ -371,7 +369,7 @@ class MemoryBuild(Base):
             "pair_id",
             "backend",
             unique=True,
-            postgresql_where=text("status = 'ready'"),
+            postgresql_where=text("status = 'ready' AND backend <> 'mem0_timem'"),
         ),
     )
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -388,6 +386,7 @@ class MemoryBuild(Base):
     fence: Mapped[int] = mapped_column(default=0)
     attempts: Mapped[int] = mapped_column(default=0)
     maintenance_revision: Mapped[int | None] = mapped_column()
+    base_build_id: Mapped[UUID | None] = mapped_column(ForeignKey("memory_builds.id"))
     call_limit: Mapped[int | None] = mapped_column()
     worker_id: Mapped[str | None] = mapped_column(String(100))
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

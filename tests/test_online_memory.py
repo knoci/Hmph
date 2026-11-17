@@ -92,6 +92,216 @@ class NativeReader:
         return NativeSources(source_ids=tuple(self.ids))
 
 
+@pytest.mark.parametrize("historical", [False, True])
+async def test_workspace_links_withdrawal_only_for_current_question(conversation, historical):
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    prior = await say(conversation, identity, "可以把灯塔照片放进群相册。", "permission")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    requested = await builds.request(owner, character, "build", backend="mem0_timem")
+    writer = await builds.claim("writer", backend="mem0_timem")
+    await builds.quiesce(writer)
+    assert await builds.publish(writer)
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    )
+    await selection.update(owner, character, "select", expected_revision=1, build_id=requested.id)
+    change = await say(conversation, identity, "灯塔照片从群相册里撤掉。", "withdrawal")
+    conversation.source_reader = NativeReader([prior.id])
+    chat = await conversation.create_chat(owner, character, "recall")
+    when = "当时" if historical else "现在"
+    await conversation.accept(owner, chat.id, "question", f"{when}灯塔照片能放群相册吗？")
+    request = await conversation.generation_request(await conversation.claim("reader"))
+    assert {prior.id, change.id} <= {s.message_id for s in request.raw_evidence}
+    links = request.workspace.withdrawal_evidence
+    if historical:
+        assert not links
+    else:
+        assert [(link.prior_source_id, link.withdrawal_source_id) for link in links] == [
+            (prior.id, change.id)
+        ]
+
+
+@pytest.mark.parametrize("condition_before_change", [False, True])
+async def test_current_withdrawal_keeps_exact_scope_and_condition(
+    conversation, condition_before_change
+):
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    other = await say(conversation, identity, "便签还是喜欢紫色。", "other-preference")
+    action = (
+        "晚间喝水提醒作废。"
+        if condition_before_change
+        else "晚间喝水提醒撤掉。除非我自己请你提醒。"
+    )
+    body = f"紫色便签可以留着，但{action}"
+    condition_body = (
+        "如果我确实需要，到时候会告诉你。晚间喝水提醒先停。"
+        if condition_before_change
+        else "以后除非我主动说，不用问了。"
+    )
+    source_chat = await conversation.create_chat(owner, character, "changes")
+    changes = [("scoped-change", body), ("condition", condition_body)]
+    if condition_before_change:
+        changes.reverse()
+    for key, content in changes:
+        turn = await conversation.accept(owner, source_chat.id, key, content)
+        await conversation.cancel(owner, turn.id, key)
+    messages = await conversation.messages(owner, source_chat.id)
+    change, condition = reversed(messages) if condition_before_change else messages
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    requested = await builds.request(owner, character, "build", backend="mem0_timem")
+    writer = await builds.claim("writer", backend="mem0_timem")
+    await builds.quiesce(writer)
+    assert await builds.publish(writer)
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    )
+    await selection.update(owner, character, "select", expected_revision=1, build_id=requested.id)
+    conversation.source_reader = NativeReader([other.id, change.id, condition.id])
+    chat = await conversation.create_chat(owner, character, "recall")
+    query = (
+        "晚间喝水提醒能不能继续用？"
+        if condition_before_change
+        else "现在还应该主动给我晚间喝水提醒吗？"
+    )
+    await conversation.accept(owner, chat.id, "q", query)
+    request = await conversation.generation_request(await conversation.claim("reader"))
+    sources = {source.message_id: source for source in request.raw_evidence}
+    assert set(sources) == {change.id, condition.id}
+    source, followup = sources[change.id], sources[condition.id]
+    assert source.content == action
+    assert source.content == body[source.start_offset:source.end_offset]
+    assert followup.content == condition_body
+    assert not request.workspace.withdrawal_evidence
+
+
+async def test_timem_refresh_keeps_the_selected_snapshot_until_explicit_switch(conversation):
+    from hmph.conversation import Conversation
+
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    original = await say(conversation, identity, "我在山脚拍到过一只白尾鸟。", "old")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+
+    async def publish(key):
+        build = await builds.request(owner, character, key, backend="mem0_timem", force=True)
+        writer = await builds.claim(key, backend="mem0_timem")
+        await builds.quiesce(writer)
+        assert await builds.publish(writer)
+        return build.id
+
+    first = await publish("first")
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    )
+    active = await selection.update(
+        owner, character, "choose-old", expected_revision=1, build_id=first
+    )
+    service = Conversation(
+        conversation.db,
+        digest_key=conversation.digest_key,
+        source_reader=NativeReader([original.id]),
+    )
+    chat = await service.create_chat(owner, character, "active-chat")
+    await service.accept(owner, chat.id, "lookup", "我在山脚拍到了什么？")
+    lease = await service.claim("lookup")
+    assert (await service.generation_request(lease)).workspace.backend == "mem0_timem"
+
+    intermediate = await publish("intermediate")
+    latest = await publish("latest")
+    assert (await builds.current(owner, character, backend="mem0_timem")).id == latest
+    assert (await builds.get(owner, intermediate)).status == "retired"
+    assert (await selection.get(owner, character)) == active and active.available
+    await service.publish(lease, 0, "你拍到过白尾鸟。")
+    await service.finish(lease)
+
+    replacement = await selection.update(
+        owner, character, "choose-new", expected_revision=active.revision, build_id=latest
+    )
+    assert replacement.build_id == latest and replacement.available
+    assert (await builds.get(owner, first)).status == "retired"
+
+
+async def test_forgetting_retires_both_ready_timem_snapshots_during_handoff(conversation):
+    from hmph.memory import Memory
+
+    identity = await conversation.bootstrap()
+    owner, char = identity.owner_id, identity.character_id
+    source = await say(conversation, identity, "我常在南桥边散步。", "path")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    )
+    ready = []
+    for i in range(2):
+        key = f"snapshot-{i}"
+        build = await builds.request(owner, char, key, backend="mem0_timem", force=True)
+        writer = await builds.claim(key, backend="mem0_timem")
+        await builds.quiesce(writer)
+        assert await builds.publish(writer)
+        ready.append(build.id)
+        if i == 0:
+            await selection.update(owner, char, "select", expected_revision=1, build_id=build.id)
+
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    receipt = await memory.forget_source(owner, source.id, "forget", expected_revision=1)
+    assert receipt.status == "pending_cleanup"
+    for build_id in ready:
+        assert (await builds.get(owner, build_id)).status == "retired"
+        assert (await builds.spaces(owner, build_id))[-1].status == "retired"
+    assert not (await selection.get(owner, char)).available
+    assert await builds.current(owner, char, backend="mem0_timem") is None
+
+
+async def test_new_correction_reaches_generation_when_committed_facts_fill_the_budget(
+    conversation,
+):
+    from hmph.conversation import Conversation
+    from hmph.memory import Memory
+    from hmph.memory_types import MemoryProposal
+
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    memory = Memory(conversation.db, digest_key=conversation.digest_key)
+    original = None
+    for i in range(8):
+        value = f"森屿陶艺样品{i}，青灰釉手拉陶杯"
+        source = await say(conversation, identity, f"我选了{value}。", f"sample-{i}")
+        if original is None:
+            original = source
+        await memory.learn(
+            await memory.claim("extract"),
+            [MemoryProposal(predicate=f"sample_{i}", value=value, quote=source.content)],
+        )
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    build = await builds.request(owner, character, "build", backend="mem0_timem")
+    writer = await builds.claim("combine", backend="mem0_timem")
+    await builds.quiesce(writer)
+    assert await builds.publish(writer)
+    await MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    ).update(owner, character, "select", expected_revision=1, build_id=build.id)
+    new = await say(
+        conversation,
+        identity,
+        "森屿陶艺工坊改期了，周日下午取件。" + "我还整理了随身的一些工具。" * 40,
+        "fresh",
+    )
+    service = Conversation(
+        conversation.db,
+        digest_key=conversation.digest_key,
+        source_reader=NativeReader([original.id]),
+    )
+    chat = await service.create_chat(owner, character, "follow-up")
+    await service.accept(owner, chat.id, "ask", "森屿陶艺的陶杯什么时候去取？")
+    lease = await service.claim("lookup")
+    request = await service.generation_request(lease)
+    assert any("森屿陶艺" in hit.value for hit in request.evidence)
+    assert new.id in {source.message_id for source in request.raw_evidence}
+    await service.finish(lease)
+
+
 async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conversation):
     from hmph.conversation import Conversation
     from hmph.memory import Memory
@@ -299,6 +509,101 @@ async def test_delta_overflow_cannot_reintroduce_old_graph_value(conversation):
     assert old.id not in {s.message_id for s in request.raw_evidence}
     assert not request.evidence
     await service.finish(lease)
+
+
+@pytest.mark.parametrize(
+    ("filler_count", "correction_kind"),
+    [(14, "short"), (14, "padded"), (14, "spread"), (100, "short"), (100, "spread")],
+)
+async def test_timem_keeps_older_evidence_through_unrelated_backlog(
+    conversation, filler_count, correction_kind
+):
+    from hmph.conversation import Conversation
+
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    old = await say(conversation, identity, "森屿陶艺工坊的小碗是雾蓝色，周六取。", "old")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    build = await builds.request(owner, character, "build", backend="mem0_timem")
+    writer = await builds.claim("index", backend="mem0_timem")
+    await builds.quiesce(writer)
+    assert await builds.publish(writer)
+    await MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    ).update(owner, character, "select", expected_revision=1, build_id=build.id)
+    update = "工坊改期了，周日下午去拿。"
+    correction_body = update
+    if correction_kind != "short":
+        correction_body += "补充很长的说明。" * 200
+    if correction_kind == "spread":
+        correction_body += "工坊又通知改成星期一了。"
+    correction = await say(conversation, identity, correction_body, "correction")
+    for index in range(filler_count):
+        await say(
+            conversation, identity, f"这是第{index}次海边慢跑，我听了一路摇滚。", f"run-{index}"
+        )
+
+    class RecoveringReader(NativeReader):
+        recovering = False
+
+        async def retrieve_sources(self, ticket, query):
+            from hmph.online_memory import SourceRetrievalError
+
+            if self.recovering:
+                raise SourceRetrievalError("reader_recovering")
+            return await super().retrieve_sources(ticket, query)
+
+    reader = RecoveringReader([old.id])
+    service = Conversation(
+        conversation.db, digest_key=conversation.digest_key, source_reader=reader
+    )
+    chat = await service.create_chat(owner, character, "new-chat")
+    turn = await service.accept(owner, chat.id, "lookup", "森屿陶艺的小碗是什么颜色，什么时候取？")
+    lease = await service.claim("lookup")
+    request = await service.generation_request(lease)
+    explanation = await service.memory_explanation(owner, turn.id)
+    audit = explanation["context"]
+    if filler_count > 80:
+        assert audit["delta_scope"] == "matched"
+        assert audit["delta_scanned"] == 1
+        assert audit["delta_scanned_from_order"] is None
+        assert audit["delta_unselected"] is None
+    else:
+        assert audit["delta_scope"] == "recent"
+        assert audit["delta_scanned"] == 15
+        assert audit["delta_unselected"] == 14
+    assert request.workspace.coverage == "partial"
+    source_ids = {s.message_id for s in request.raw_evidence}
+    if correction_kind == "spread":
+        assert source_ids == set()
+        assert request.workspace.delta_gap == 1
+    else:
+        assert source_ids == {old.id, correction.id}
+        assert request.workspace.delta_gap == 0
+        if correction_kind == "padded":
+            selected = next(s for s in request.raw_evidence if s.message_id == correction.id)
+            assert selected.truncated and update in selected.content
+            assert selected.content == correction_body[selected.start_offset : selected.end_offset]
+    await service.finish(lease)
+
+    if filler_count > 80 and correction_kind == "short":
+        reader.recovering = True
+        await service.accept(owner, chat.id, "during-recovery", "森屿陶艺取件要约哪天？")
+        lease = await service.claim("recovering")
+        request = await service.generation_request(lease)
+        assert request.workspace.retrieval_status == "reader_recovering"
+        assert request.workspace.backend == "canonical"
+        assert correction.id in {source.message_id for source in request.raw_evidence}
+        assert old.id not in {source.message_id for source in request.raw_evidence}
+        await service.finish(lease)
+
+        reader.recovering = False
+        await service.accept(owner, chat.id, "after-recovery", "森屿陶艺小碗的釉色是什么？")
+        lease = await service.claim("recovered")
+        request = await service.generation_request(lease)
+        assert request.workspace.backend == "mem0_timem"
+        assert {old.id, correction.id} <= {source.message_id for source in request.raw_evidence}
+        await service.finish(lease)
 
 
 @pytest.mark.parametrize("change", ["replacement", "selection", "preference", "forget"])

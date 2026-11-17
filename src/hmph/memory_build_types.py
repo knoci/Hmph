@@ -59,6 +59,8 @@ class BuildLease(BaseModel):
     fence: int
     worker_id: str
     sources: tuple[BuildSource, ...]
+    base_space_id: UUID | None = None
+    reused_sources: int = 0
     maintenance_revision: int | None = Field(default=None, ge=1)
     call_limit: int | None = Field(default=None, ge=1, le=128)
 

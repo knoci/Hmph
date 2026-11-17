@@ -7,7 +7,7 @@ No native framework or network operation runs inside these transactions.
 
 from datetime import timedelta
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, literal, or_, select, update
 
 from hmph.contracts import DomainError
 from hmph.graphiti_reference import GRAPHITI_REVISION
@@ -108,6 +108,7 @@ class MemoryBuilds:
         model="deepseek-flash",
         force=False,
         maintenance_revision=None,
+        timem_call_limit=None,
     ):
         if backend not in REVISIONS or model not in MODELS:
             raise DomainError("invalid_framework_config", 422)
@@ -116,6 +117,10 @@ class MemoryBuilds:
             body["force"] = True
         if maintenance_revision is not None:
             body["maintenance_revision"] = maintenance_revision
+        if timem_call_limit is not None and (
+            backend != "mem0_timem" or not 1 <= timem_call_limit <= 128
+        ):
+            raise DomainError("invalid_framework_config", 422)
         digest = self.ledger.digest(str(character_id), body)
         async with self.db.sessions.begin() as session:
             await self.ledger.owner_lock(session, owner_id)
@@ -132,6 +137,33 @@ class MemoryBuilds:
                 policy = await due_policy(session, pair, maintenance_revision, backend, model)
                 if policy is None:
                     return None
+            combined = backend == "mem0_timem"
+            base = None
+            if combined and not force:
+                base = await session.scalar(
+                    select(MemoryBuild)
+                    .join(MemorySpace)
+                    .where(
+                        MemoryBuild.pair_id == pair.id,
+                        MemoryBuild.backend == backend,
+                        MemoryBuild.backend_revision == REVISIONS[backend],
+                        MemoryBuild.model == model,
+                        MemoryBuild.memory_epoch == pair.memory_epoch,
+                        MemoryBuild.status == "ready",
+                        MemorySpace.status == "ready",
+                        MemorySpace.quiesced.is_(True),
+                    )
+                    .order_by(MemoryBuild.watermark.desc(), MemoryBuild.generation.desc())
+                    .limit(1)
+                )
+            after = base.watermark if base else 0
+            limit = MAX_SOURCES
+            if combined and policy is not None:
+                # A batch can cost one extraction and one L2 call per source.
+                calls = min(policy.per_attempt_calls, policy.remaining_calls)
+                limit = min(limit, max(1, calls // 2))
+            elif combined and not force:
+                limit = min(limit, max(1, (timem_call_limit or 96) // 2))
             rows = (
                 await session.execute(
                     select(Message, MemoryTask.source_order)
@@ -141,15 +173,40 @@ class MemoryBuilds:
                         MemoryTask.source_revision == Message.revision,
                         Message.role == "user",
                         Message.deleted.is_(False),
+                        MemoryTask.source_order > after,
                     )
                     .order_by(MemoryTask.source_order)
-                    .limit(MAX_SOURCES + 1)
+                    .limit(limit + 1)
                 )
             ).all()
-            if len(rows) > MAX_SOURCES:
+            if not combined and len(rows) > limit:
                 raise DomainError("framework_snapshot_too_large", 413)
+            watermark = pair.next_memory_seq - 1
+            if len(rows) > limit:
+                watermark = rows[limit - 1][1]
+                rows = rows[:limit]
             rows = [(m, order) for m, order in rows if retainable(m.content)]
-            if policy is not None:
+            if combined:
+                size = 0
+                for i, (message, _) in enumerate(rows):
+                    size += len(message.content.encode())
+                    if size > MAX_SOURCE_BYTES:
+                        if not i:
+                            raise DomainError("framework_snapshot_too_large", 413)
+                        watermark = rows[i - 1][1]
+                        rows = rows[:i]
+                        break
+                if policy is not None and watermark == pair.next_memory_seq - 1:
+                    if not rows:
+                        return None
+                    if len(rows) < min(policy.minimum_sources, limit):
+                        accepted = await session.scalar(
+                            select(Turn.created_at).where(Turn.id == rows[0][0].turn_id)
+                        )
+                        now = await session.scalar(select(func.clock_timestamp()))
+                        if accepted + timedelta(seconds=policy.cooldown_seconds) > now:
+                            return None
+            elif policy is not None:
                 previous = await session.scalar(
                     select(func.max(MemoryBuild.watermark)).where(
                         MemoryBuild.pair_id == pair.id,
@@ -167,8 +224,12 @@ class MemoryBuilds:
                     return None
             if sum(len(m.content.encode()) for m, _ in rows) > MAX_SOURCE_BYTES:
                 raise DomainError("framework_snapshot_too_large", 413)
+            source_keys = [[str(m.id), m.revision, order] for m, order in rows]
+            if base is not None and not rows and watermark == after:
+                self.ledger.save(session, owner_id, "memory.build", request_id, digest, base.id)
+                return BuildView.model_validate(base)
             snapshot_digest = self.ledger.digest(
-                str(pair.id), [[str(m.id), m.revision, order] for m, order in rows]
+                str(pair.id), [base.snapshot_digest, source_keys] if base else source_keys
             )
             if not force:
                 ready_space = (
@@ -181,7 +242,8 @@ class MemoryBuilds:
                     .exists()
                 )
                 reusable = await session.scalar(
-                    select(MemoryBuild).where(
+                    select(MemoryBuild)
+                    .where(
                         MemoryBuild.pair_id == pair.id,
                         MemoryBuild.backend == backend,
                         MemoryBuild.backend_revision == REVISIONS[backend],
@@ -191,6 +253,8 @@ class MemoryBuilds:
                         MemoryBuild.status == "ready",
                         ready_space,
                     )
+                    .order_by(MemoryBuild.generation.desc())
+                    .limit(1)
                 )
                 if reusable is not None:
                     self.ledger.save(
@@ -215,10 +279,12 @@ class MemoryBuilds:
                 backend=backend,
                 backend_revision=REVISIONS[backend],
                 model=model,
-                watermark=pair.next_memory_seq - 1,
-                source_count=len(rows),
+                watermark=watermark,
+                source_count=(base.source_count if base else 0) + len(rows),
                 snapshot_digest=snapshot_digest,
                 maintenance_revision=maintenance_revision,
+                base_build_id=base.id if base else None,
+                call_limit=timem_call_limit,
             )
             if policy is not None:
                 pair.memory_maintenance = policy.model_copy(
@@ -229,6 +295,18 @@ class MemoryBuilds:
             pair.next_framework_seq += 1
             session.add(build)
             await session.flush()
+            if base is not None:
+                await session.execute(
+                    MemoryBuildSource.__table__.insert().from_select(
+                        ("build_id", "message_id", "message_revision", "source_order"),
+                        select(
+                            literal(build.id, type_=MemoryBuildSource.build_id.type),
+                            MemoryBuildSource.message_id,
+                            MemoryBuildSource.message_revision,
+                            MemoryBuildSource.source_order,
+                        ).where(MemoryBuildSource.build_id == base.id),
+                    )
+                )
             session.add_all(
                 [
                     MemoryBuildSource(
@@ -355,12 +433,15 @@ class MemoryBuilds:
         async with self.db.sessions() as session:
             pair = await self._pair(session, owner_id, character_id)
             build = await session.scalar(
-                select(MemoryBuild).where(
+                select(MemoryBuild)
+                .where(
                     MemoryBuild.pair_id == pair.id,
                     MemoryBuild.backend == backend,
                     MemoryBuild.memory_epoch == pair.memory_epoch,
                     MemoryBuild.status == "ready",
                 )
+                .order_by(MemoryBuild.generation.desc())
+                .limit(1)
             )
             return BuildView.model_validate(build) if build else None
 
@@ -447,6 +528,15 @@ class MemoryBuilds:
                 return None
             try:
                 sources = await self._sources(session, build)
+                parent = None
+                if build.base_build_id is not None:
+                    from hmph.online_memory import ready_space
+
+                    parent = await ready_space(session, pair, build.base_build_id)
+                    if parent is None or sources[:parent[0].source_count] != await self._sources(
+                        session, parent[0]
+                    ):
+                        raise DomainError("framework_source_changed")
             except DomainError:
                 build.status, build.error_code = "failed", "framework_source_changed"
                 if build.maintenance_revision is not None:
@@ -461,11 +551,15 @@ class MemoryBuilds:
                 if not policy.enabled or policy.revision != build.maintenance_revision:
                     await self._retire(session, [build.id])
                     return None
-                if policy.remaining_calls <= 0:
+                minimum_calls = 2 if build.backend == "mem0_timem" else 1
+                if policy.remaining_calls < minimum_calls:
                     build.status, build.error_code = "failed", "maintenance_budget"
                     suspend_policy(pair, policy.revision, "budget_exhausted")
                     return None
                 limit = min(policy.per_attempt_calls, policy.remaining_calls)
+                if build.backend == "mem0_timem":
+                    new_sources = len(sources) - (parent[0].source_count if parent else 0)
+                    limit = min(limit, max(2, 3 * new_sources))
                 pair.memory_maintenance = policy.model_copy(
                     update={
                         "remaining_calls": policy.remaining_calls - limit,
@@ -493,6 +587,8 @@ class MemoryBuilds:
                 fence=build.fence,
                 worker_id=worker_id,
                 sources=sources,
+                base_space_id=parent[1].id if parent else None,
+                reused_sources=parent[0].source_count if parent else 0,
                 maintenance_revision=build.maintenance_revision,
                 call_limit=build.call_limit,
             )
@@ -726,6 +822,8 @@ class MemoryBuilds:
                     )
                 )
             )
+            if build.backend == "mem0_timem":
+                previous = [bid for bid in previous if bid != pair.selected_memory_build]
             await self._retire(session, previous)
             build.status, build.ready_at = "ready", now
             build.worker_id, build.lease_until = None, None
@@ -748,6 +846,15 @@ class MemoryBuilds:
                 return False
             space.status = "retired"
             space.error_code = code
+            if build.backend == "mem0_timem":
+                # An explicit request grants one set of paid calls. Relaunch
+                # only when the stopped worker proved it sent no requests.
+                usage = space.usage or {}
+                retryable = (
+                    retryable
+                    and bool(usage.get("usage_complete"))
+                    and (usage.get("attempted_calls") == 0)
+                )
             build.status = "queued" if retryable and build.attempts < 3 else "failed"
             build.worker_id, build.lease_until = None, None
             build.error_code = code
@@ -797,7 +904,11 @@ class MemoryBuilds:
                         .where(MemorySpace.build_id == build.id, MemorySpace.status == "writing")
                         .values(status="retired", error_code="worker_lost")
                     )
-                    build.status = "queued" if build.attempts < 3 else "failed"
+                    build.status = (
+                        "queued"
+                        if build.backend != "mem0_timem" and build.attempts < 3
+                        else "failed"
+                    )
                     build.fence += 1
                     build.error_code = "worker_lost"
                     build.worker_id, build.lease_until = None, None
@@ -907,6 +1018,18 @@ class MemoryBuilds:
             space.status, space.cleaned_at = "cleaned", now
             await session.execute(
                 delete(MemoryNativeSource).where(MemoryNativeSource.space_id == space.id)
+            )
+            await session.execute(
+                delete(MemoryBuildSource).where(
+                    MemoryBuildSource.build_id == space.build_id,
+                    MemoryBuildSource.build_id.in_(
+                        select(MemoryBuild.id).where(
+                            MemoryBuild.id == space.build_id,
+                            MemoryBuild.backend == "mem0_timem",
+                            MemoryBuild.status == "retired",
+                        )
+                    ),
+                )
             )
             space.cleanup_worker_id, space.cleanup_until, space.error_code = None, None, None
             await session.flush()

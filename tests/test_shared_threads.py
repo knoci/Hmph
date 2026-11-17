@@ -120,6 +120,58 @@ async def test_shared_plan_survives_sessions_pauses_resumes_and_forgets_all_sour
     await conversation.finish(lease)
 
 
+async def test_plan_lookup_prefers_the_named_plan_and_lists_multiple_active_plans(conversation):
+    identity = await conversation.bootstrap()
+    owner = identity.owner_id
+    chat = await conversation.create_chat(owner, identity.character_id, "plan-list")
+    service = SharedThreads(conversation)
+    plans = [
+        await service.write(owner, chat.id, f"create-{i}", topic=topic)
+        for i, topic in enumerate(("盒子里整理老照片", "学会完整弹奏月光奏鸣曲"))
+    ]
+    first, named = sorted(plans, key=lambda plan: plan["id"])
+    reopened = await conversation.create_chat(owner, identity.character_id, "plan-reopened")
+    lease, request = await prepare(
+        conversation, identity, reopened, "named", f"还记得「{named['topic']}」那个共同计划吗？"
+    )
+    assert request.companion.shared_thread["id"] == named["id"]
+    await conversation.finish(lease)
+
+    lease, request = await prepare(
+        conversation, identity, reopened, "list", "我们还有哪些共同计划？"
+    )
+    assert request.companion.shared_thread is None
+    offered = request.companion.model_context()["shared_threads"]
+    assert {thread["id"] for thread in offered} == {first["id"], named["id"]}
+    assert request.companion.shared_threads_complete
+    assert {t["source_id"] for t in offered} <= {str(s.message_id) for s in request.raw_evidence}
+    await conversation.finish(lease)
+
+    await service.write(
+        owner, chat.id, "pause", thread_id=UUID(named["id"]), expected_revision=1, status="paused"
+    )
+    lease, request = await prepare(
+        conversation, identity, reopened, "list-open", "现在还在继续的共同计划还有哪些？"
+    )
+    assert request.companion.shared_threads_complete
+    assert request.companion.shared_thread["id"] == first["id"]
+    assert request.companion.shared_threads == ()
+    assert named["source_message_id"] not in {str(s.message_id) for s in request.raw_evidence}
+    await conversation.finish(lease)
+
+    lease, request = await prepare(
+        conversation,
+        identity,
+        reopened,
+        "paused-by-name",
+        f"「{named['topic']}」共同计划怎么样了？",
+    )
+    assert request.companion.shared_thread["id"] == named["id"]
+    assert request.companion.shared_thread["status"] == "paused"
+    assert not request.companion.shared_threads_complete
+    await conversation.finish(lease)
+
+
 async def test_shared_plan_revision_ownership_capacity_and_inflight_invalidation(conversation):
     identity = await conversation.bootstrap()
     chat = await conversation.create_chat(identity.owner_id, identity.character_id, "controls")

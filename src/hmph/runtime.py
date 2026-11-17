@@ -74,7 +74,7 @@ async def run_local(*, port=8017, stop_file=None, timem_mem0=False):
         if framework is not None:
             tasks.append(
                 asyncio.create_task(
-                    framework.run_forever(schedule_maintenance=False), name="hmph-worker-framework"
+                    framework.run_forever(), name="hmph-worker-framework"
                 )
             )
         if stop_file is not None:

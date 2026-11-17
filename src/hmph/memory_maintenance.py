@@ -1,7 +1,8 @@
-"""Budgeted coalescing for the existing shadow-build queue; never selects a backend."""
+"""Budgeted coalescing for the existing build queue."""
 
 from datetime import datetime
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
@@ -14,7 +15,7 @@ class MaintenancePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     revision: int = 0
     enabled: bool = False
-    backend: Literal["mem0", "graphiti"] = "graphiti"
+    backend: Literal["mem0", "graphiti", "mem0_timem"] = "graphiti"
     model: Literal["deepseek-flash", "deepseek-v4-pro"] = "deepseek-flash"
     cooldown_seconds: int = Field(default=300, ge=1, le=86400)
     minimum_sources: int = Field(default=8, ge=1, le=100)
@@ -36,6 +37,12 @@ async def due_policy(session, pair, revision, backend, model):
         or policy.remaining_calls <= 0
     ):
         return None
+    if backend == "mem0_timem":
+        if pair.selected_memory_build is None:
+            return None
+        selected = await session.get(MemoryBuild, pair.selected_memory_build)
+        if selected is None or selected.backend != backend:
+            return None
     now = await session.scalar(select(func.clock_timestamp()))
     if (
         policy.last_scheduled_at is not None
@@ -179,7 +186,10 @@ class MemoryMaintenance:
                 result = await self.builds.request(
                     owner,
                     character,
-                    f"maintenance:{policy.revision}:{epoch}:{next_source - 1}:{character}",
+                    (
+                        f"maintenance:{uuid4()}" if backend == "mem0_timem" else
+                        f"maintenance:{policy.revision}:{epoch}:{next_source - 1}:{character}"
+                    ),
                     backend=backend,
                     model=policy.model,
                     maintenance_revision=policy.revision,

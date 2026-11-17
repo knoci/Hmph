@@ -1,3 +1,5 @@
+import pytest
+
 from hmph.model_gateway import FakeModel
 from hmph.worker import Worker
 
@@ -58,6 +60,68 @@ async def say(conversation, identity, text, request_id):
     turn = await conversation.accept(identity.owner_id, chat.id, request_id, text)
     await conversation.cancel(identity.owner_id, turn.id, request_id)
     return (await conversation.messages(identity.owner_id, chat.id))[0]
+
+
+async def test_timem_maintenance_extends_bounded_prefix_and_adopts_on_next_turn(
+    conversation, monkeypatch
+):
+    from hmph.memory_builds import MemoryBuilds
+    from hmph.memory_maintenance import MemoryMaintenance
+    from hmph.online_memory import MemorySelection
+
+    monkeypatch.setattr("hmph.memory_builds.MAX_SOURCES", 2)
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    build = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    )
+    maintenance = MemoryMaintenance(build)
+
+    first = await say(conversation, identity, "我的陶杯是雾蓝色。", "cup")
+    initial = await build.request(owner, character, "initial", backend="mem0_timem")
+    base = await build.claim("initial", backend="mem0_timem")
+    await build.quiesce(base)
+    assert await build.publish(base)
+    await selection.update(owner, character, "select", expected_revision=1, build_id=initial.id)
+    await maintenance.update(
+        owner, character, "enable", expected_revision=0, enabled=True, backend="mem0_timem",
+        minimum_sources=1, per_attempt_calls=4, additional_calls=4,
+    )
+    second = await say(conversation, identity, "陶杯安排在周日取。", "date")
+    third = await say(conversation, identity, "我在陶艺店遇到了阿哲。", "friend")
+    queued, = await maintenance.schedule("mem0_timem")
+    incremental = await build.claim("append", backend="mem0_timem")
+    assert incremental.base_space_id == base.space_id
+    assert incremental.reused_sources == 1
+    assert [s.message_id for s in incremental.sources] == [first.id, second.id, third.id]
+    await build.quiesce(incremental)
+    assert await build.publish(incremental)
+    assert (await selection.get(owner, character)).build_id == initial.id
+
+    chat = await conversation.create_chat(owner, character, "query")
+    await conversation.accept(owner, chat.id, "ask", "陶杯什么时候取？")
+    from types import SimpleNamespace
+
+    conversation.source_reader = SimpleNamespace(advances_timem_maintenance=True)
+    await conversation.generation_request(await conversation.claim("reader"))
+    assert (await selection.get(owner, character)).build_id == queued
+    assert (await build.get(owner, initial.id)).status == "retired"
+
+
+async def test_snapshot_keeps_state_correction_and_respects_explicit_no_save(conversation):
+    from hmph.memory_builds import MemoryBuilds
+
+    identity = await conversation.bootstrap()
+    for key, body in (
+        ("correct", "别记成周五。我有空的是周日下午。"),
+        ("unsaved", "这条不要记，之后也不用保存。"),
+    ):
+        await say(conversation, identity, body, key)
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    await builds.request(identity.owner_id, identity.character_id, "review", backend="mem0_timem")
+    lease = await builds.claim("review", backend="mem0_timem")
+    assert [source.content for source in lease.sources] == ["别记成周五。我有空的是周日下午。"]
 
 
 async def test_unchanged_ready_snapshot_reuses_build_but_explicit_force_rebuilds(conversation):
@@ -373,7 +437,9 @@ async def test_cleanup_timeout_can_retry_without_accepting_the_expired_confirmat
     writer = await builds.claim("old-writer", backend="mem0")
     await builds.quiesce(writer)
     assert await builds.publish(writer)
-    await builds.request(identity.owner_id, identity.character_id, "new", backend="mem0")
+    await builds.request(
+        identity.owner_id, identity.character_id, "new", backend="mem0", force=True
+    )
     latest = await builds.claim("new-writer", backend="mem0")
     await builds.quiesce(latest)
     assert await builds.publish(latest)
@@ -388,3 +454,54 @@ async def test_cleanup_timeout_can_retry_without_accepting_the_expired_confirmat
     assert (
         await builds.current(identity.owner_id, identity.character_id, backend="mem0")
     ).id == latest.build_id
+
+
+@pytest.mark.parametrize("attempted_calls", [None, 0, 1])
+async def test_combined_build_only_retries_when_zero_calls_are_proven(
+    conversation, attempted_calls
+):
+    from hmph.memory_build_types import BuildUsage
+    from hmph.memory_builds import MemoryBuilds
+
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    await say(conversation, identity, "我喜欢喝茶。", "tea")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    requested = await builds.request(owner, character, "index", backend="mem0_timem")
+    lease = await builds.claim("writer", backend="mem0_timem")
+    usage = (
+        None
+        if attempted_calls is None
+        else BuildUsage(
+            attempted_calls=attempted_calls,
+            reported_tokens=0,
+            usage_complete=True,
+            processed_sources=0,
+            native_changes=0,
+        )
+    )
+    await builds.quiesce(lease, usage=usage)
+    assert await builds.fail(lease, code="build_failed", retryable=True)
+    expected = "queued" if attempted_calls == 0 else "failed"
+    assert (await builds.get(owner, requested.id)).status == expected
+
+
+async def test_expired_combined_writer_does_not_spend_a_second_budget(conversation):
+    from datetime import UTC, datetime, timedelta
+
+    from hmph.memory_builds import MemoryBuilds
+    from hmph.models import MemoryBuild
+
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    await say(conversation, identity, "我还在练琴。", "piano")
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    requested = await builds.request(owner, character, "index", backend="mem0_timem")
+    assert await builds.claim("writer", backend="mem0_timem")
+    async with conversation.db.sessions.begin() as session:
+        building = await session.get(MemoryBuild, requested.id)
+        building.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+    await builds.recover_expired(backend="mem0_timem")
+    result = await builds.get(owner, requested.id)
+    assert result.status == "failed" and result.error_code == "worker_lost"
+    assert await builds.claim("another-writer", backend="mem0_timem") is None

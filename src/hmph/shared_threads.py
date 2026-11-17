@@ -2,7 +2,7 @@
 
 import re
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from hmph.companion_policy import requested
 from hmph.contracts import ACTIVE, DomainError
@@ -248,24 +248,52 @@ class SharedThreads:
             return self.view(thread)
 
 
-async def prepare_thread(session, pair, turn, query, candidates):
+async def prepare_threads(session, pair, turn, query, candidates):
     english_question = bool(ENGLISH_THREAD_QUESTION.search(query))
     thread_query = english_question or bool(THREAD_QUERY.search(query))
-    threads = list(
+    known = list(
         await session.scalars(
             select(SharedThread)
-            .where(SharedThread.pair_id == pair.id, SharedThread.status == "open")
+            .where(
+                SharedThread.pair_id == pair.id,
+                or_(
+                    SharedThread.status == "open",
+                    func.strpos(query.lower(), func.lower(SharedThread.topic)) > 0,
+                ),
+            )
             .order_by(SharedThread.id)
-            .limit(3)
+            .limit(32)
         )
     )
-    for thread in threads:
-        if not (
-            RETURNING.search(query)
-            or thread_query
-            or set(query_terms(query)) & set(query_terms(thread.topic))
-        ):
-            continue
+    threads = [thread for thread in known if thread.status == "open"]
+    folded = query.casefold()
+    terms = set(query_terms(query))
+    matches = [thread for thread in known if thread.topic.casefold() in folded][:3]
+    active_list = False
+    if not matches:
+        ranked = [(len(terms.intersection(query_terms(t.topic))), t) for t in threads]
+        best = max((score for score, _ in ranked), default=0)
+        nearest = [t for score, t in ranked if best and score == best]
+        if len(nearest) == 1 and (best >= 2 or not thread_query):
+            matches = nearest
+        elif thread_query or RETURNING.search(query):
+            matches = threads
+            active_list = thread_query
+    if active_list and candidates.raw:
+        inactive = set(
+            await session.scalars(
+                select(SharedThreadSource.message_id)
+                .join(SharedThread)
+                .where(
+                    SharedThread.pair_id == pair.id,
+                    SharedThread.status != "open",
+                    SharedThreadSource.message_id.in_([s.message_id for s in candidates.raw]),
+                )
+            )
+        )
+        candidates.raw[:] = [s for s in candidates.raw if s.message_id not in inactive]
+    offered = []
+    for thread in matches:
         source = await session.get(Message, thread.source_message_id)
         if source is None or source.deleted:
             continue
@@ -276,27 +304,31 @@ async def prepare_thread(session, pair, turn, query, candidates):
         start = source.content.find(thread.topic)
         if start < 0:
             continue
-        if not any(s.message_id == source.id for s in candidates.raw):
-            if candidates.candidate_count >= 80:
-                return None, False
+        existing = next((s for s in candidates.raw if s.message_id == source.id), None)
+        if existing is not None:
+            candidates.raw.remove(existing)
+        else:
+            if candidates.candidate_count >= candidates.plan.candidate_limit:
+                continue
             candidates.candidate_count += 1
             origin = await session.get(Turn, source.turn_id)
-            candidates.raw.insert(
-                0,
-                RawEvidence(
-                    message_id=source.id,
-                    message_revision=source.revision,
-                    role="user",
-                    recorded_at=origin.created_at,
-                    content=thread.topic,
-                    start_offset=start,
-                    end_offset=start + len(thread.topic),
-                    truncated=True,
-                    source_timezone=origin.source_timezone,
-                ),
+            existing = RawEvidence(
+                message_id=source.id,
+                message_revision=source.revision,
+                role="user",
+                recorded_at=origin.created_at,
+                content=thread.topic,
+                start_offset=start,
+                end_offset=start + len(thread.topic),
+                truncated=True,
+                source_timezone=origin.source_timezone,
             )
-        return thread, False
-    return None, not threads and thread_query and (english_question or requested(query))
+        candidates.raw.insert(len(offered), existing)
+        offered.append(thread)
+    no_active = (
+        not matches and not threads and thread_query and (english_question or requested(query))
+    )
+    return tuple(offered), active_list and len(offered) == len(threads), no_active
 
 
 async def apply_thread_command(session, pair, turn, message, *, proposed=None):

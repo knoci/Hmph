@@ -44,6 +44,7 @@ class ContextOrigin(BaseModel):
     message_revision: int
     start_offset: int | None
     end_offset: int | None
+    recorded_at: datetime | None = None
 
 
 class ModelUsage(BaseModel):

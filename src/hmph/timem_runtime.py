@@ -22,6 +22,30 @@ from hmph.timem_reference import (
 
 BACKEND = "mem0_timem"
 REVISION = TIMEM_REVISION
+EPISODE_BATCH_LIMIT = 4
+COMBINED_EPISODE_BYTES = 12000
+
+
+def _fit_episode_budget(episodes, limit):
+    """Combine neighboring short episodes only as far as the writer budget requires."""
+    to_merge = len(episodes) - limit
+    compact = []
+    sizes = []
+    for episode in episodes:
+        size = sum(len(source.content.encode("utf-8")) + 1 for batch in episode for source in batch)
+        if (
+            to_merge > 0
+            and compact
+            and len(compact[-1]) + len(episode) <= EPISODE_BATCH_LIMIT
+            and sizes[-1] + size <= COMBINED_EPISODE_BYTES
+        ):
+            compact[-1] = (*compact[-1], *episode)
+            sizes[-1] += size
+            to_merge -= 1
+        else:
+            compact.append(episode)
+            sizes.append(size)
+    return compact
 
 
 def configure_native(root):
@@ -65,23 +89,36 @@ class CombinedBackend(Mem0Backend):
 
         if lease.backend != BACKEND or lease.backend_revision != REVISION:
             raise FrameworkBuildError("build_failed", retryable=False)
-        batches = tuple(self._batches(lease.sources))
+        new_sources = lease.sources[lease.reused_sources:]
+        batches = tuple(self._batches(new_sources))
         episodes = []
         for _, group in groupby(batches, key=lambda batch: batch[0].conversation_id):
             adjacent = tuple(group)
-            episodes.extend(adjacent[i : i + 4] for i in range(0, len(adjacent), 4))
-        timem_calls = len(episodes) + (len(batches) if self.summarize_leaves else 0)
-        if len(batches) + timem_calls > self.max_calls:
+            episodes.extend(
+                adjacent[i : i + EPISODE_BATCH_LIMIT]
+                for i in range(0, len(adjacent), EPISODE_BATCH_LIMIT)
+            )
+        call_limit = min(self.max_calls, lease.call_limit or self.max_calls)
+        l2_grouping = "conversation"
+        if len(batches) < call_limit < len(batches) + len(episodes):
+            episodes = _fit_episode_budget(episodes, call_limit - len(batches))
+            l2_grouping = "adjacent"
+        minimum_calls = len(batches) + len(episodes)
+        if minimum_calls > call_limit:
             raise FrameworkBuildError("call_budget", retryable=False)
+        # Keep local L1 originals when there is room for mem0 and L2 but not
+        # for an additional summary of every L1. Source mappings are identical.
+        summarize_leaves = self.summarize_leaves and minimum_calls + len(batches) <= call_limit
+        timem_calls = len(episodes) + (len(batches) if summarize_leaves else 0)
         try:
-            await super().build(lease, checkpoint)
+            await super().build(lease.model_copy(update={"sources": new_sources}), checkpoint)
         except FrameworkBuildError:
             raise
         except Exception:
             raise FrameworkBuildError("provider_failed", retryable=False) from None
 
         _, directory = self._location(lease.space_id)
-        remaining = self.max_calls - self.usage.attempted_calls
+        remaining = call_limit - self.usage.attempted_calls
         if remaining < timem_calls:
             raise FrameworkBuildError("call_budget", retryable=False)
         budget = RunBudget(
@@ -95,22 +132,39 @@ class CombinedBackend(Mem0Backend):
         try:
             configure_native(self.root)
             install_provider(llm)
-            await native.open(directory)
+            await native.open(directory, extend=lease.base_space_id is not None)
+            if lease.base_space_id is not None:
+                from timem.models.memory import Memory
+
+                base = json.loads((directory / "timem.json").read_bytes())
+                reused_ids = [str(s.message_id) for s in lease.sources[:lease.reused_sources]]
+                if (
+                    base["timem_revision"] != REVISION
+                    or base["mem0_revision"] != MEM0_REVISION
+                    or base["source_ids"] != reused_ids
+                ):
+                    raise ValueError("TiMem index does not match the reused source prefix")
+                nodes = [Memory.model_validate(row) for row in base["nodes"]]
+                native.nodes = {node.id: node for node in nodes}
+                native.leaf_map = base["leaves"]
             await build_snapshot_layers(
                 native,
                 lease.sources,
                 episodes=episodes,
                 checkpoint=checkpoint,
-                summarize_leaves=self.summarize_leaves,
+                summarize_leaves=summarize_leaves,
             )
-            await native.index_originals(lease.sources)
+            await native.index_originals(new_sources)
             await checkpoint()
             manifest = {
                 "timem_revision": REVISION,
                 "mem0_revision": MEM0_REVISION,
                 "source_ids": [str(source.message_id) for source in lease.sources],
+                "reused_sources": lease.reused_sources,
                 "nodes": [node.model_dump(mode="json") for node in native.nodes.values()],
                 "leaves": native.leaf_map,
+                "l1_storage": "summary" if summarize_leaves else "original",
+                "l2_grouping": l2_grouping,
             }
             (directory / "timem.json").write_text(json.dumps(manifest), encoding="utf-8")
         except Exception:
@@ -147,6 +201,8 @@ class CombinedProcessBackend(ProcessBackend):
 
 
 class CombinedReader:
+    advances_timem_maintenance = True
+
     def __init__(self, builds, backend):
         self.builds, self.backend = builds, backend
         configure_native(backend.root)
@@ -202,7 +258,7 @@ class CombinedReader:
                     or manifest["mem0_revision"] != MEM0_REVISION
                     or manifest["source_ids"] != [str(source.message_id) for source in sources]
                 ):
-                    raise SourceRetrievalError("reader_failed")
+                    raise ValueError("TiMem manifest does not match the ready snapshot")
                 await native.open(directory, embedding=self.mem0.embedding, existing=True)
                 native.snapshot = sources
                 nodes = [Memory.model_validate(row) for row in manifest["nodes"]]

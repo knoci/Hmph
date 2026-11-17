@@ -21,6 +21,7 @@ from hmph.contracts import (
 )
 from hmph.database import Database
 from hmph.dialogue import queue_dialogue, short_term_context, state_sources
+from hmph.event_changes import withdrawals
 from hmph.model_gateway import ChatMessage, ContextOrigin, GenerationRequest
 from hmph.models import (
     Character,
@@ -37,6 +38,7 @@ from hmph.models import (
 )
 from hmph.online_memory import (
     READ_SECONDS,
+    UPDATE_CUE,
     NativeSources,
     expand_sources,
     pin_read,
@@ -46,9 +48,13 @@ from hmph.online_memory import (
 from hmph.persistence import RequestLedger, append_event, terminate_turn
 from hmph.preference_types import expression_preferences
 from hmph.working_memory import (
+    RawEvidence,
+    WithdrawalEvidence,
     WorkingCandidates,
     build_workspace,
     focused_query,
+    has_contextual_reference,
+    native_contextual_query,
     retrieve,
     search_raw,
 )
@@ -583,22 +589,39 @@ class Conversation:
 
     async def generation_request(self, lease: Lease) -> GenerationRequest:
         started = time.monotonic()
+        query = lease.user_content
+        lookup = (query, ())
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
             pair = await session.get(Pair, turn.pair_id)
-            ticket = await pin_read(session, pair, turn, lease)
+            ticket = await pin_read(
+                session, pair, turn, lease,
+                advance_timem=getattr(self.source_reader, "advances_timem_maintenance", False),
+            )
+            if (
+                ticket is not None
+                and ticket.backend == "mem0_timem"
+                and ticket.space_id is not None
+                and self.source_reader is not None
+                and has_contextual_reference(query)
+            ):
+                state = await short_term_context(session, turn, self._short_term_budget(query))
+                if not state.state_truncated:
+                    lookup = await native_contextual_query(
+                        session, turn, query, state, pair.preferences
+                    )
         native, retrieval_status = (None, None)
         # Reopening the persistent Qdrant collection has a cold-start cost.
         deadline = started + (6 if ticket and ticket.backend == "mem0_timem" else READ_SECONDS)
         if ticket is not None:
             native, retrieval_status = await retrieve_native(
-                self.source_reader, ticket, lease.user_content, deadline=deadline
+                self.source_reader, ticket, lookup[0], deadline=deadline
             )
         if ticket is not None:
             try:
                 async with asyncio.timeout(max(0, deadline - time.monotonic())):
                     return await self._assemble_request(
-                        lease, ticket, native, retrieval_status, started
+                        lease, ticket, native, retrieval_status, started, lookup=lookup
                     )
             except TimeoutError:
                 # The experimental route has ended; fallback uses no native result.
@@ -607,13 +630,20 @@ class Conversation:
                 )
         return await self._assemble_request(lease, ticket, native, retrieval_status, started)
 
-    async def _assemble_request(self, lease, ticket, native, retrieval_status, started):
+    @staticmethod
+    def _short_term_budget(query):
+        return max(0, min(1300, 5000 - len(query.encode("utf-8")) - 64))
+
+    async def _assemble_request(
+        self, lease, ticket, native, retrieval_status, started, *, lookup=None
+    ):
         draft = await self._assemble_draft(
             lease,
             ticket,
             native,
             retrieval_status,
             started,
+            lookup=lookup,
             candidate_limit=40 if self.recall_planner and ticket is None else 80,
         )
         if self.recall_planner is None or ticket is not None:
@@ -727,6 +757,7 @@ class Conversation:
         *,
         candidates_override=None,
         candidate_limit=80,
+        lookup=None,
     ):
         async with self.db.sessions.begin() as session:
             turn, _, _ = await self._lease(session, lease)
@@ -755,9 +786,9 @@ class Conversation:
                         )
                         .on_conflict_do_nothing()
                     )
-            rows = list(
-                await session.scalars(
-                    select(Message)
+            history = (
+                await session.execute(
+                    select(Message, Turn.created_at, Turn.source_timezone)
                     .join(Turn, Message.turn_id == Turn.id)
                     .where(
                         Message.conversation_id == turn.conversation_id,
@@ -768,12 +799,18 @@ class Conversation:
                     .order_by(Message.source_seq.desc())
                     .limit(40)
                 )
-            )
+            ).all()
+            rows = [row for row, _, _ in history]
+            observation_times = {
+                row.id: recorded.astimezone(ZoneInfo(zone))
+                for row, recorded, zone in history
+                if zone
+            }
             evidence = []
             evidence_bytes = 0
             current_size = len(rows[0].content.encode("utf-8")) + 64
             short_term = await short_term_context(
-                session, turn, max(0, min(1300, 5000 - current_size))
+                session, turn, self._short_term_budget(rows[0].content)
             )
             state_bytes = len(short_term.model_dump_json().encode())
             evidence_budget = max(
@@ -792,6 +829,23 @@ class Conversation:
                     candidate_limit=candidate_limit,
                 )
             else:
+                lookup_query, hint_sources = lookup or (rows[0].content, ())
+                if hint_sources:
+                    verified = (
+                        None
+                        if short_term.state_truncated
+                        else await native_contextual_query(
+                            session,
+                            turn,
+                            rows[0].content,
+                            short_term,
+                            pair.preferences,
+                        )
+                    )
+                    if verified != lookup:
+                        native = NativeSources(requests=native.requests)
+                        retrieval_status = "context_changed"
+                        lookup_query, hint_sources = rows[0].content, ()
                 candidates, audit = await expand_sources(
                     session,
                     turn,
@@ -800,13 +854,17 @@ class Conversation:
                     retrieval_status,
                     rows[0].content,
                     budget=evidence_budget,
+                    lookup_query=lookup_query,
                 )
+                candidates.query_hint_source_ids = hint_sources
             from hmph.companion import project_context, repaired
-            from hmph.shared_threads import prepare_thread
+            from hmph.shared_threads import prepare_threads
 
-            shared_thread, no_active_shared_thread = await prepare_thread(
-                session, pair, turn, lease.user_content, candidates
-            )
+            (
+                shared_threads,
+                shared_threads_complete,
+                no_active_shared_thread,
+            ) = await prepare_threads(session, pair, turn, lease.user_content, candidates)
 
             inspected_rows = {row.id: row.source_seq for row in rows}
             rows, candidates, short_term, companion_plan = await project_context(
@@ -817,39 +875,88 @@ class Conversation:
                 rows,
                 candidates,
                 short_term,
-                shared_thread=shared_thread,
+                shared_threads=shared_threads,
             )
             if no_active_shared_thread:
                 companion_plan = companion_plan.model_copy(update={"no_active_shared_thread": True})
-            turn.companion_plan = {
-                **(turn.companion_plan or {}),
-                **companion_plan.model_dump(mode="json"),
-                "controls_applied": repaired(turn),
-            }
-            for hit in candidates.memories:
-                # Retain every source in storage; supply bounded evidence in the prompt.
-                hit = hit.model_copy(update={"sources": hit.sources[:2]})
-                size = len(hit.model_dump_json().encode("utf-8")) + 64
-                if size + evidence_bytes > evidence_budget:
-                    continue
-                evidence.append(hit)
-                evidence_bytes += size
+            corrections = []
+            withdrawal_evidence = ()
+            if ticket is not None and ticket.backend == "mem0_timem":
+                corrections = [
+                    s
+                    for s in candidates.raw
+                    if s.source_order is not None
+                    and s.source_order > ticket.build_watermark
+                    and UPDATE_CUE.search(s.content)
+                ]
+                if candidates.plan.intent in {"fact", "multi_hop"}:
+                    originals = sorted(
+                        (s for s in candidates.raw if s.source_order and not s.truncated),
+                        key=lambda s: s.source_order,
+                    )
+                    pairs = withdrawals(originals, lease.user_content)
+                    withdrawal_evidence = tuple(
+                        WithdrawalEvidence(
+                            prior_source_id=originals[prior].message_id,
+                            withdrawal_source_id=originals[change].message_id,
+                        )
+                        for prior, change in pairs
+                    )
+                    corrections = list({
+                        source.message_id: source
+                        for source in [
+                            *corrections,
+                            *(originals[i] for prior, change in pairs for i in (change, prior)),
+                        ]
+                    }.values())
+            correction_ids = {s.message_id for s in corrections}
+            # Use one budget for raw and structured evidence. Pack fresh updates
+            # before committed facts, then restore the original presentation order.
+            ordered = [
+                *corrections,
+                *(
+                    hit.model_copy(update={"sources": hit.sources[:2]})
+                    for hit in candidates.memories
+                ),
+                *(s for s in candidates.raw if s.message_id not in correction_ids),
+            ]
             raw_evidence = []
-            for source in candidates.raw:
-                size = len(source.model_dump_json().encode()) + 64
+            for item in ordered:
+                size = len(item.model_dump_json().encode("utf-8")) + 64
                 if (
                     size + evidence_bytes > evidence_budget
                     or len(evidence) + len(raw_evidence) >= 12
                 ):
                     continue
-                raw_evidence.append(source)
+                if isinstance(item, RawEvidence):
+                    raw_evidence.append(item)
+                else:
+                    evidence.append(item)
                 evidence_bytes += size
+            raw_order = {s.message_id: i for i, s in enumerate(candidates.raw)}
+            raw_evidence.sort(key=lambda s: raw_order[s.message_id])
             chosen = []
-            if companion_plan.shared_thread and not any(
-                str(s.message_id) == companion_plan.shared_thread["source_id"] for s in raw_evidence
-            ):
-                companion_plan = companion_plan.model_copy(update={"shared_thread": None})
-                turn.companion_plan = {**turn.companion_plan, "shared_thread": None}
+            offered_ids = {str(s.message_id) for s in raw_evidence}
+            single = companion_plan.shared_thread
+            if single and single["source_id"] not in offered_ids:
+                single = None
+            multiple = tuple(
+                item for item in companion_plan.shared_threads if item["source_id"] in offered_ids
+            )
+            offered_threads = (single,) if single else multiple
+            companion_plan = companion_plan.model_copy(
+                update={
+                    "shared_thread": single,
+                    "shared_threads": multiple,
+                    "shared_threads_complete": shared_threads_complete
+                    and len(offered_threads) == len(shared_threads),
+                }
+            )
+            turn.companion_plan = {
+                **(turn.companion_plan or {}),
+                **companion_plan.model_dump(mode="json"),
+                "controls_applied": repaired(turn),
+            }
             source_rows = []
             remaining = 5000 - evidence_bytes - state_bytes
             for row in rows:
@@ -901,6 +1008,11 @@ class Conversation:
             )
             workspace.policy_filtered_sources = len(inspected_rows) - len(rows)
             workspace.query_hint_source_ids = candidates.query_hint_source_ids
+            workspace.withdrawal_evidence = tuple(
+                pair for pair in withdrawal_evidence
+                if str(pair.prior_source_id) in offered_ids
+                and str(pair.withdrawal_source_id) in offered_ids
+            )
             if self.recall_planner is not None and ticket is None:
                 workspace.rounds = 2 if candidates_override is not None else 1
             if workspace.policy_filtered_sources:
@@ -910,7 +1022,17 @@ class Conversation:
                 workspace = workspace.model_copy(
                     update={key: audit[key] for key in ("backend", "retrieval_status", "delta_gap")}
                 )
-                if audit["delta_gap"] or audit["filtered_sources"]:
+                if (
+                    audit["delta_gap"]
+                    or audit["filtered_sources"]
+                    or audit["withdrawal_scope_skipped"]
+                    or audit["delta_unselected"]
+                    or audit["delta_truncated"]
+                    or audit["delta_scope"] == "matched"
+                    or any(
+                        status not in {"ok", "empty"} for status in audit["branch_status"].values()
+                    )
+                ):
                     workspace.coverage = "partial"
                 turn.memory_context = {
                     **audit,
@@ -960,16 +1082,28 @@ class Conversation:
                     .values(turn_id=turn.id, message_id=signal.id, message_revision=signal.revision)
                     .on_conflict_do_nothing()
                 )
-            if companion_plan.shared_thread:
+            if offered_threads:
                 from hmph.models import SharedThreadSource
 
                 for source_id in await session.scalars(
                     select(SharedThreadSource.message_id).where(
-                        SharedThreadSource.thread_id == UUID(companion_plan.shared_thread["id"])
+                        SharedThreadSource.thread_id.in_([UUID(t["id"]) for t in offered_threads])
                     )
                 ):
                     source = await session.get(Message, source_id)
                     if source.deleted:
+                        raise DomainError("source_invalidated")
+                    await session.execute(
+                        insert(TurnSourceUse)
+                        .values(
+                            turn_id=turn.id, message_id=source.id, message_revision=source.revision
+                        )
+                        .on_conflict_do_nothing()
+                    )
+            if ticket is not None:
+                for source_id in workspace.query_hint_source_ids:
+                    source = await session.get(Message, source_id)
+                    if source is None or source.deleted:
                         raise DomainError("source_invalidated")
                     await session.execute(
                         insert(TurnSourceUse)
@@ -1027,6 +1161,7 @@ class Conversation:
                         message_revision=row.revision,
                         start_offset=row.start_offset,
                         end_offset=row.end_offset,
+                        recorded_at=observation_times.get(row.id),
                     )
                     for row in reversed(source_rows)
                 ),

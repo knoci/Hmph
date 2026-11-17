@@ -5,6 +5,7 @@ untrusted until the pair, build, revision, permission and source order agree.
 """
 
 import asyncio
+import re
 import time
 from datetime import datetime
 from typing import Literal
@@ -12,9 +13,10 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, update
+from sqlalchemy import case, or_, select, update
 
 from hmph.contracts import ACTIVE, DomainError
+from hmph.event_changes import WITHDRAWAL, asks_current_state, withdrawal_focus, withdrawal_window
 from hmph.memory import Memory
 from hmph.models import (
     MemoryBuild,
@@ -29,12 +31,21 @@ from hmph.models import (
 )
 from hmph.persistence import RequestLedger, terminate_turn
 from hmph.source_context import budget_window
-from hmph.source_policy import retainable
+from hmph.source_policy import NO_RETAIN, SECRET, retainable
 from hmph.working_memory import RawEvidence, WorkingCandidates, plan_recall, query_terms, search_raw
 
 READ_SECONDS = 3
 CANDIDATES = 80
 SOURCES = 12
+UPDATE_CUE = re.compile(
+    r"更正|纠正|改[成为到期了]|换[成到了]|更新|延期|推迟|提前|取消|不再|不去了|"
+    r"不是[^。！？!?\n]{0,60}是|现在是|定在|"
+    r"\b(?:correction|actually|instead|no longer|"
+    r"updat(?:e|ed)|chang(?:e|ed)|mov(?:e|ed)|"
+    r"reschedul(?:e|ed)|cancel(?:led|ed))\b|" + WITHDRAWAL,
+    re.I,
+)
+SENTENCES = re.compile(r"[^。！？.!?\n]+[。！？.!?]?")
 
 
 class SourceRetrievalError(Exception):
@@ -72,11 +83,15 @@ class ReadTicket(BaseModel):
     cutoff: int
     job_fence: int
     valid_until: datetime
+    reference_time: datetime | None = Field(default=None, exclude=True)
+    source_timezone: str | None = Field(default=None, exclude=True)
 
 
-async def pin_read(session, pair, turn, lease):
+async def pin_read(session, pair, turn, lease, *, advance_timem=False):
     if pair.selected_memory_build is None:
         return None
+    if advance_timem:
+        await _adopt_timem_maintenance(session, pair)
     turn.memory_context = {
         "backend": "lexical",
         "retrieval_status": "build_unavailable",
@@ -96,6 +111,8 @@ async def pin_read(session, pair, turn, lease):
         cutoff=pair.next_memory_seq - 1,
         job_fence=lease.fence,
         valid_until=turn.deadline,
+        reference_time=turn.created_at,
+        source_timezone=turn.source_timezone,
     )
     if ready:
         session.add(
@@ -106,6 +123,43 @@ async def pin_read(session, pair, turn, lease):
         **ticket.model_dump(mode="json", exclude={"pair_id", "turn_id"}),
     }
     return ticket
+
+
+async def _adopt_timem_maintenance(session, pair):
+    """Select a finished maintenance generation before pinning this pair's next turn."""
+    from hmph.memory_builds import MemoryBuilds
+    from hmph.memory_maintenance import MaintenancePolicy
+
+    policy = MaintenancePolicy.model_validate(pair.memory_maintenance)
+    if not policy.enabled or policy.backend != "mem0_timem":
+        return
+    previous = await session.get(MemoryBuild, pair.selected_memory_build)
+    if previous is None or previous.backend != "mem0_timem":
+        return
+    minimum_watermark = previous.watermark if previous.memory_epoch == pair.memory_epoch else 0
+    candidate = await session.scalar(
+        select(MemoryBuild)
+        .join(MemorySpace)
+        .where(
+            MemoryBuild.pair_id == pair.id,
+            MemoryBuild.backend == previous.backend,
+            MemoryBuild.generation > previous.generation,
+            MemoryBuild.watermark >= minimum_watermark,
+            MemoryBuild.memory_epoch == pair.memory_epoch,
+            MemoryBuild.maintenance_revision == policy.revision,
+            MemoryBuild.status == "ready",
+            MemorySpace.status == "ready",
+            MemorySpace.quiesced.is_(True),
+        )
+        .order_by(MemoryBuild.generation.desc())
+        .limit(1)
+    )
+    if candidate is None:
+        return
+    pair.selected_memory_build = candidate.id
+    pair.memory_config_revision += 1
+    if previous.status == "ready":
+        await MemoryBuilds._retire(session, [previous.id])
 
 
 async def validate_read(session, pair, turn, job, now):
@@ -140,7 +194,16 @@ async def retrieve_native(reader, ticket, query, *, deadline):
     try:
         async with asyncio.timeout(max(0, deadline - time.monotonic())):
             result = NativeSources.model_validate(await reader.retrieve_sources(ticket, query))
-            return result, "ok" if result.source_ids else "empty"
+            if result.source_ids:
+                return result, "ok"
+            branches = set(result.branch_status.values())
+            if branches <= {"empty"}:
+                return result, "empty"
+            if "reader_recovering" in branches:
+                return result, "reader_recovering"
+            if branches <= {"empty", "timeout"}:
+                return result, "timeout"
+            return result, "reader_failed"
     except TimeoutError:
         return NativeSources(requests=None), "timeout"
     except SourceRetrievalError as error:
@@ -150,39 +213,21 @@ async def retrieve_native(reader, ticket, query, *, deadline):
         return NativeSources(requests=None), "reader_failed"
 
 
-async def expand_sources(session, turn, ticket, native, status, query, *, budget):
-    """Prioritize complete post-build input before older retrieved evidence.
+async def expand_sources(
+    session, turn, ticket, native, status, query, *, budget, lookup_query=None
+):
+    """Scan post-build input before admitting older retrieved evidence.
 
-    An incomplete delta suppresses all pre-build evidence. This is deliberately
-    conservative until structured correction/subject resolution is validated.
+    TiMem + mem0 can narrow a fully scanned delta under context pressure. Keep
+    matching originals and possible updates. A scan gap or dropped candidate
+    still suppresses pre-build evidence.
     """
     current = await session.scalar(
         select(Message.id).where(Message.turn_id == turn.id, Message.role == "user")
     )
-    delta = list(
-        (
-            await session.execute(
-                select(Message, Turn, MemoryTask)
-                .join(Turn, Message.turn_id == Turn.id)
-                .join(MemoryTask, MemoryTask.source_message_id == Message.id)
-                .where(
-                    MemoryTask.pair_id == ticket.pair_id,
-                    Turn.pair_id == ticket.pair_id,
-                    MemoryTask.source_order > ticket.build_watermark,
-                    MemoryTask.source_order <= ticket.cutoff,
-                    Message.id != current,
-                    Message.role == "user",
-                    Message.deleted.is_(False),
-                    MemoryTask.source_revision == Message.revision,
-                )
-                .order_by(MemoryTask.source_order.desc())
-                .limit(CANDIDATES + 1)
-            )
-        ).all()
-    )
-    scan_overflow = len(delta) > CANDIDATES
-    delta_gap = int(scan_overflow)
-    delta = delta[:CANDIDATES]
+    focus_query = lookup_query or query
+    terms = query_terms(focus_query)
+    plan = plan_recall(query)
     # Native hits locate original messages. Keep independently committed facts
     # available both alongside those hits and after a native snapshot retires.
     memories = []
@@ -190,14 +235,60 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         memories = await Memory.search(
             session,
             turn.pair_id,
-            query,
+            lookup_query or query,
             reference=turn.created_at,
             source_timezone=turn.source_timezone,
         )
+    native_ids = tuple(dict.fromkeys(native.source_ids))
+    delta_limit = CANDIDATES - len(memories) - min(SOURCES, len(native_ids))
+    focused_delta = (
+        ticket.backend == "mem0_timem"
+        and (status != "timeout" or bool(native.branch_status))
+        and bool(terms)
+        and ticket.cutoff - ticket.build_watermark - 1 > delta_limit
+    )
+    delta_query = (
+        select(Message, Turn, MemoryTask)
+        .join(Turn, Message.turn_id == Turn.id)
+        .join(MemoryTask, MemoryTask.source_message_id == Message.id)
+        .where(
+            MemoryTask.pair_id == ticket.pair_id,
+            Turn.pair_id == ticket.pair_id,
+            MemoryTask.source_order > ticket.build_watermark,
+            MemoryTask.source_order <= ticket.cutoff,
+            Message.id != current,
+            Message.role == "user",
+            Message.deleted.is_(False),
+            MemoryTask.source_revision == Message.revision,
+        )
+        .order_by(MemoryTask.source_order.desc())
+    )
+    if focused_delta:
+        # Match throughout the interval before applying the candidate limit.
+        # PostgreSQL spells a word boundary \y. Include exclusions so a
+        # source we cannot use still signals a gap rather than disappearing.
+        patterns = (UPDATE_CUE, SECRET, NO_RETAIN)
+        topical = or_(*(Message.content.icontains(term, autoescape=True) for term in terms))
+        delta_query = (
+            delta_query.where(
+                or_(
+                    topical,
+                    *(Message.content.op("~*")(p.pattern.replace(r"\b", r"\y")) for p in patterns),
+                )
+            )
+            .order_by(None)
+            .order_by(case((topical, 1), else_=0).desc(), MemoryTask.source_order.desc())
+        )
+    else:
+        delta_limit = CANDIDATES
+    delta = (await session.execute(delta_query.limit(delta_limit + 1))).all()
+    scan_overflow = len(delta) > delta_limit
+    delta_gap = int(scan_overflow)
+    delta = delta[:delta_limit]
     native_capacity = max(0, CANDIDATES - len(delta) - len(memories))
     if ticket.backend == "graphiti":
         native_capacity //= 2  # Reserve space for Graphiti's existing lexical complement.
-    source_ids = tuple(dict.fromkeys(native.source_ids))[:native_capacity]
+    source_ids = native_ids[:native_capacity]
     rows = list(
         (
             await session.execute(
@@ -235,15 +326,55 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
     else:
         native_rank = {str(source_id): index for index, source_id in enumerate(source_ids)}
         rows.sort(key=lambda row: native_rank[row[0].native_id])
+    scope, conditions = set(), {}
+    if (
+        ticket.backend == "mem0_timem"
+        and plan.intent in {"fact", "multi_hop"}
+        and asks_current_state(query)
+    ):
+        scope, conditions = withdrawal_focus(
+            [_raw(m, t, mapping.source_order) for mapping, m, t, _ in rows]
+            + [_raw(m, t, task.source_order) for m, t, task in delta if retainable(m.content)],
+            focus_query,
+        )
+    out_of_scope = 0
     selected, used, filtered, truncated = [], 0, 0, 0
-    terms = query_terms(query)
+    delta_sources = []
     for message, source_turn, task in delta:
         if not retainable(message.content):
             filtered += 1
             # Omitted boundaries must not leave pre-build values in context.
             continue
         source = _raw(message, source_turn, task.source_order)
+        if scope:
+            source = _scope_withdrawal(source, scope, focus_query, conditions)
+            if source is None:
+                out_of_scope += 1
+                continue
         size = len(source.model_dump_json().encode()) + 64
+        delta_sources.append((source, size))
+    delta_unselected = None if focused_delta else 0
+    if (
+        ticket.backend == "mem0_timem"
+        and terms
+        and not scan_overflow
+        and not focused_delta
+        and (len(delta_sources) >= SOURCES or sum(size for _, size in delta_sources) > budget // 2)
+    ):
+        scoped = []
+        for source, size in delta_sources:
+            text = source.content.lower()
+            if UPDATE_CUE.search(text) or any(term in text for term in terms):
+                scoped.append((source, size))
+        delta_unselected = len(delta_sources) - len(scoped)
+        delta_sources = scoped
+    delta_truncated = 0
+    for source, size in delta_sources:
+        if ticket.backend == "mem0_timem" and used + size > budget and len(selected) < SOURCES:
+            excerpt = _correction_excerpt(source, budget - used)
+            if excerpt is not None:
+                source, size = excerpt
+                delta_truncated += 1
         if used + size > budget or len(selected) >= SOURCES:
             delta_gap += 1
             continue
@@ -287,13 +418,18 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         if message.deleted or not retainable(message.content):
             continue
         source = _raw(message, await session.get(Turn, message.turn_id), task.source_order)
-        start, end = budget_window(message.content, terms)
+        if scope:
+            source = _scope_withdrawal(source, scope, focus_query, conditions)
+            if source is None:
+                out_of_scope += 1
+                continue
+        start, end = budget_window(source.content, terms)
         source = source.model_copy(
             update={
-                "content": message.content[start:end],
-                "start_offset": start,
-                "end_offset": end,
-                "truncated": start > 0 or end < len(message.content),
+                "content": source.content[start:end],
+                "start_offset": source.start_offset + start,
+                "end_offset": source.start_offset + end,
+                "truncated": source.truncated or start > 0 or end < len(source.content),
             }
         )
         size = len(source.model_dump_json().encode()) + 64
@@ -311,13 +447,18 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         else "lexical"
         if ticket.backend == "graphiti"
         else "canonical"
-        if memories
+        if memories or (focused_delta and selected)
         else "recent_only",
         "retrieval_status": status,
         "delta_gap": delta_gap,
         "delta_scanned": len(delta),
+        "delta_scope": "matched" if focused_delta else "recent",
+        "delta_unselected": delta_unselected,
+        "delta_truncated": delta_truncated,
         "delta_scan_truncated": scan_overflow,
-        "delta_scanned_from_order": min((task.source_order for _, _, task in delta), default=None),
+        "delta_scanned_from_order": None
+        if focused_delta
+        else min((task.source_order for _, _, task in delta), default=None),
         "native_budget_dropped": len(set(native.source_ids)) - len(source_ids),
         "lexical_complement_sources": sum(
             s.message_id not in native_messages and s.source_order <= ticket.build_watermark
@@ -327,7 +468,8 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         else 0,
         "lexical_candidates_scanned": fallback_scanned,
         "filtered_sources": filtered,
-        "truncated_sources": truncated,
+        "withdrawal_scope_skipped": out_of_scope,
+        "truncated_sources": truncated + delta_truncated,
         "requests": native.requests,
         "database_queries": native.database_queries,
         "branch_status": native.branch_status,
@@ -340,12 +482,49 @@ async def expand_sources(session, turn, ticket, native, status, query, *, budget
         "space_id": str(ticket.space_id) if ticket.space_id else None,
     }
     return WorkingCandidates(
-        plan_recall(query),
+        plan,
         memories,
         selected,
         native.requests if native.requests is not None else 1,
         min(CANDIDATES, len(rows) + len(delta) + fallback_scanned + len(memories)),
     ), audit
+
+
+def _scope_withdrawal(source, terms, query, conditions):
+    span = conditions.get(source.message_id) or withdrawal_window(source.content, terms, query)
+    if span is None:
+        return None
+    start, end = span
+    return source.model_copy(
+        update={
+            "content": source.content[start:end],
+            "start_offset": source.start_offset + start,
+            "end_offset": source.start_offset + end,
+            "truncated": source.truncated or start > 0 or end < len(source.content),
+        }
+    )
+
+
+def _correction_excerpt(source, available_bytes):
+    """Keep all update-bearing sentences and their immediate context as one exact span."""
+    sentences = list(SENTENCES.finditer(source.content))
+    updates = [i for i, sentence in enumerate(sentences) if UPDATE_CUE.search(sentence.group())]
+    if not updates:
+        return None
+    start = sentences[max(0, updates[0] - 1)].start()
+    end = sentences[min(len(sentences) - 1, updates[-1] + 1)].end()
+    if end - start == len(source.content):
+        return None
+    excerpt = source.model_copy(
+        update={
+            "content": source.content[start:end],
+            "start_offset": source.start_offset + start,
+            "end_offset": source.start_offset + end,
+            "truncated": True,
+        }
+    )
+    size = len(excerpt.model_dump_json().encode()) + 64
+    return (excerpt, size) if size <= available_bytes else None
 
 
 def _raw(message, turn, source_order):
@@ -364,6 +543,7 @@ def _raw(message, turn, source_order):
         truncated=False,
         source_timezone=turn.source_timezone,
         source_order=source_order,
+        conversation_id=turn.conversation_id,
     )
 
 
@@ -459,6 +639,7 @@ class MemorySelection:
                 raise DomainError("memory_config_conflict")
             if build_id and await ready_space(session, pair, build_id) is None:
                 raise DomainError("memory_build_unavailable")
+            superseded = []
             if build_id:
                 from sqlalchemy import func
 
@@ -477,6 +658,17 @@ class MemorySelection:
                 )
                 if mapped != build.source_count:
                     raise DomainError("memory_build_unavailable")
+                if build.backend == "mem0_timem":
+                    superseded = list(
+                        await session.scalars(
+                            select(MemoryBuild.id).where(
+                                MemoryBuild.pair_id == pair.id,
+                                MemoryBuild.backend == build.backend,
+                                MemoryBuild.status == "ready",
+                                MemoryBuild.generation < build.generation,
+                            )
+                        )
+                    )
             pair.selected_memory_build = build_id
             pair.memory_config_revision += 1
             turns = list(
@@ -491,6 +683,8 @@ class MemorySelection:
                 if read:
                     read.invalidated = True
                 await terminate_turn(session, turn, "invalidated", "memory_config_changed")
+            if superseded:
+                await MemoryBuilds._retire(session, superseded)
             self.ledger.save(session, owner_id, "memory.select", request_id, digest, pair.id)
             await session.flush()
             return await self._view(session, pair)
