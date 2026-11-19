@@ -120,6 +120,38 @@ async def test_shared_plan_survives_sessions_pauses_resumes_and_forgets_all_sour
     await conversation.finish(lease)
 
 
+async def test_named_status_uses_its_plan_evidence_and_keeps_mixed_questions(conversation):
+    identity = await conversation.bootstrap()
+    owner = identity.owner_id
+    chat = await conversation.create_chat(owner, identity.character_id, "mixed-history")
+    unrelated = "我还得周四中午去青禾木工房取胸针。"
+    lease, _ = await prepare(conversation, identity, chat, "pickup", unrelated)
+    await conversation.publish(lease, 0, "好，周四中午取胸针。")
+    await conversation.finish(lease)
+
+    threads = SharedThreads(conversation)
+    plan = await threads.write(owner, chat.id, "make-plan", topic="周末的木刻小集试做")
+    await threads.write(
+        owner, chat.id, "pause-plan", thread_id=UUID(plan["id"]), expected_revision=1,
+        status="paused",
+    )
+    lease, request = await prepare(
+        conversation, identity, chat, "named-status", "木刻小集的试做现在是什么状态？"
+    )
+    assert request.companion.shared_thread["status"] == "paused"
+    assert "青禾木工房" not in request.model_dump_json()
+    used_source_ids = {str(source.message_id) for source in request.raw_evidence}
+    assert plan["source_message_id"] in used_source_ids
+    await conversation.finish(lease)
+
+    lease, request = await prepare(
+        conversation, identity, chat, "mixed-status", f"{plan['topic']}还在继续吗？胸针什么时候取？"
+    )
+    assert request.companion.shared_thread["status"] == "paused"
+    assert any(message.content == unrelated for message in request.messages)
+    await conversation.finish(lease)
+
+
 async def test_plan_lookup_prefers_the_named_plan_and_lists_multiple_active_plans(conversation):
     identity = await conversation.bootstrap()
     owner = identity.owner_id

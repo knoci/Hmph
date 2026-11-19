@@ -10,6 +10,7 @@ from hmph.mem0_backend import Mem0Backend, Mem0SourceReader
 from hmph.mem0_reference import MEM0_REVISION
 from hmph.memory_build_types import FrameworkBuildError
 from hmph.online_memory import SourceRetrievalError
+from hmph.reference_transport import failed_call_summary
 from hmph.timem_reference import (
     TIMEM_REVISION,
     LocalTiMem,
@@ -184,6 +185,7 @@ class CombinedBackend(Mem0Backend):
                     + sum((call.get("usage") or {}).get("total_tokens", 0) for call in calls),
                     "usage_complete": self.usage.usage_complete
                     and all(c.get("usage") for c in calls),
+                    **failed_call_summary(calls, "timem"),
                 }
             )
         return self.usage

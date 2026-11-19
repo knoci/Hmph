@@ -649,7 +649,7 @@ class MemoryBuilds:
                 raise DomainError("framework_stop_proof_required")
             space.quiesced = True
             if usage is not None:
-                space.usage = BuildUsage.model_validate(usage).model_dump()
+                space.usage = BuildUsage.model_validate(usage).model_dump(exclude_none=True)
 
     async def reserve_execution(self, lease, identity):
         async with self.db.sessions.begin() as session:
@@ -776,7 +776,7 @@ class MemoryBuilds:
             space.quiesced = True
             space.stop_proof = stop_proof
             if usage is not None:
-                space.usage = BuildUsage.model_validate(usage).model_dump()
+                space.usage = BuildUsage.model_validate(usage).model_dump(exclude_none=True)
 
     async def stop_unverified(self, lease):
         async with self.db.sessions.begin() as session:

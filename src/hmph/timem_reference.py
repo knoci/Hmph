@@ -624,13 +624,17 @@ class TiMemSupplement:
                 if len(self.timem.snapshot) >= LONG_HISTORY_MINIMUM
                 else COMPACT_SOURCE_COUNT + 2
             )
+            # mem0 can map a single hit to several originals. Keep a short
+            # history's useful overflow available for PostgreSQL evidence packing.
+            refill = min(SOURCES, max(limit, len(mem0.source_ids)))
             if asks_current_state(query):
                 direct_ids = set(originals)
                 scope, _ = withdrawal_focus(
                     [s for s in self.timem.snapshot if s.message_id in direct_ids], query
                 )
                 if scope:
-                    limit += SOURCES
+                    refill = limit + SOURCES
+            limit = refill
         elif strategy == "episodes_and_hierarchy":
             supporting = (
                 source

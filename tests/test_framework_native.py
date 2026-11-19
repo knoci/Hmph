@@ -200,6 +200,8 @@ async def test_invalid_native_extraction_never_publishes_an_empty_ready_build(
     space = (await builds.spaces(identity.owner_id, requested.id))[0]
     assert space.quiesced and space.usage["reported_tokens"] == 120
     assert space.usage["processed_sources"] == 0
+    assert space.usage["failure_stage"] == "mem0"
+    assert space.usage["failure_code"] == "reference_invalid_output"
     assert not await builds.claim("paid-retry", backend="mem0")
     await FrameworkWorker(builds, backend).run_once()
     assert (await builds.spaces(identity.owner_id, requested.id))[0].status == "cleaned"

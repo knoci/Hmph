@@ -212,14 +212,28 @@ def forget_controls(pair, memories):
 
 
 async def project_context(
-    session, pair, turn, query, rows, candidates, short_term, *, shared_threads=()
+    session, pair, turn, query, rows, candidates, short_term, *,
+    shared_threads=(), thread_focus_sources=None,
 ):
     """One projection for every prompt channel, including original message bodies."""
     current = rows[0].id
+    state_ids = set(state_sources(short_term.data))
+    if thread_focus_sources is not None:
+        focus = thread_focus_sources | {current}
+        rows = [row for row in rows if row.id in focus]
+        candidates.raw = [source for source in candidates.raw if source.message_id in focus]
+        candidates.memories = [
+            hit for hit in candidates.memories
+            if hit.sources and all(source.message_id in focus for source in hit.sources)
+        ]
+        candidates.query_hint_source_ids = tuple(
+            source_id for source_id in candidates.query_hint_source_ids if source_id in focus
+        )
+        state_ids &= focus
     ids = {row.id for row in rows}
     ids |= {s.message_id for m in candidates.memories for s in m.sources}
     ids |= {s.message_id for s in candidates.raw}
-    ids |= set(state_sources(short_term.data))
+    ids |= state_ids
     messages = list(
         await session.scalars(
             select(Message)

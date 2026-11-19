@@ -20,7 +20,7 @@ import httpx
 
 from hmph.mem0_reference import EMBEDDING_MODEL, MEM0_REVISION, PLACEHOLDER
 from hmph.memory_build_types import BuildUsage, CleanupProof, FrameworkBuildError
-from hmph.reference_transport import ReferenceTransport
+from hmph.reference_transport import ReferenceTransport, failed_call_summary
 
 
 def _prepare_pgvector(admin, *, install=False, retiring=None):
@@ -318,6 +318,7 @@ class Mem0Backend:
                     usage_complete=all(r.get("usage") is not None for r in transport.records),
                     processed_sources=processed,
                     native_changes=changes,
+                    **failed_call_summary(transport.records, "mem0"),
                 )
                 transport.close()
         return self.usage

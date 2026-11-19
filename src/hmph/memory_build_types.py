@@ -111,3 +111,5 @@ class BuildUsage(BaseModel):
     usage_complete: bool
     processed_sources: int = Field(ge=0)
     native_changes: int = Field(ge=0)
+    failure_stage: Literal["mem0", "timem"] | None = None
+    failure_code: str | None = Field(default=None, pattern=r"^reference_[a-z_]+$", max_length=48)

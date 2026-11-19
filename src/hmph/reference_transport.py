@@ -37,6 +37,16 @@ def http_failure_code(status):
     return "reference_service_unavailable" if status == 503 else "reference_provider_error"
 
 
+def failed_call_summary(records, stage):
+    from hmph.eval_budget import ERROR_CODES
+
+    for record in reversed(records):
+        code = record.get("error_code")
+        if record.get("status") == "failed" and code in ERROR_CODES:
+            return {"failure_stage": stage, "failure_code": code}
+    return {}
+
+
 class ReferenceTransport(httpx.BaseTransport):
     def __init__(
         self,

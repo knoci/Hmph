@@ -1,5 +1,6 @@
 """Product evidence boundary: native IDs are untrusted, PostgreSQL owns text."""
 
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -90,6 +91,27 @@ class NativeReader:
         from hmph.online_memory import NativeSources
 
         return NativeSources(source_ids=tuple(self.ids))
+
+
+@pytest.mark.parametrize("same_chat", [True, False])
+def test_current_state_admits_the_reply_between_on_topic_sources(same_chat):
+    from hmph.online_memory import _prefer_bridged_update
+
+    chat = uuid4()
+    question = SimpleNamespace(
+        conversation_id=chat, source_order=10, content="Do I still need the yellow cycling pass?"
+    )
+    answer = SimpleNamespace(
+        conversation_id=chat if same_chat else uuid4(),
+        source_order=11, content="No, they stopped checking last week."
+    )
+    confirmation = SimpleNamespace(
+        conversation_id=chat, source_order=12,
+        content="Right, the yellow cycling pass is no longer required."
+    )
+    ranked = [question, confirmation, answer]
+    expected = [answer, question, confirmation] if same_chat else ranked
+    assert _prefer_bridged_update(ranked, question.content) == expected
 
 
 @pytest.mark.parametrize("historical", [False, True])
@@ -302,7 +324,8 @@ async def test_new_correction_reaches_generation_when_committed_facts_fill_the_b
     await service.finish(lease)
 
 
-async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conversation):
+@pytest.mark.parametrize("backend", ["mem0", "mem0_timem"])
+async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conversation, backend):
     from hmph.conversation import Conversation
     from hmph.memory import Memory
     from hmph.memory_build_types import CleanupProof
@@ -317,13 +340,15 @@ async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conv
         [MemoryProposal(predicate="employer", value="远山设计", quote=original.content)],
     )
     poem = await say(conversation, identity, "我正在背山居秋暝。", "poem")
+    await say(conversation, identity, "周末小幅版画试印。", "unrelated-thread")
+    await say(conversation, identity, "小幅版画的试印现在是什么状态？", "unrelated-question")
     builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
-    build = await builds.request(owner, character, "build", backend="mem0")
-    build_lease = await builds.claim("native", backend="mem0")
+    build = await builds.request(owner, character, "build", backend=backend)
+    build_lease = await builds.claim("native", backend=backend)
     await builds.quiesce(build_lease)
     assert await builds.publish(build_lease)
     selection = MemorySelection(
-        conversation.db, digest_key=conversation.digest_key, allow_mem0=True
+        conversation.db, digest_key=conversation.digest_key, allow_mem0=True, allow_timem=True
     )
     await selection.update(owner, character, "select", expected_revision=1, build_id=build.id)
     service = Conversation(
@@ -338,10 +363,12 @@ async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conv
         if key == "after-forget":
             assert request.workspace.retrieval_status == "build_unavailable"
             assert "山居秋暝" not in request.model_dump_json()
+            if backend == "mem0_timem":
+                assert "小幅版画" not in request.model_dump_json()
         await service.finish(lease)
         if key == "ready":
             receipt = await memory.forget_source(owner, poem.id, "forget", expected_revision=1)
-            cleanup = await builds.claim_cleanup("cleanup", backend="mem0")
+            cleanup = await builds.claim_cleanup("cleanup", backend=backend)
             await builds.finish_cleanup(
                 cleanup, CleanupProof(store_empty=True, auxiliary_empty=True)
             )

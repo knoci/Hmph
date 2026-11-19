@@ -2,6 +2,7 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
+from time import monotonic
 from uuid import uuid4
 
 from hmph.contracts import DomainError
@@ -44,14 +45,18 @@ class Worker:
     async def _generate(self, lease):
         request = await self.conversation.generation_request(lease)
         if self.model_mode == "deepseek":
+            generation_started = monotonic()
             try:
-                await self._generate_reviewed(lease, request)
+                await self._generate_reviewed(lease, request, generation_started=generation_started)
             except ProviderError as error:
                 if error.code not in {"provider_network", "provider_timeout"}:
                     raise
                 # Real replies are buffered before publication. A single
                 # network recovery stays in the same fenced user turn.
-                await self._generate_reviewed(lease, request, previous_failure=error.code)
+                await self._generate_reviewed(
+                    lease, request, generation_started=generation_started,
+                    previous_failure=error.code,
+                )
             return
         buffer = ""
         prefix = ""
@@ -80,7 +85,9 @@ class Worker:
                 raise DomainError("empty_model_output")
             await self.conversation.finish(lease)
 
-    async def _generate_reviewed(self, lease, request, *, previous_failure=None):
+    async def _generate_reviewed(
+        self, lease, request, *, generation_started, previous_failure=None
+    ):
         body = ""
         generation_usage = None
         async with aclosing(self.model.stream(request)) as stream:
@@ -96,6 +103,7 @@ class Worker:
             "provider": "deepseek",
             "model": self.model_name,
             "generation": generation_usage,
+            "generation_seconds": round(monotonic() - generation_started, 3),
             "guard": None,
             "complete": False,
         }

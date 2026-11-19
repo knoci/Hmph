@@ -247,15 +247,18 @@ class DeepSeekModel:
             )
         if request.workspace:
             workspace = request.workspace
+            excluded = {
+                "rounds", "query_count", "candidate_count", "coverage_semantics",
+                "budget_dropped", "policy_filtered_sources",
+            }
             if workspace.withdrawal_evidence:
                 content = (
                     "\nwithdrawal_evidence 关联原记录与后来的撤回候选。"
                     "核对两条原话的对象与范围。回答当前状态时，采用同一事项的最新明确变化。"
                 )
-                excluded = None
             else:
                 content = ""
-                excluded = {"withdrawal_evidence"}
+                excluded.add("withdrawal_evidence")
             evidence.append(
                 {
                     "role": "user",

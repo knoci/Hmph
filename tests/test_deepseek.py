@@ -51,6 +51,7 @@ async def test_review_exposes_only_canonical_source_ids_not_memory_entry_ids(con
 async def test_deepseek_stream_hides_reasoning_and_tracks_usage():
     from hmph.deepseek import DeepSeekModel
     from hmph.model_gateway import ChatMessage, GenerationRequest
+    from hmph.working_memory import EvidenceWorkspace, plan_recall
 
     seen = []
 
@@ -69,7 +70,13 @@ async def test_deepseek_stream_hides_reasoning_and_tracks_usage():
         return httpx.Response(200, text=body + "data: [DONE]\n\n")
 
     model = DeepSeekModel(SecretStr("test-key-not-real"), transport=httpx.MockTransport(endpoint))
-    request = GenerationRequest(messages=(ChatMessage(role="user", content="你好"),))
+    workspace = EvidenceWorkspace(
+        plan=plan_recall("你好"), slots=(), rounds=1, query_count=2,
+        candidate_count=12, budget_dropped=12, coverage="unknown",
+    )
+    request = GenerationRequest(
+        messages=(ChatMessage(role="user", content="你好"),), workspace=workspace
+    )
     deltas = [delta async for delta in model.stream(request)]
     assert "".join(delta.text for delta in deltas) == "你好。"
     assert "PRIVATE_REASONING" not in str(deltas)
@@ -77,6 +84,9 @@ async def test_deepseek_stream_hides_reasoning_and_tracks_usage():
     assert seen[0]["thinking"] == {"type": "disabled"}
     assert seen[0]["stream"] is True
     assert seen[0]["max_tokens"] <= 512
+    delivered = json.loads(seen[0]["messages"][1]["content"].split("\n", 1)[1])
+    assert delivered["coverage"] == "unknown"
+    assert {"candidate_count", "query_count", "budget_dropped"}.isdisjoint(delivered)
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from sqlalchemy import case, or_, select, update
 
 from hmph.contracts import ACTIVE, DomainError
 from hmph.event_changes import WITHDRAWAL, asks_current_state, withdrawal_focus, withdrawal_window
+from hmph.lexical import tokenize
 from hmph.memory import Memory
 from hmph.models import (
     MemoryBuild,
@@ -354,17 +355,28 @@ async def expand_sources(
         size = len(source.model_dump_json().encode()) + 64
         delta_sources.append((source, size))
     delta_unselected = None if focused_delta else 0
+    recovery_scope = status == "build_unavailable" and plan.intent in {"fact", "multi_hop"}
     if (
         ticket.backend == "mem0_timem"
         and terms
         and not scan_overflow
         and not focused_delta
-        and (len(delta_sources) >= SOURCES or sum(size for _, size in delta_sources) > budget // 2)
+        and (
+            recovery_scope
+            or len(delta_sources) >= SOURCES
+            or sum(size for _, size in delta_sources) > budget // 2
+        )
     ):
         scoped = []
+        required_matches = min(2, len(terms)) if recovery_scope else 1
         for source, size in delta_sources:
             text = source.content.lower()
-            if UPDATE_CUE.search(text) or any(term in text for term in terms):
+            update = UPDATE_CUE.search(text)
+            # A prior question about another subject isn't a correction merely
+            # because it contains a state cue such as "现在是".
+            if recovery_scope and text.rstrip().endswith(("？", "?")):
+                update = None
+            if update or sum(term in text for term in terms) >= required_matches:
                 scoped.append((source, size))
         delta_unselected = len(delta_sources) - len(scoped)
         delta_sources = scoped
@@ -389,6 +401,14 @@ async def expand_sources(
             session, turn, query, (), limit=CANDIDATES - len(delta) - len(rows)
         )
     candidates = [_raw(m, t, mapping.source_order) for mapping, m, t, _ in rows]
+    if (
+        ticket.backend == "mem0_timem"
+        and native.branch_status.get("timem") == "ok"
+        and not scope
+        and plan.intent in {"fact", "multi_hop"}
+        and asks_current_state(query)
+    ):
+        candidates = _prefer_bridged_update(candidates, focus_query)
     native_messages = {s.message_id for s in candidates}
     if delta_gap or filtered:
         candidates = []
@@ -488,6 +508,22 @@ async def expand_sources(
         native.requests if native.requests is not None else 1,
         min(CANDIDATES, len(rows) + len(delta) + fallback_scanned + len(memories)),
     ), audit
+
+
+def _prefer_bridged_update(candidates, query):
+    """Keep the answer between two on-topic turns in one conversation."""
+    terms = set(tokenize(query))
+    matching = {
+        (source.conversation_id, source.source_order): source
+        for source in candidates
+        if source.conversation_id and len(terms.intersection(tokenize(source.content))) >= 2
+    }
+    for index, source in enumerate(candidates):
+        previous = matching.get((source.conversation_id, source.source_order - 1))
+        following = matching.get((source.conversation_id, source.source_order + 1))
+        if previous and following and UPDATE_CUE.search(following.content):
+            return [source, *candidates[:index], *candidates[index + 1:]]
+    return candidates
 
 
 def _scope_withdrawal(source, terms, query, conditions):

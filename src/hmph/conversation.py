@@ -864,6 +864,7 @@ class Conversation:
                 shared_threads,
                 shared_threads_complete,
                 no_active_shared_thread,
+                thread_focus_sources,
             ) = await prepare_threads(session, pair, turn, lease.user_content, candidates)
 
             inspected_rows = {row.id: row.source_seq for row in rows}
@@ -876,6 +877,7 @@ class Conversation:
                 candidates,
                 short_term,
                 shared_threads=shared_threads,
+                thread_focus_sources=thread_focus_sources,
             )
             if no_active_shared_thread:
                 companion_plan = companion_plan.model_copy(update={"no_active_shared_thread": True})

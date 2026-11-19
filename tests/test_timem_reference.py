@@ -215,7 +215,7 @@ async def test_current_withdrawal_keeps_a_candidate_buffer_for_scoped_packing():
 
     ticket = SimpleNamespace(build_id=uuid4(), space_id=uuid4(), reference_time=None)
     change, support = uuid4(), uuid4()
-    other = tuple(uuid4() for _ in range(10))
+    other = tuple(uuid4() for _ in range(11))
 
     class Mem0:
         async def retrieve_sources(self, ticket, query):
@@ -242,6 +242,8 @@ async def test_current_withdrawal_keeps_a_candidate_buffer_for_scoped_packing():
     assert result.source_ids[0] == change
     assert support in result.source_ids  # Overfetch is only here, before the common context cap.
     ordinary = await reader.retrieve_sources(ticket, "晚间聊过什么？")
+    assert len(ordinary.source_ids) == 12
+    assert other[10] in ordinary.source_ids
     assert support not in ordinary.source_ids
 
 

@@ -20,6 +20,11 @@ THREAD_QUERY = re.compile(
 ENGLISH_THREAD_QUESTION = re.compile(
     r"^\s*(?:are we|do we|what|which)\b[^?]{0,80}\b(?:shared|joint)\s+plans?\b", re.I
 )
+NAMED_STATUS_QUESTION = re.compile(
+    r"\s*(?P<topic>[^，,。！!？?；;、\n]{2,120}?)"
+    r"(?:还在(?:继续|跟进)|现在(?:是)?什么状态|目前(?:是)?什么状态|暂停了|恢复了)"
+    r"(?:吗|么|呢)?[？?]?\s*"
+)
 TRANSITIONS = {
     "open": {"paused", "resolved", "dropped"},
     "paused": {"open", "resolved", "dropped"},
@@ -251,6 +256,12 @@ class SharedThreads:
 async def prepare_threads(session, pair, turn, query, candidates):
     english_question = bool(ENGLISH_THREAD_QUESTION.search(query))
     thread_query = english_question or bool(THREAD_QUERY.search(query))
+    question = query.rstrip()
+    named_status = (
+        NAMED_STATUS_QUESTION.fullmatch(question)
+        if question.endswith(("吗", "么", "呢", "?", "？")) or "什么状态" in question
+        else None
+    )
     known = list(
         await session.scalars(
             select(SharedThread)
@@ -259,6 +270,7 @@ async def prepare_threads(session, pair, turn, query, candidates):
                 or_(
                     SharedThread.status == "open",
                     func.strpos(query.lower(), func.lower(SharedThread.topic)) > 0,
+                    named_status is not None,
                 ),
             )
             .order_by(SharedThread.id)
@@ -269,6 +281,9 @@ async def prepare_threads(session, pair, turn, query, candidates):
     folded = query.casefold()
     terms = set(query_terms(query))
     matches = [thread for thread in known if thread.topic.casefold() in folded][:3]
+    status_matches = _named_status_matches(named_status, known)
+    if len(status_matches) == 1:
+        matches = status_matches
     active_list = False
     if not matches:
         ranked = [(len(terms.intersection(query_terms(t.topic))), t) for t in threads]
@@ -328,7 +343,30 @@ async def prepare_threads(session, pair, turn, query, candidates):
     no_active = (
         not matches and not threads and thread_query and (english_question or requested(query))
     )
-    return tuple(offered), active_list and len(offered) == len(threads), no_active
+    focus_sources = None
+    if len(status_matches) == 1 and offered:
+        thread = offered[0]
+        focus_sources = set(
+            await session.scalars(
+                select(SharedThreadSource.message_id).where(
+                    SharedThreadSource.thread_id == thread.id
+                )
+            )
+        )
+        focus_sources.add(thread.source_message_id)
+        focus_sources.update(s.message_id for s in candidates.raw if thread.topic in s.content)
+    return tuple(offered), active_list and len(offered) == len(threads), no_active, focus_sources
+
+
+def _named_status_matches(match, known):
+    if match is None:
+        return []
+    topic = re.sub(r"^(?:请问|咱们|我们)+", "", match["topic"]).strip(" 「」『』“”")
+    topic = topic.replace("的", "")
+    exact = [thread for thread in known if topic == thread.topic.replace("的", "")]
+    if exact or len(topic) < 4:
+        return exact
+    return [thread for thread in known if thread.topic.replace("的", "").endswith(topic)]
 
 
 async def apply_thread_command(session, pair, turn, message, *, proposed=None):
