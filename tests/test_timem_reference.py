@@ -247,6 +247,34 @@ async def test_current_withdrawal_keeps_a_candidate_buffer_for_scoped_packing():
     assert support not in ordinary.source_ids
 
 
+async def test_combined_read_starts_both_independent_branches():
+    import asyncio
+
+    from hmph.online_memory import NativeSources
+
+    ticket = SimpleNamespace(build_id=uuid4(), space_id=uuid4())
+    mem0_started, timem_started = asyncio.Event(), asyncio.Event()
+    direct, linked = uuid4(), uuid4()
+
+    class Mem0:
+        async def retrieve_sources(self, ticket, query):
+            mem0_started.set()
+            await timem_started.wait()
+            return NativeSources(source_ids=(direct,))
+
+    class TiMem:
+        async def retrieve(self, query):
+            timem_started.set()
+            await mem0_started.wait()
+            return (), (str(linked),)
+
+    reader = TiMemSupplement(Mem0(), TiMem(), build_id=ticket.build_id, space_id=ticket.space_id)
+    async with asyncio.timeout(1):
+        result = await reader.retrieve_sources(ticket, "what changed")
+    assert result.source_ids == (direct, linked)
+    assert result.branch_status == {"mem0": "ok", "timem": "ok"}
+
+
 async def test_empty_combination_keeps_the_branch_timeout_instead_of_reporting_no_match():
     import time
 

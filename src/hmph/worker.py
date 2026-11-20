@@ -43,11 +43,16 @@ class Worker:
         self.reviewer = reviewer
 
     async def _generate(self, lease):
+        preparation_started = monotonic()
         request = await self.conversation.generation_request(lease)
         if self.model_mode == "deepseek":
             generation_started = monotonic()
+            preparation_seconds = round(generation_started - preparation_started, 3)
             try:
-                await self._generate_reviewed(lease, request, generation_started=generation_started)
+                await self._generate_reviewed(
+                    lease, request, generation_started=generation_started,
+                    preparation_seconds=preparation_seconds,
+                )
             except ProviderError as error:
                 if error.code not in {"provider_network", "provider_timeout"}:
                     raise
@@ -55,7 +60,7 @@ class Worker:
                 # network recovery stays in the same fenced user turn.
                 await self._generate_reviewed(
                     lease, request, generation_started=generation_started,
-                    previous_failure=error.code,
+                    preparation_seconds=preparation_seconds, previous_failure=error.code,
                 )
             return
         buffer = ""
@@ -86,7 +91,7 @@ class Worker:
             await self.conversation.finish(lease)
 
     async def _generate_reviewed(
-        self, lease, request, *, generation_started, previous_failure=None
+        self, lease, request, *, generation_started, preparation_seconds, previous_failure=None
     ):
         body = ""
         generation_usage = None
@@ -99,11 +104,14 @@ class Worker:
                     generation_usage = delta.usage.model_dump()
         if not body.strip():
             raise DomainError("empty_model_output")
+        publication_started = monotonic()
         metadata = {
             "provider": "deepseek",
             "model": self.model_name,
             "generation": generation_usage,
-            "generation_seconds": round(monotonic() - generation_started, 3),
+            "queue_seconds": lease.queue_seconds,
+            "preparation_seconds": preparation_seconds,
+            "generation_seconds": round(publication_started - generation_started, 3),
             "guard": None,
             "complete": False,
         }
@@ -157,6 +165,7 @@ class Worker:
             )
             remaining = remaining[length:]
             segment_index += 1
+        metadata["publication_seconds"] = round(monotonic() - publication_started, 3)
         await self.conversation.finish(lease, usage=metadata)
 
     async def _heartbeat(self, lease):

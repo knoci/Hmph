@@ -198,6 +198,52 @@ async def test_current_withdrawal_keeps_exact_scope_and_condition(
     assert not request.workspace.withdrawal_evidence
 
 
+async def test_low_ranked_revocation_and_exception_survive_context_budget(conversation):
+    identity = await conversation.bootstrap()
+    owner, character = identity.owner_id, identity.character_id
+    history = await conversation.create_chat(owner, character, "previous-permission")
+    change = await conversation.create_chat(owner, character, "access-change")
+    for chat, messages in (
+        (history, [
+            f"Sample {index}. The studio card allows after-hours entry. " + "Other notes. " * 26
+            for index in range(8)
+        ]),
+        (change, [
+            "I removed you from the studio card access list.",
+            "Does that mean the old studio card no longer counts for entry?",
+            "Right. Don't use the old card. If I need help, I'll send a one-day pass.",
+        ]),
+    ):
+        for index, message in enumerate(messages):
+            key = f"{chat.id}-{index}"
+            turn = await conversation.accept(owner, chat.id, f"history-{key}", message)
+            await conversation.cancel(owner, turn.id, f"cancel-{key}")
+    originals = await conversation.messages(owner, history.id)
+    revoked, confirmation, exception = await conversation.messages(owner, change.id)
+    builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
+    build = await builds.request(owner, character, "mem", backend="mem0_timem")
+    writer = await builds.claim("fixture", backend="mem0_timem")
+    await builds.quiesce(writer)
+    assert await builds.publish(writer)
+    selection = MemorySelection(
+        conversation.db, digest_key=conversation.digest_key, allow_timem=True
+    )
+    await selection.update(
+        owner, character, "select", expected_revision=1, build_id=build.id
+    )
+    ranked = (*originals, confirmation, exception, revoked)
+    conversation.source_reader = NativeReader([m.id for m in ranked])
+    chat = await conversation.create_chat(owner, character, "current")
+    query = "Can I currently use the old studio card for entry?"
+    await conversation.accept(owner, chat.id, "q", query)
+    request = await conversation.generation_request(await conversation.claim("reader"))
+    sources = {item.message_id: item for item in request.raw_evidence}
+    assert revoked.id in sources and exception.id in sources
+    admitted = sources[exception.id]
+    assert "Don't use the old card. If I need help, I'll send a one-day pass." in admitted.content
+    assert exception.content[admitted.start_offset:admitted.end_offset] == admitted.content
+
+
 async def test_timem_refresh_keeps_the_selected_snapshot_until_explicit_switch(conversation):
     from hmph.conversation import Conversation
 
@@ -341,7 +387,9 @@ async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conv
     )
     poem = await say(conversation, identity, "我正在背山居秋暝。", "poem")
     await say(conversation, identity, "周末小幅版画试印。", "unrelated-thread")
-    await say(conversation, identity, "小幅版画的试印现在是什么状态？", "unrelated-question")
+    unrelated = await say(
+        conversation, identity, "小幅版画的试印现在是什么状态？", "unrelated-question"
+    )
     builds = MemoryBuilds(conversation.db, digest_key=conversation.digest_key)
     build = await builds.request(owner, character, "build", backend=backend)
     build_lease = await builds.claim("native", backend=backend)
@@ -373,6 +421,21 @@ async def test_mem0_keeps_unrelated_current_fact_after_forget_retires_build(conv
                 cleanup, CleanupProof(store_empty=True, auxiliary_empty=True)
             )
             assert (await memory.deletion(owner, receipt.id)).status == "completed"
+    if backend == "mem0_timem":
+        chat = await service.create_chat(owner, character, "social-recovery")
+        first_message = "外面的风很轻，我想坐一会儿。"
+        await service.accept(owner, chat.id, "first", first_message)
+        await service.finish(await service.claim("reader"))
+        await service.accept(owner, chat.id, "next", "再等一等。")
+        lease = await service.claim("reader")
+        request = await service.generation_request(lease)
+        assert request.workspace.retrieval_status == "build_unavailable"
+        assert "小幅版画" not in request.model_dump_json()
+        assert request.messages[-2].content == first_message
+        explanation = await service.memory_explanation(owner, lease.turn_id)
+        assert unrelated.id not in explanation["source_ids"]
+        assert explanation["context"]["delta_unselected"] > 0
+        await service.finish(lease)
 
 
 async def test_successful_graph_result_is_complemented_by_matching_canonical_original(conversation):
@@ -546,6 +609,7 @@ async def test_timem_keeps_older_evidence_through_unrelated_backlog(
     conversation, filler_count, correction_kind
 ):
     from hmph.conversation import Conversation
+    from hmph.memory import Memory
 
     identity = await conversation.bootstrap()
     owner, character = identity.owner_id, identity.character_id
@@ -630,6 +694,19 @@ async def test_timem_keeps_older_evidence_through_unrelated_backlog(
         request = await service.generation_request(lease)
         assert request.workspace.backend == "mem0_timem"
         assert {old.id, correction.id} <= {source.message_id for source in request.raw_evidence}
+        await service.finish(lease)
+
+        await Memory(conversation.db, digest_key=conversation.digest_key).forget_source(
+            owner, old.id, "retire", expected_revision=1
+        )
+        social = await service.create_chat(owner, character, "unrelated-after-retirement")
+        await service.accept(owner, social.id, "weather", "我想听会儿雨声。")
+        lease = await service.claim("unrelated-after-retirement")
+        request = await service.generation_request(lease)
+        assert request.workspace.retrieval_status == "build_unavailable"
+        audit = (await service.memory_explanation(owner, lease.turn_id))["context"]
+        assert audit["delta_scope"] == "matched" and audit["delta_scanned"] > 0
+        assert correction.id not in {source.message_id for source in request.raw_evidence}
         await service.finish(lease)
 
 

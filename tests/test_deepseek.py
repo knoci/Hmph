@@ -49,9 +49,12 @@ async def test_review_exposes_only_canonical_source_ids_not_memory_entry_ids(con
 
 
 async def test_deepseek_stream_hides_reasoning_and_tracks_usage():
+    from datetime import datetime
+    from uuid import uuid4
+
     from hmph.deepseek import DeepSeekModel
     from hmph.model_gateway import ChatMessage, GenerationRequest
-    from hmph.working_memory import EvidenceWorkspace, plan_recall
+    from hmph.working_memory import EvidenceWorkspace, RawEvidence, plan_recall
 
     seen = []
 
@@ -71,11 +74,18 @@ async def test_deepseek_stream_hides_reasoning_and_tracks_usage():
 
     model = DeepSeekModel(SecretStr("test-key-not-real"), transport=httpx.MockTransport(endpoint))
     workspace = EvidenceWorkspace(
-        plan=plan_recall("你好"), slots=(), rounds=1, query_count=2,
+        plan=plan_recall("我之前跟你提过哪家店吗？"), slots=(), rounds=1, query_count=2,
         candidate_count=12, budget_dropped=12, coverage="unknown",
     )
+    source = RawEvidence(
+        message_id=uuid4(), message_revision=5, role="user",
+        recorded_at=datetime.fromisoformat("2026-09-03T18:12:00-07:00"),
+        content="今天改到周六。", start_offset=10, end_offset=18, truncated=True,
+        source_timezone="Etc/GMT+7", source_order=37,
+    )
     request = GenerationRequest(
-        messages=(ChatMessage(role="user", content="你好"),), workspace=workspace
+        messages=(ChatMessage(role="user", content="你好"),), workspace=workspace,
+        raw_evidence=(source,),
     )
     deltas = [delta async for delta in model.stream(request)]
     assert "".join(delta.text for delta in deltas) == "你好。"
@@ -84,9 +94,19 @@ async def test_deepseek_stream_hides_reasoning_and_tracks_usage():
     assert seen[0]["thinking"] == {"type": "disabled"}
     assert seen[0]["stream"] is True
     assert seen[0]["max_tokens"] <= 512
+    assert "区分目前找不到相关记录" in seen[0]["messages"][0]["content"]
     delivered = json.loads(seen[0]["messages"][1]["content"].split("\n", 1)[1])
     assert delivered["coverage"] == "unknown"
     assert {"candidate_count", "query_count", "budget_dropped"}.isdisjoint(delivered)
+    [delivered_source] = json.loads(seen[0]["messages"][2]["content"].split("\n", 1)[1])
+    assert delivered_source["content"] == source.content
+    assert delivered_source["message_id"] == str(source.message_id)
+    assert delivered_source["recorded_at"] == "2026-09-03T18:12:00-07:00"
+    assert delivered_source["truncated"]
+    assert {"message_revision", "start_offset", "end_offset", "source_order"}.isdisjoint(
+        delivered_source
+    )
+    assert request.raw_evidence[0].message_revision == 5
 
 
 @pytest.mark.parametrize(

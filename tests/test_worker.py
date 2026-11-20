@@ -70,7 +70,8 @@ async def test_deepseek_retries_one_network_failure_within_the_same_turn(convers
     saved = await conversation.get_turn(identity.owner_id, turn.id)
     assert saved.status == "completed" and model.attempts == 2
     assert saved.usage["generation_attempts"] == 2
-    assert saved.usage["generation_seconds"] >= 0
+    for phase in ("queue", "preparation", "generation", "publication"):
+        assert saved.usage[f"{phase}_seconds"] >= 0
     assert saved.usage["previous_generation_error"] == "provider_network"
     assert saved.usage["complete"] is False
     reply = (await conversation.messages(identity.owner_id, chat.id))[-1].content

@@ -463,6 +463,7 @@ class Conversation:
                 deadline=turn.deadline,
                 remaining_seconds=(turn.deadline - now).total_seconds(),
                 user_content=content,
+                queue_seconds=round(max(0, (now - turn.created_at).total_seconds()), 3),
             )
 
     async def _lease(self, session, lease):
@@ -924,7 +925,10 @@ class Conversation:
             ]
             raw_evidence = []
             for item in ordered:
-                size = len(item.model_dump_json().encode("utf-8")) + 64
+                packed_json = (
+                    item.prompt_json() if isinstance(item, RawEvidence) else item.model_dump_json()
+                )
+                size = len(packed_json.encode("utf-8")) + 64
                 if (
                     size + evidence_bytes > evidence_budget
                     or len(evidence) + len(raw_evidence) >= 12

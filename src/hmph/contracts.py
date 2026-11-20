@@ -67,3 +67,4 @@ class Lease(View):
     deadline: datetime
     remaining_seconds: float
     user_content: str
+    queue_seconds: float | None = None

@@ -293,13 +293,22 @@ async def expand_sources(
     rows = list(
         (
             await session.execute(
-                select(MemoryNativeSource, Message, Turn, MemoryBuildSource)
+                select(
+                    MemoryNativeSource, Message, Turn, MemoryBuildSource, MemoryTask.source_order
+                )
                 .join(Message, MemoryNativeSource.message_id == Message.id)
                 .join(Turn, Message.turn_id == Turn.id)
                 .join(
                     MemoryBuildSource,
                     (MemoryBuildSource.build_id == ticket.build_id)
                     & (MemoryBuildSource.message_id == Message.id),
+                )
+                .outerjoin(
+                    MemoryTask,
+                    (MemoryTask.source_message_id == Message.id)
+                    & (MemoryTask.source_revision == Message.revision)
+                    & (MemoryTask.pair_id == ticket.pair_id)
+                    & (MemoryTask.source_order == MemoryNativeSource.source_order),
                 )
                 .where(
                     MemoryNativeSource.space_id == ticket.space_id,
@@ -309,7 +318,7 @@ async def expand_sources(
         ).all()
     )
     valid = len(rows) == len(source_ids)
-    for mapping, message, source_turn, frozen in rows:
+    for mapping, message, source_turn, frozen, _ in rows:
         if (
             source_turn.pair_id != ticket.pair_id
             or message.deleted
@@ -327,34 +336,49 @@ async def expand_sources(
     else:
         native_rank = {str(source_id): index for index, source_id in enumerate(source_ids)}
         rows.sort(key=lambda row: native_rank[row[0].native_id])
-    scope, conditions = set(), {}
+    candidates = [_raw(m, t, order) for _, m, t, _, order in rows if order is not None]
+    scope, conditions, changes = set(), {}, ()
     if (
         ticket.backend == "mem0_timem"
         and plan.intent in {"fact", "multi_hop"}
         and asks_current_state(query)
     ):
-        scope, conditions = withdrawal_focus(
-            [_raw(m, t, mapping.source_order) for mapping, m, t, _ in rows]
+        focus = withdrawal_focus(
+            candidates
             + [_raw(m, t, task.source_order) for m, t, task in delta if retainable(m.content)],
             focus_query,
         )
+        scope, conditions, changes = focus.terms, focus.conditions, focus.changes
     out_of_scope = 0
     selected, used, filtered, truncated = [], 0, 0, 0
     delta_sources = []
+    delta_unselected = None if focused_delta else 0
+    recovery_social = (
+        ticket.backend == "mem0_timem"
+        and status == "build_unavailable"
+        and plan.intent == "social"
+    )
     for message, source_turn, task in delta:
         if not retainable(message.content):
             filtered += 1
             # Omitted boundaries must not leave pre-build values in context.
             continue
+        if recovery_social and source_turn.conversation_id != turn.conversation_id:
+            content = message.content.lower()
+            if not terms or sum(term in content for term in terms) < min(2, len(terms)):
+                # An unfiltered recent window can replay an unrelated chat as
+                # evidence while the replacement snapshot is being built.
+                if delta_unselected is not None:
+                    delta_unselected += 1
+                continue
         source = _raw(message, source_turn, task.source_order)
         if scope:
             source = _scope_withdrawal(source, scope, focus_query, conditions)
             if source is None:
                 out_of_scope += 1
                 continue
-        size = len(source.model_dump_json().encode()) + 64
+        size = len(source.prompt_json().encode()) + 64
         delta_sources.append((source, size))
-    delta_unselected = None if focused_delta else 0
     recovery_scope = status == "build_unavailable" and plan.intent in {"fact", "multi_hop"}
     if (
         ticket.backend == "mem0_timem"
@@ -378,7 +402,7 @@ async def expand_sources(
                 update = None
             if update or sum(term in text for term in terms) >= required_matches:
                 scoped.append((source, size))
-        delta_unselected = len(delta_sources) - len(scoped)
+        delta_unselected += len(delta_sources) - len(scoped)
         delta_sources = scoped
     delta_truncated = 0
     for source, size in delta_sources:
@@ -400,8 +424,11 @@ async def expand_sources(
         fallback, fallback_scanned = await search_raw(
             session, turn, query, (), limit=CANDIDATES - len(delta) - len(rows)
         )
-    candidates = [_raw(m, t, mapping.source_order) for mapping, m, t, _ in rows]
-    if (
+    if changes:
+        ordered = dict.fromkeys((*changes[:2], *tuple(conditions)[:2]))
+        priority = {source_id: rank for rank, source_id in enumerate(ordered)}
+        candidates.sort(key=lambda source: priority.get(source.message_id, len(priority)))
+    elif (
         ticket.backend == "mem0_timem"
         and native.branch_status.get("timem") == "ok"
         and not scope
@@ -409,7 +436,7 @@ async def expand_sources(
         and asks_current_state(query)
     ):
         candidates = _prefer_bridged_update(candidates, focus_query)
-    native_messages = {s.message_id for s in candidates}
+    native_messages = {s.message_id: s for s in candidates}
     if delta_gap or filtered:
         candidates = []
     else:
@@ -423,21 +450,24 @@ async def expand_sources(
     for source in candidates:
         if source.message_id in seen or len(selected) >= SOURCES:
             continue
-        # A fallback match still needs pair-global source order and permission.
-        task = await session.scalar(
-            select(MemoryTask).where(
-                MemoryTask.source_message_id == source.message_id,
-                MemoryTask.source_revision == source.message_revision,
-                MemoryTask.pair_id == ticket.pair_id,
-                MemoryTask.source_order <= ticket.cutoff,
+        if source.message_id in native_messages:
+            source = native_messages[source.message_id]
+        else:
+            # Graphiti's complementary raw lookup still needs the pair-global order.
+            task = await session.scalar(
+                select(MemoryTask).where(
+                    MemoryTask.source_message_id == source.message_id,
+                    MemoryTask.source_revision == source.message_revision,
+                    MemoryTask.pair_id == ticket.pair_id,
+                    MemoryTask.source_order <= ticket.cutoff,
+                )
             )
-        )
-        if task is None or source.role != "user":
-            continue
-        message = await session.get(Message, source.message_id)
-        if message.deleted or not retainable(message.content):
-            continue
-        source = _raw(message, await session.get(Turn, message.turn_id), task.source_order)
+            if task is None or source.role != "user":
+                continue
+            message = await session.get(Message, source.message_id)
+            if message.deleted or not retainable(message.content):
+                continue
+            source = _raw(message, await session.get(Turn, message.turn_id), task.source_order)
         if scope:
             source = _scope_withdrawal(source, scope, focus_query, conditions)
             if source is None:
@@ -452,7 +482,7 @@ async def expand_sources(
                 "truncated": source.truncated or start > 0 or end < len(source.content),
             }
         )
-        size = len(source.model_dump_json().encode()) + 64
+        size = len(source.prompt_json().encode()) + 64
         if used + size <= budget:
             selected.append(source)
             seen.add(source.message_id)
@@ -460,7 +490,7 @@ async def expand_sources(
             truncated += int(source.truncated)
     # Presentation order reflects observation order, never event-time sorting.
     selected.sort(key=lambda s: s.source_order)
-    selected_native = native_messages.intersection(s.message_id for s in selected)
+    selected_native = native_messages.keys() & {s.message_id for s in selected}
     audit = {
         "backend": ("mem0_timem" if native.branch_status else ticket.backend)
         if status == "ok" and selected_native
@@ -559,7 +589,7 @@ def _correction_excerpt(source, available_bytes):
             "truncated": True,
         }
     )
-    size = len(excerpt.model_dump_json().encode()) + 64
+    size = len(excerpt.prompt_json().encode()) + 64
     return (excerpt, size) if size <= available_bytes else None
 
 

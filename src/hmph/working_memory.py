@@ -81,6 +81,12 @@ class RawEvidence(BaseModel):
     source_order: int | None = None
     conversation_id: UUID | None = Field(default=None, exclude=True)
 
+    def prompt_json(self) -> str:
+        """Keep provenance identity and observation time in the model's evidence."""
+        return self.model_dump_json(
+            exclude={"message_revision", "start_offset", "end_offset", "source_order"}
+        )
+
 
 class EvidenceSlot(BaseModel):
     name: str

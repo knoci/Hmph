@@ -320,7 +320,7 @@ class LocalTiMem:
         changes = []
         withdrawal_sources = ()
         conditions = ()
-        scope = set()
+        direct_changes = ()
         if not windows and plan_recall(query).intent in {"fact", "multi_hop"}:
             anchors = list(dict.fromkeys((*semantic[:3], *exact[:3])))
             withdrawal_sources = tuple(
@@ -330,8 +330,9 @@ class LocalTiMem:
                 for index in (update, prior)
             )
             if asks_current_state(query):
-                scope, followups = withdrawal_focus(self.snapshot, query)
-                conditions = tuple(positions[str(item)] for item in followups)[:2]
+                focus = withdrawal_focus(self.snapshot, query)
+                direct_changes = tuple(positions[str(item)] for item in focus.changes[:2])
+                conditions = tuple(positions[str(item)] for item in focus.conditions)[:2]
             for i, source in enumerate(self.snapshot):
                 if not UPDATE_CUE.search(source.content):
                     continue
@@ -372,6 +373,7 @@ class LocalTiMem:
                 *temporal,
                 *withdrawal_sources,
                 *conditions,
+                *direct_changes,
                 *change_sources,
                 *semantic[:2],
                 *links[:1],
@@ -381,8 +383,8 @@ class LocalTiMem:
                 *semantic[2:],
             )
         )
-        if scope:
-            # PostgreSQL will scope and pack the confirmed event under the same budget.
+        if direct_changes:
+            # PostgreSQL will pack the confirmed event under the same budget.
             selected = list(ranked)[:SOURCES]
         elif len(self.snapshot) < LONG_HISTORY_MINIMUM:
             selected = list(ranked)[:COMPACT_SOURCE_COUNT]
@@ -553,6 +555,18 @@ class TiMemSupplement:
         self.build_id, self.space_id = build_id, space_id
         self.originals = originals
 
+    async def _read_mem0(self, ticket, query):
+        from hmph.online_memory import NativeSources
+
+        try:
+            async with asyncio.timeout(1.25):
+                mem0 = await self.mem0.retrieve_sources(ticket, query)
+            return mem0, "ok" if mem0.source_ids else "empty"
+        except TimeoutError:
+            return NativeSources(requests=None), "timeout"
+        except Exception:
+            return NativeSources(requests=None), "reader_failed"
+
     async def retrieve_sources(self, ticket, query):
         from itertools import zip_longest
         from uuid import UUID
@@ -562,52 +576,47 @@ class TiMemSupplement:
 
         if (ticket.build_id, ticket.space_id) != (self.build_id, self.space_id):
             raise SourceRetrievalError("reader_failed")
-        try:
-            async with asyncio.timeout(1.25):
-                mem0 = await self.mem0.retrieve_sources(ticket, query)
-            mem0_status = "ok" if mem0.source_ids else "empty"
-        except TimeoutError:
-            mem0, mem0_status = NativeSources(requests=None), "timeout"
-        except Exception:
-            mem0, mem0_status = NativeSources(requests=None), "reader_failed"
-        clauses = QUESTION_JOIN.split(query, maxsplit=1)
-        strategy = "hierarchical"
-        timem_requests = 1
-        originals = ()
-        timem = ()
-        try:
-            async with asyncio.timeout(1.25):
-                leaves = await self.timem.linked_sources(clauses) if len(clauses) == 2 else ()
-                if leaves:
-                    strategy, timem_requests = "linked_exchanges", 2
-                else:
-                    _, leaves = await self.timem.retrieve(query)
-                timem = tuple(dict.fromkeys(UUID(item) for item in leaves))[:CANDIDATES]
-                if self.originals and strategy == "hierarchical":
-                    timem_requests += 1
-                    episodes = await self.timem.episode_sources(query)
-                    if episodes:
-                        ranked = episodes
-                    elif ticket.reference_time is not None:
-                        ranked = await self.timem.original_sources(
-                            query,
-                            reference_time=ticket.reference_time,
-                            source_timezone=ticket.source_timezone,
-                        )
+        async with asyncio.TaskGroup() as reads:
+            mem0_task = reads.create_task(self._read_mem0(ticket, query))
+            clauses = QUESTION_JOIN.split(query, maxsplit=1)
+            strategy = "hierarchical"
+            timem_requests = 1
+            originals = ()
+            timem = ()
+            try:
+                async with asyncio.timeout(1.25):
+                    leaves = await self.timem.linked_sources(clauses) if len(clauses) == 2 else ()
+                    if leaves:
+                        strategy, timem_requests = "linked_exchanges", 2
                     else:
-                        ranked = await self.timem.original_sources(query)
-                    if ranked:
-                        direct = tuple(dict.fromkeys(UUID(item) for item in ranked))
-                        timem = tuple(dict.fromkeys((*direct, *timem)))[:CANDIDATES]
-                        originals = direct
-                        strategy = (
-                            "episodes_and_hierarchy" if episodes else "originals_and_hierarchy"
-                        )
-            timem_status = "ok" if timem else "empty"
-        except TimeoutError:
-            timem_status = "partial_timeout" if timem else "timeout"
-        except Exception:
-            timem_status = "partial_failure" if timem else "reader_failed"
+                        _, leaves = await self.timem.retrieve(query)
+                    timem = tuple(dict.fromkeys(UUID(item) for item in leaves))[:CANDIDATES]
+                    if self.originals and strategy == "hierarchical":
+                        timem_requests += 1
+                        episodes = await self.timem.episode_sources(query)
+                        if episodes:
+                            ranked = episodes
+                        elif ticket.reference_time is not None:
+                            ranked = await self.timem.original_sources(
+                                query,
+                                reference_time=ticket.reference_time,
+                                source_timezone=ticket.source_timezone,
+                            )
+                        else:
+                            ranked = await self.timem.original_sources(query)
+                        if ranked:
+                            direct = tuple(dict.fromkeys(UUID(item) for item in ranked))
+                            timem = tuple(dict.fromkeys((*direct, *timem)))[:CANDIDATES]
+                            originals = direct
+                            strategy = (
+                                "episodes_and_hierarchy" if episodes else "originals_and_hierarchy"
+                            )
+                timem_status = "ok" if timem else "empty"
+            except TimeoutError:
+                timem_status = "partial_timeout" if timem else "timeout"
+            except Exception:
+                timem_status = "partial_failure" if timem else "reader_failed"
+        mem0, mem0_status = mem0_task.result()
         limit = CANDIDATES
         if strategy == "linked_exchanges":
             merged = dict.fromkeys((*timem, *mem0.source_ids))
@@ -629,10 +638,10 @@ class TiMemSupplement:
             refill = min(SOURCES, max(limit, len(mem0.source_ids)))
             if asks_current_state(query):
                 direct_ids = set(originals)
-                scope, _ = withdrawal_focus(
+                focus = withdrawal_focus(
                     [s for s in self.timem.snapshot if s.message_id in direct_ids], query
                 )
-                if scope:
+                if focus.changes:
                     refill = limit + SOURCES
             limit = refill
         elif strategy == "episodes_and_hierarchy":
