@@ -33,14 +33,6 @@ TRANSITIONS = {
 }
 
 
-def interaction_rhythm(texts):
-    """A bounded view of actual publication, never planned or cancelled drafts."""
-    return {
-        "recent_questions": sum(bool(re.search(r"[?？]", text)) for text in texts),
-        "recent_advice": sum(bool(re.search(r"建议|可以试试|不妨", text)) for text in texts),
-    }
-
-
 class SharedThreads:
     def __init__(self, conversation):
         self.conversation = conversation

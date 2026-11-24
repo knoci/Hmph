@@ -26,30 +26,8 @@ PARTICIPATION = re.compile(
     re.I,
 )
 OUTSIDE = re.compile(
-    r"\b(?:hiking|hike|bike ride|trail|outdoors|outdoor|cycling|picnic|camping)\b"
-    r"|徒步|骑行|户外|野餐|露营",
-    re.I,
+    r"\b(?:hiking|hike|bike ride|trail|outdoors|outdoor|cycling)\b|徒步|骑行|户外", re.I
 )
-PLACE_QUERY = re.compile(r"\b(?:places|venues|locations|spots)\b|去过哪|哪些地方|地点", re.I)
-ACTIVITY_QUERY = re.compile(r"\bactivities\b|做过什么|哪些活动", re.I)
-VISIT = re.compile(
-    r"\b(?:(?:went|walked|headed|drove|travel(?:led|ed)|cycled|rode)\s+(?:to|through)|"
-    r"visited|checked out|tried out|stumbled (?:up)?on|volunteer(?:ed|ing)\s+at|"
-    r"(?:stayed|dined|ate)\s+at|(?:found|discovered)\s+(?:a|the)\s+(?:new\s+)?"
-    r"(?:place|spot|area|space))\b|去了|去过|参观了|逛了|发现了",
-    re.I,
-)
-PAST_EVENT = re.compile(
-    r"\b(?:went|visited|had|did|joined|took|started|tried|played|volunteer(?:ed|ing)|"
-    r"hiked|saw|worked|made|spent)\b|已经|昨天|上周|上个月|参加了|做过|去过|去了",
-    re.I,
-)
-FUTURE_EVENT = re.compile(
-    r"\b(?:going (?:to|on)|planning to|plan to|will (?:go|visit)|would love to|"
-    r"can.t wait (?:to|for))\b|准备去|打算去|计划去",
-    re.I,
-)
-SENTENCE = re.compile(r"[^.!?。！？\n]+")
 
 
 def episode_candidates(snapshot, query):
@@ -74,14 +52,9 @@ def episode_candidates(snapshot, query):
         cue = re.sub(rf"\b{re.escape(name)}\b(?:['’]s)?", "I", cue, flags=re.I)
     if named:
         cue = re.sub(r"\b(?:his|her|their)\b", "my", cue, flags=re.I)
-    places = relation is not None and PLACE_QUERY.search(query) is not None
     if relation is not None:
         mention = re.compile(RELATIONS[relation] + RELATION_ALIASES.get(relation, ""), re.I)
-        cue += (
-            f" I visited a place or went to an event with my {relation}."
-            if places
-            else f" I went somewhere or did an activity with my {relation}."
-        )
+        cue += f" I went somewhere or did an activity with my {relation}."
     else:
         mention = ENROLLMENT
         cue += " I took a class, joined a group, enrolled in a course, or attended a workshop."
@@ -98,29 +71,5 @@ def episode_candidates(snapshot, query):
             bias -= 0.12
         if courses and PARTICIPATION.search(body):
             bias += 0.10
-        if places and any(
-            VISIT.search(clause) and not FUTURE_EVENT.search(clause)
-            for clause in SENTENCE.findall(body)
-        ):
-            bias += 0.18
-        if (
-            relation is not None
-            and (places or ACTIVITY_QUERY.search(query))
-            and FUTURE_EVENT.search(body)
-            and not PAST_EVENT.search(body)
-        ):
-            bias -= 0.18
         candidates.append((i, bias))
     return tuple(candidates), cue
-
-
-def event_terms(content):
-    """Describe the event rather than the whole surrounding conversation."""
-    from hmph.lexical import tokenize
-
-    clauses = SENTENCE.findall(content)
-    for pattern in (VISIT, PARTICIPATION, PAST_EVENT):
-        terms = set(tokenize(" ".join(clause for clause in clauses if pattern.search(clause))))
-        if terms:
-            return terms
-    return set(tokenize(content))

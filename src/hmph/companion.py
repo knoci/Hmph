@@ -261,27 +261,6 @@ async def project_context(
         shared_source_id=shared_threads[0].source_message_id if len(shared_threads) == 1 else None,
         contextual_recall=bool(candidates.query_hint_source_ids),
     )
-    from hmph.shared_threads import interaction_rhythm
-
-    previous_messages = list(
-        await session.scalars(
-            select(Message)
-            .join(Turn)
-            .where(
-                Turn.pair_id == pair.id,
-                Turn.id != turn.id,
-                Turn.published_segments > 0,
-                Message.role == "assistant",
-                Message.deleted.is_(False),
-                Turn.created_at < turn.created_at,
-            )
-            .order_by(Turn.created_at.desc())
-            .limit(2)
-        )
-    )
-    plan = plan.model_copy(
-        update={"rhythm": interaction_rhythm([m.content for m in previous_messages])}
-    )
     thread_control = (turn.companion_plan or {}).get("thread_control")
     if thread_control:
         plan = plan.model_copy(
@@ -291,16 +270,6 @@ async def project_context(
                 if thread_control == "paused"
                 else plan.shared_thread_action,
             }
-        )
-    from sqlalchemy.dialects.postgresql import insert
-
-    from hmph.models import TurnSourceUse
-
-    for previous in previous_messages:
-        await session.execute(
-            insert(TurnSourceUse)
-            .values(turn_id=turn.id, message_id=previous.id, message_revision=previous.revision)
-            .on_conflict_do_nothing()
         )
     if shared_threads:
         contexts = tuple(
@@ -405,25 +374,6 @@ async def checked_mentions(session, turn, body, mentions):
             continue
         use = await session.get(TurnSourceUse, (turn.id, hint.source_id))
         source = await session.get(Message, hint.source_id)
-        scope = (turn.memory_context or {}).get("current_source", {})
-        start, end = scope.get("start_offset"), scope.get("end_offset")
-        if (
-            source is not None
-            and source.turn_id == turn.id
-            and source.role == "user"
-            and not source.deleted
-            and use is not None
-            and str(source.id) == scope.get("message_id")
-            and source.revision == use.message_revision == scope.get("revision")
-            and type(start) is int
-            and type(end) is int
-            and 0 <= start < end <= len(source.content)
-            and (hint.source_quote or hint.quote) in source.content[start:end]
-        ):
-            # This is acknowledgment of the actual current user input, not a
-            # proactive old-memory use. Keep its publication/deletion lineage.
-            current_mentions.append((source.id, source.revision))
-            continue
         if use is None:
             entry = await session.get(MemoryEntry, hint.source_id)
             if entry is not None and entry.pair_id == turn.pair_id:
@@ -433,6 +383,20 @@ async def checked_mentions(session, turn, body, mentions):
             return None, "source_invalid"
         if source.revision != use.message_revision:
             return None, "source_revision"
+        if source.turn_id == turn.id:
+            scope = (turn.memory_context or {}).get("current_source", {})
+            start, end = scope.get("start_offset"), scope.get("end_offset")
+            if not (
+                str(source.id) == scope.get("message_id")
+                and source.revision == scope.get("revision")
+                and type(start) is int
+                and type(end) is int
+                and 0 <= start < end <= len(source.content)
+                and (hint.source_quote or hint.quote) in source.content[start:end]
+            ):
+                return None, "source_permission"
+            current_mentions.append((source.id, source.revision))
+            continue
         if (hint.source_quote or hint.quote) not in source.content:
             missing_quote.add(source.id)
             continue

@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "hmph-memory": {
+      "command": "python",
+      "args": [
+        "-m",
+        "hmph.cli",
+        "local-mcp",
+        "--db",
+        "artifacts/local-memory/hmph.db"
+      ],
+      "env": {
+        "PYTHONPATH": "src"
+      }
+    }
+  },
+  "httpGateway": {
+    "openaiBaseUrl": "http://127.0.0.1:8018/v1",
+    "defaultModel": "hmph",
+    "characterModelExample": "hmph/yuki",
+    "mcpHttpUrl": "http://127.0.0.1:8018/mcp",
+    "memoryEventsSseUrl": "http://127.0.0.1:8018/v1/memory/events?namespace=yuki",
+    "proactiveCheckinUrl": "http://127.0.0.1:8018/v1/companion/proactive?namespace=yuki&cooldown_hours=12",
+    "coreMemoryUrl": "http://127.0.0.1:8018/v1/memory/core?namespace=yuki"
+  }
+}

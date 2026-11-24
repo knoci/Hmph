@@ -20,15 +20,107 @@ _CONDITION = re.compile(
     r"除非|如果|假如|只要|仅当|直到|之前|\b(?:unless|if|only|until|before)\b", re.I
 )
 _OLD_ACTION = re.compile(r"(?:别|不要)再|\b(?:don['’]t|do not)\s+(?:use|follow)\b", re.I)
+_REPLACED_ACTION = re.compile(
+    rf"{_OLD_ACTION.pattern}|\b(?:don['’]t|do not)\s+(?:route|circulate)\b",
+    re.I,
+)
+_EXPLICIT_REVISION = re.compile(
+    r"改[成为到期]|\b(?:changed|moved|replaced|replaces|rescheduled)\b", re.I
+)
+_CURRENT_ASSERTION = re.compile(r"现在是|已改为|目前由|\b(?:current|is now|are now)\b", re.I)
 _UNCERTAIN = re.compile(r"如果|要是|假如|要不要|没有撤|\b(?:if|unless|not)\b", re.I)
 _CURRENT = re.compile(
-    r"现在|目前|还(?:能|可|应该|该|要)|仍|(?:能不能|可不可以|能否|是否可以)继续|"
-    r"\b(?:now|still|currently|can I keep|can you keep)\b", re.I
+    r"现在|目前|当前|现行|还(?:能|可|应该|该|要)|仍|(?:能不能|可不可以|能否|是否可以)继续|"
+    r"\b(?:now|still|current|currently|can I keep|can you keep)\b", re.I
 )
 
 
 def asks_current_state(query):
     return bool(_CURRENT.search(query)) and len(re.findall(r"[?？]", query)) <= 1
+
+
+def revision_exchange_sources(snapshot, candidates, query):
+    """Recover the nearby reply and confirmation around a retrieved revision."""
+    questions = [part.strip() for part in re.split(r"[?？]", query) if part.strip()]
+    if not questions or not all(_CURRENT.search(part) for part in questions):
+        return ()
+    terms = set(tokenize(_CURRENT.sub("", query)))
+    names = {
+        name.lower() for name in re.findall(r"\b[A-Z][a-z]+\b", query)
+        if name.lower() in terms
+    }
+    revision_terms = terms - names
+    by_id = {source.message_id: source for source in snapshot}
+    by_position = {
+        (source.conversation_id, source.source_order): source
+        for source in snapshot
+        if source.conversation_id is not None
+    }
+    changes = {}
+    for source_id in candidates:
+        anchor = by_id.get(source_id)
+        if anchor is None:
+            continue
+        anchor_terms = terms.intersection(tokenize(anchor.content))
+        if len(anchor_terms) < 2 and not names.intersection(anchor_terms):
+            continue
+        for offset in (0, 1, -1, 2, -2):
+            source = by_position.get((anchor.conversation_id, anchor.source_order + offset))
+            if source is None or source.message_id in changes:
+                continue
+            explicit = _withdrawal_matches(
+                source.content, revision_terms, _EXPLICIT_REVISION, minimum_overlap=1
+            )
+            confirmed = (
+                len(revision_terms.intersection(tokenize(source.content))) >= 2
+                and _withdrawal_matches(
+                    source.content, revision_terms, _CURRENT_ASSERTION, minimum_overlap=1
+                )
+            )
+            replacement = explicit or _withdrawal_matches(source.content, terms, _REPLACED_ACTION)
+            if replacement or confirmed:
+                changes[source.message_id] = (bool(replacement), source)
+    selected = {}
+    used_conversations = set()
+    ordered = sorted(
+        changes.values(), key=lambda item: (item[0], item[1].source_order), reverse=True
+    )
+    for _, change in ordered:
+        if change.conversation_id in used_conversations:
+            continue
+        event_terms = terms | {term for term in tokenize(change.content) if len(term) > 1}
+        followup = by_position.get((change.conversation_id, change.source_order + 1))
+        has_followup = followup is not None and followup.content.rstrip().endswith(("?", "？"))
+        nearby = []
+        replacement_terms = set()
+        for offset in (0, -1, 1, 2, -2, 3):
+            neighbor = by_position.get((change.conversation_id, change.source_order + offset))
+            if neighbor is None:
+                continue
+            nearby_terms = set(tokenize(neighbor.content))
+            linked = len(event_terms & nearby_terms) >= 2 or (
+                _CURRENT.search(neighbor.content)
+                and terms & nearby_terms
+                and not neighbor.content.rstrip().endswith(("?", "？"))
+            )
+            replacement_answer = offset == 2 and has_followup and any(
+                _asserted_withdrawal(neighbor.content[start:end], _EXPLICIT_REVISION)
+                for start, end in _clauses(neighbor.content)
+            )
+            if replacement_answer:
+                replacement_terms = nearby_terms
+            confirms_replacement = offset == 3 and len(replacement_terms & nearby_terms) >= 2
+            # Keep the clause being revised and an adjacent reply. More distant
+            # turns need a topical match, as does a new question after the change.
+            if offset in (0, -1) or linked or replacement_answer or confirms_replacement or (
+                offset == 1 and not neighbor.content.rstrip().endswith(("?", "？"))
+            ):
+                nearby.append(neighbor.message_id)
+        selected.update(dict.fromkeys(nearby[:4]))
+        used_conversations.add(change.conversation_id)
+        if len(used_conversations) == 2:
+            break
+    return tuple(selected)
 
 
 def _clauses(content):
@@ -48,13 +140,13 @@ def _asserted_withdrawal(clause, cue=_WITHDRAWAL):
     )
 
 
-def _withdrawal_matches(content, terms, cue=_WITHDRAWAL):
+def _withdrawal_matches(content, terms, cue=_WITHDRAWAL, *, minimum_overlap=2):
     matched = set()
     for start, end in _clauses(content):
         clause = content[start:end]
         if _asserted_withdrawal(clause, cue):
             shared = set(tokenize(clause)) & terms
-            if len(shared) >= 2:
+            if len(shared) >= minimum_overlap:
                 matched.update(shared)
     return matched
 

@@ -1,5 +1,6 @@
 """Bounded evidence assembly. Slot coverage describes retrieved support, not truth."""
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -86,6 +87,11 @@ class RawEvidence(BaseModel):
         return self.model_dump_json(
             exclude={"message_revision", "start_offset", "end_offset", "source_order"}
         )
+
+    def prompt_bytes(self) -> int:
+        """Measure the record as escaped chat content, including its list separator."""
+        escaped = json.dumps(self.prompt_json(), ensure_ascii=False)
+        return len(escaped[1:-1].encode("utf-8")) + 1
 
 
 class EvidenceSlot(BaseModel):

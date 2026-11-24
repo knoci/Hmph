@@ -35,8 +35,8 @@ function connect(turn){closeStream();state.active=turn;busy();if(turn.conversati
   source.onopen=()=>$("connection").textContent="连接已恢复";
   source.onerror=()=>{if(state.source===source)$("connection").textContent="连接中断，正在重连";};
 }
-async function refreshMode(){const choice=await api("/api/memory-selection");$("mode").textContent=`${state.modelLabel} · ${choice.mode==="lexical"?"词法记忆基线":choice.available?"增强记忆实验（异常时回退）":"增强记忆暂不可用，使用原文回退"}`;}
-async function start(){state.chat=null;busy();const session=await api("/api/session");state.csrf=session.csrf_token;$("login").hidden=true;$("app").hidden=false;const health=await api("/health");state.modelLabel=health.model_mode==="fake"?"测试模型":"DeepSeek";await loadChats();await refreshActive();const hash=new URLSearchParams(location.hash.slice(1));let chosen=state.active?.conversation_id||hash.get("chat")||state.chats[0]?.id;if(chosen){try{await selectChat(chosen);}catch{if(state.chats.length)await selectChat(state.chats[0].id);else await createChat();}}else await createChat();}
+async function refreshMode(){const choice=await api("/api/memory-selection");$("mode").textContent=`${state.modelLabel} · ${choice.mode==="lexical"?"词法记忆基线":choice.available?(choice.mode==="mem0_timem_experimental"?"TiMem＋mem0":"增强记忆实验（异常时回退）"):"增强记忆暂不可用，使用原文回退"}`;}
+async function start(){state.chat=null;busy();const session=await api("/api/session");state.csrf=session.csrf_token;$("login").hidden=true;$("app").hidden=false;const health=await api("/health");state.timemEnabled=health.timem_mem0;state.timemCallLimit=health.timem_build_max_calls;$("timem-controls").hidden=!state.timemEnabled;state.modelLabel=health.model_mode==="fake"?"测试模型":"DeepSeek";await loadChats();await refreshActive();const hash=new URLSearchParams(location.hash.slice(1));let chosen=state.active?.conversation_id||hash.get("chat")||state.chats[0]?.id;if(chosen){try{await selectChat(chosen);}catch{if(state.chats.length)await selectChat(state.chats[0].id);else await createChat();}}else await createChat();}
 $("login-form").onsubmit=task(async()=>{const token=$("token").value;$("token").value="";await write("POST","/api/session",{token});await start();});
 $("logout").onclick=task(async()=>{await write("POST","/api/session/logout",{});signedOut();});
 $("new-chat").onclick=task(createChat);$("more-chats").onclick=task(()=>loadChats(true));$("older").onclick=task(()=>loadMessages(true));$("jump-active").onclick=task(()=>selectChat(state.active.conversation_id));
@@ -55,10 +55,17 @@ async function loadHistory(memory,root,cursor=null){
     if(version.sources.length<version.total_sources){const more=document.createElement("button");more.textContent=`更多来源（共 ${version.total_sources} 条）`;let next=version.sources.at(-1)?.message_id;more.onclick=task(async()=>{more.disabled=true;try{const params=new URLSearchParams({revision:String(version.revision),limit:"20"});if(next)params.set("cursor",next);const sources=await api(`/api/memories/${memory.id}/sources?${params}`);quotes.textContent+="\n"+sources.items.map(s=>s.quote).join("\n");next=sources.next_cursor;if(!next)more.remove();}finally{more.disabled=false;}});block.append(more);}root.append(block);}
   if(page.next_cursor){const more=document.createElement("button");more.textContent="更早的版本";more.onclick=task(async()=>{more.disabled=true;try{await loadHistory(memory,root,page.next_cursor);more.remove();}finally{more.disabled=false;}});root.append(more);}
 }
-async function previewForget(base){const preview=await api(`${base}/forget-preview`);state.forget={base,preview,request_id:crypto.randomUUID()};$("forget-scope").textContent=`预计影响 ${preview.memories} 条记忆、${preview.messages} 条消息、${preview.turns} 个回合。${preview.framework_spaces?"包含框架派生数据，清理可能需要等待。":""}`;$("forget-dialog").showModal();}
+async function previewForget(base){const preview=await api(`${base}/forget-preview`);state.forget={base,preview,request_id:crypto.randomUUID()};const remaining=preview.source_message_id?"其他消息里独立提到的内容会保留，可分别忘记。":"";$("forget-scope").textContent=`预计影响 ${preview.memories} 条记忆、${preview.messages} 条消息、${preview.turns} 个回合。${preview.framework_spaces?"包含框架派生数据，清理可能需要等待。":""}${remaining}`;$("forget-dialog").showModal();}
 async function loadMemories(append=false){if(!append){await loadSharedThreads();await loadMemoryState();await loadMemoryHealth();}const query=new URLSearchParams({limit:"30"});if(append&&state.memoryCursor)query.set("cursor",state.memoryCursor);const page=await api(`/api/memories/page?${query}`);state.memoryCursor=page.next_cursor;if(!append)$("memories").replaceChildren();for(const memory of page.items){const card=document.createElement("article");card.className="memory-card";const label=document.createElement("span");label.className="memory-label";label.textContent=({expression_preferences:"表达偏好记录",companion_boundary:"互动边界记录",companion_repair:"互动修复记录"})[memory.predicate]||(memory.kind==="episode"?"经历":"你说过的事实");const value=document.createElement("p");value.className="memory-value";value.textContent=memory.value;const sources=document.createElement("button");sources.textContent="查看来源";const details=document.createElement("div");details.className="sources";details.hidden=true;sources.onclick=task(async()=>{if(details.hidden){await loadHistory(memory,details);}details.hidden=!details.hidden;});const forget=document.createElement("button");forget.textContent="忘记";forget.onclick=task(()=>previewForget(`/api/memories/${memory.id}`));card.append(label,value,sources,forget,details);$("memories").append(card);}if(!append&&!page.items.length){const empty=document.createElement("p");empty.className="muted";empty.textContent="暂时没有长期记忆。测试模型不会自动整理聊天记忆；真实模式整理完成后会显示在这里。";$("memories").append(empty);}$("more-memories").hidden=!state.memoryCursor;}
 $("memory-toggle").onclick=task(async()=>{openPanel("memory");await loadMemories();});$("refresh-memories").onclick=task(()=>loadMemories());$("more-memories").onclick=task(()=>loadMemories(true));$("forget-cancel").onclick=()=>$("forget-dialog").close();
-async function watchDeletion(receipt,node){if(!state.csrf)return;node.textContent=receipt.status==="completed"?"已完成本地清理。":"相关记忆已停止使用，派生数据仍在清理中。";if(receipt.status!=="completed")setTimeout(async()=>{try{await watchDeletion(await api(`/api/memory-deletions/${receipt.id}`),node);}catch(error){notify(error.message);}},2000);}
+async function watchDeletion(receipt,node){
+  if(!state.csrf)return;
+  const completed=receipt.status==="completed";
+  const message=completed?"已完成本地清理。":"相关记忆已停止使用，派生数据仍在清理中。";
+  if(node.textContent!==message&&($("panel").hidden||$("memory-panel").hidden))notify(message);
+  node.textContent=message;
+  if(!completed)setTimeout(async()=>{try{await watchDeletion(await api(`/api/memory-deletions/${receipt.id}`),node);}catch(error){notify(error.message);}},2000);
+}
 $("forget-confirm").onclick=task(async()=>{const selected=state.forget;if(!selected)return;$("forget-confirm").disabled=true;try{const receipt=await write("POST",`${selected.base}/forget`,{request_id:selected.request_id,expected_revision:selected.preview.revision});$("forget-dialog").close();state.forget=null;const node=document.createElement("p");node.className="notice";$("deletions").append(node);watchDeletion(receipt,node);await refreshActive();await loadMemories();await loadMessages();}finally{$("forget-confirm").disabled=false;}});
 start().catch(error=>{signedOut();if(!error.message.includes("登录已过期"))notify(error.message);});
 
@@ -87,17 +94,80 @@ async function loadSharedThreads(){
     card.append(forget);root.append(card);
   }
 }
+async function loadTimemControls(){
+  if(!state.timemEnabled)return;
+  const selection=await api("/api/memory-selection");
+  const ready=await api("/api/memory-builds/current?backend=mem0_timem");
+  const latest=state.timemBuildId?await api("/api/memory-builds/"+state.timemBuildId):ready;
+  const pending=["queued","building"].includes(latest?.status);
+  $("timem-build").disabled=pending;
+  $("timem-select").disabled=!ready||selection.build_id===ready.id;
+  $("timem-disable").hidden=selection.mode!=="mem0_timem_experimental";
+  $("timem-maintenance").hidden=selection.mode!=="mem0_timem_experimental";
+  const active=state.maintenance?.enabled&&state.maintenance.backend==="mem0_timem";
+  $("timem-maintenance-enable").textContent=active?"追加额度":"启用后台整理";
+  $("timem-maintenance-pause").hidden=!active;
+  const labels={queued:"等待整理",building:"正在整理",ready:"索引可用",failed:"整理失败",retired:"索引已退役"};
+  $("timem-status").textContent=labels[latest?.status]||"暂无可用索引";
+  if(latest?.error_code==="call_budget")$("timem-status").textContent="整理达到本次调用上限";
+  return pending;
+}
+async function pollTimemBuild(){
+  if(state.csrf&&state.timemEnabled&&await loadTimemControls()){
+    setTimeout(()=>pollTimemBuild().catch(error=>notify(error.message)),2000);
+  }
+}
+$("timem-build").onclick=task(async()=>{
+  if(!confirm("整理会向 DeepSeek 发送来源，单次最多 "+state.timemCallLimit+" 次模型调用。现在开始？"))return;
+  $("timem-build").disabled=true;
+  try{
+    const build=await write("POST","/api/memory-builds",{backend:"mem0_timem",request_id:crypto.randomUUID()});
+    state.timemBuildId=build.id;
+    await pollTimemBuild();
+  }catch(error){$("timem-build").disabled=false;throw error;}
+});
+async function chooseTimem(buildId){
+  const selection=await api("/api/memory-selection");
+  await write("PUT","/api/memory-selection",{request_id:crypto.randomUUID(),expected_revision:selection.revision,build_id:buildId});
+  await refreshMode();await loadMemoryHealth();await refreshActive();
+}
+$("timem-select").onclick=task(async()=>{
+  const ready=await api("/api/memory-builds/current?backend=mem0_timem");
+  if(ready)await chooseTimem(ready.id);
+});
+$("timem-disable").onclick=task(()=>chooseTimem(null));
+async function setTimemMaintenance(enabled,additionalCalls){
+  const current=await api("/api/memory-maintenance");
+  if(enabled&&current.remaining_calls+additionalCalls<2){
+    notify("后台整理至少需要 2 次调用额度。");
+    return;
+  }
+  if(additionalCalls&&!confirm(`为后台整理授权最多 ${additionalCalls} 次新增模型调用？`))return;
+  await write("PUT","/api/memory-maintenance",{
+    request_id:crypto.randomUUID(),expected_revision:current.revision,
+    backend:"mem0_timem",enabled,additional_calls:additionalCalls,
+    per_attempt_calls:Math.min(24,state.timemCallLimit,current.remaining_calls+additionalCalls||2)
+  });
+  $("timem-maintenance-calls").value="0";
+  await loadMemoryHealth();
+}
+$("timem-maintenance").onsubmit=task(async()=>{
+  await setTimemMaintenance(true,Number($("timem-maintenance-calls").value));
+});
+$("timem-maintenance-pause").onclick=task(()=>setTimemMaintenance(false,0));
 async function loadMemoryHealth(){
   const root=$("memory-health");
   try{
     const health=await api("/api/memory-health");
+    state.maintenance=health.maintenance;
     const mode=health.mode==="experimental_index"?`已选择实验索引，其快照后有 ${health.new_source_count} 条新原话（并非都需要保存）。`:health.mode==="fallback"?"选定的实验索引暂不可用，回复使用原话检索。":"目前使用原话检索，未启用增强索引。";
     const pending=health.pending_extractions?`还有 ${health.pending_extractions} 项原话等待整理。`:"";
     const failed=health.failed_extractions?`有 ${health.failed_extractions} 项整理失败，可在来源任务中查看。`:"";
-    const building=({queued:"候选记忆正在排队整理，期间仍使用当前可用来源。",building:"候选记忆正在整理，期间仍使用当前可用来源。",ready:"候选记忆已整理完成，不会自动改变聊天选择。",failed:"本次候选整理失败，现有可用来源仍保留。",retired:"旧候选已退役，回复使用当前可用来源。"})[health.latest_build_status]||"";
     const maintenance=health.maintenance;
-    const upkeep=maintenance?.enabled?`后台整理已明确配置，剩余调用预留额度 ${maintenance.remaining_calls}。仅在维护进程运行时处理，结果不自动用于聊天。`:maintenance?.suspended_reason?"后台整理已暂停，请查看构建状态；不会自动追加调用额度。":"后台整理未启用，不会自动付费重建索引。";
+    const building=({queued:"记忆等待整理。",building:"正在整理，聊天可继续使用现有记忆。",failed:"本次整理失败，可继续使用现有记忆。"})[health.latest_build_status]||"";
+    const upkeep=maintenance?.enabled?`后台整理剩余额度 ${maintenance.remaining_calls} 次。${maintenance.backend==="mem0_timem"?"整理完成后，新回合使用更新的索引。":""}`:maintenance?.suspended_reason?"后台整理已暂停，请查看构建状态。":"后台整理未启用。";
     root.textContent=mode+pending+failed+building+upkeep;
+    await loadTimemControls();
   }catch{root.textContent="暂时无法读取整理进度；仍可查看或忘记记忆。";}
 }
 async function loadMemoryState(){

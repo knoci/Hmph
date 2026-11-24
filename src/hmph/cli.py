@@ -229,6 +229,46 @@ def main():
     serve = commands.add_parser("serve", help="Run the local authenticated HTTP API")
     serve.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1", "::1"])
     serve.add_argument("--port", type=int, default=8017)
+    local_chat = commands.add_parser(
+        "local-chat",
+        help="Run the standalone single-process SQLite local memory chat CLI",
+    )
+    local_chat.add_argument(
+        "--db",
+        type=Path,
+        default=Path("artifacts/local-memory/hmph.db"),
+        help="Path to the single SQLite memory database file",
+    )
+    local_chat.add_argument("--session", default=None, help="Optional initial session ID")
+    airi_gw = commands.add_parser(
+        "airi-gateway",
+        aliases=["local-gateway"],
+        help="Run the headless Dual-Protocol AIRI Memory Gateway (OpenAI-compatible /v1 + MCP /mcp + REST)",
+    )
+    airi_gw.add_argument(
+        "--db",
+        type=Path,
+        default=Path("artifacts/local-memory/hmph.db"),
+        help="Path to the single SQLite memory database file",
+    )
+    airi_gw.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1", "::1"])
+    airi_gw.add_argument("--port", type=int, default=8018)
+    airi_gw.add_argument(
+        "--auto-consolidate-every",
+        type=int,
+        default=12,
+        help="Automatically run background Sleep Consolidation after N extracted state changes (0 to disable)",
+    )
+    local_mcp = commands.add_parser(
+        "local-mcp",
+        help="Run the standalone SQLite local memory MCP JSON-RPC server over stdio",
+    )
+    local_mcp.add_argument(
+        "--db",
+        type=Path,
+        default=Path("artifacts/local-memory/hmph.db"),
+        help="Path to the single SQLite memory database file",
+    )
     args = parser.parse_args()
     if args.command == "init":
         try:
@@ -274,6 +314,26 @@ def main():
         )
     elif args.command == "eval-run":
         asyncio.run(run_evaluation(args))
+    elif args.command == "local-chat":
+        from hmph.local_memory.cli import run_local_chat
+
+        asyncio.run(run_local_chat(db_path=args.db, session_id=args.session))
+    elif args.command in {"airi-gateway", "local-gateway"}:
+        from hmph.local_memory.cli import run_airi_gateway
+
+        try:
+            run_airi_gateway(
+                db_path=args.db,
+                host=args.host,
+                port=args.port,
+                auto_consolidate_every=args.auto_consolidate_every,
+            )
+        except KeyboardInterrupt:
+            print("Stopped.")
+    elif args.command == "local-mcp":
+        from hmph.local_memory.mcp_server import run_mcp_stdio
+
+        asyncio.run(run_mcp_stdio(db_path=args.db))
     else:
         try:
             asyncio.run(

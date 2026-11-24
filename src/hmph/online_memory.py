@@ -377,7 +377,7 @@ async def expand_sources(
             if source is None:
                 out_of_scope += 1
                 continue
-        size = len(source.prompt_json().encode()) + 64
+        size = source.prompt_bytes()
         delta_sources.append((source, size))
     recovery_scope = status == "build_unavailable" and plan.intent in {"fact", "multi_hop"}
     if (
@@ -482,7 +482,7 @@ async def expand_sources(
                 "truncated": source.truncated or start > 0 or end < len(source.content),
             }
         )
-        size = len(source.prompt_json().encode()) + 64
+        size = source.prompt_bytes()
         if used + size <= budget:
             selected.append(source)
             seen.add(source.message_id)
@@ -589,7 +589,7 @@ def _correction_excerpt(source, available_bytes):
             "truncated": True,
         }
     )
-    size = len(excerpt.prompt_json().encode()) + 64
+    size = excerpt.prompt_bytes()
     return (excerpt, size) if size <= available_bytes else None
 
 

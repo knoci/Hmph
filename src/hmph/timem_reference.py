@@ -155,13 +155,13 @@ def install_embedding(embedding):
 
 def leaf_sources(node_id, nodes, leaf_map):
     """Resolve author child links strictly; an unmapped child is a coverage gap."""
-    visiting, result = set(), set()
+    visiting, result = set(), {}
 
     def walk(identity):
         if identity in visiting:
             raise ValueError("Cyclic native provenance")
         if identity in leaf_map:
-            result.update(leaf_map[identity])
+            result.update(dict.fromkeys(leaf_map[identity]))
             return
         node = nodes.get(identity)
         if node is None or not node.child_memory_ids:
@@ -172,7 +172,7 @@ def leaf_sources(node_id, nodes, leaf_map):
         visiting.remove(identity)
 
     walk(node_id)
-    return tuple(sorted(result))
+    return tuple(result)
 
 
 class LocalTiMem:
@@ -401,7 +401,7 @@ class LocalTiMem:
     async def episode_sources(self, query):
         from qdrant_client import models
 
-        from hmph.episode_recall import ACTIVITY_QUERY, PLACE_QUERY, episode_candidates, event_terms
+        from hmph.episode_recall import episode_candidates
         from hmph.online_memory import SOURCES
 
         if len(self.snapshot) < LONG_HISTORY_MINIMUM or not self.client.collection_exists(
@@ -420,23 +420,16 @@ class LocalTiMem:
             limit=min(len(entries), 80),
         ).points
         ranked = sorted(hits, key=lambda point: point.score + by_id[str(point.id)][1], reverse=True)
-        selected, remainder, counts, events = [], [], {}, []
-        diversify = PLACE_QUERY.search(query) or ACTIVITY_QUERY.search(query)
+        selected, remainder, counts = [], [], {}
         for point in ranked:
             key = str(point.id)
-            source = by_id[key][0]
-            conversation = source.conversation_id or key
-            terms = event_terms(source.content) if diversify else set()
-            duplicate = any(
-                len(terms & previous) >= max(3, 0.72 * len(terms | previous)) for previous in events
-            )
+            conversation = by_id[key][0].conversation_id or key
             count = counts.get(conversation, 0)
-            if count >= 2 or duplicate:
+            if count >= 2:
                 remainder.append(key)
             else:
                 counts[conversation] = count + 1
                 selected.append(key)
-                events.append(terms)
         return tuple((*selected, *remainder)[:SOURCES])
 
     async def add(self, content, *, level, when, children=(), sources=(), session_id=None):
@@ -571,7 +564,11 @@ class TiMemSupplement:
         from itertools import zip_longest
         from uuid import UUID
 
-        from hmph.event_changes import asks_current_state, withdrawal_focus
+        from hmph.event_changes import (
+            asks_current_state,
+            revision_exchange_sources,
+            withdrawal_focus,
+        )
         from hmph.online_memory import CANDIDATES, SOURCES, NativeSources, SourceRetrievalError
 
         if (ticket.build_id, ticket.space_id) != (self.build_id, self.space_id):
@@ -621,13 +618,24 @@ class TiMemSupplement:
         if strategy == "linked_exchanges":
             merged = dict.fromkeys((*timem, *mem0.source_ids))
         elif strategy == "originals_and_hierarchy":
-            hierarchy = tuple(source for source in timem if source not in originals)
-            merged = dict.fromkeys(
-                source
-                for group in zip_longest(originals, mem0.source_ids, hierarchy)
-                for source in group
-                if source is not None
-            )
+            from hmph.lexical import tokenize
+
+            core = tuple(dict.fromkeys(
+                source for pair in zip_longest(originals, mem0.source_ids)
+                for source in pair if source is not None
+            ))
+            core_ids = set(core[:8])
+            hierarchy = tuple(source for source in timem if source not in core_ids)
+            hierarchy_ids = set(hierarchy)
+            terms = {term for term in tokenize(query) if len(term) > 1}
+            relevant = {
+                source.message_id for source in self.timem.snapshot
+                if source.message_id in hierarchy_ids
+                and len(terms.intersection(tokenize(source.content))) >= 2
+            } if hierarchy else set()
+            supplements = tuple(source for source in hierarchy if source in relevant)[:2]
+            # Keep direct results and add a small number of relevant leaf sources.
+            merged = dict.fromkeys((*core[:4], *supplements, *core[4:], *hierarchy))
             limit = (
                 SOURCES
                 if len(self.timem.snapshot) >= LONG_HISTORY_MINIMUM
@@ -664,8 +672,13 @@ class TiMemSupplement:
                 for source in pair
                 if source is not None
             )
+        ordered = tuple(merged)
+        if strategy == "originals_and_hierarchy":
+            exchange = revision_exchange_sources(self.timem.snapshot, ordered[:SOURCES], query)
+            ordered = tuple(dict.fromkeys((*exchange, *ordered)))
+            timem = tuple(dict.fromkeys((*exchange, *timem)))[:CANDIDATES]
         return NativeSources(
-            source_ids=tuple(merged)[:limit],
+            source_ids=ordered[:limit],
             requests=mem0.requests + timem_requests if mem0.requests is not None else None,
             database_queries=mem0.database_queries,
             branch_status={"mem0": mem0_status, "timem": timem_status},

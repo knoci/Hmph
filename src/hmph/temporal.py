@@ -5,6 +5,15 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+_MONTHS = {
+    name: number for number, name in enumerate(
+        "january february march april may june july august september october november december"
+        .split(), 1
+    )
+}
+_NAMED_DAY = rf"\b({'|'.join(_MONTHS)})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*(\d{{4}}))?\b"
+_LOCAL_DAY = r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]"
+
 
 @dataclass(frozen=True)
 class TimeInterval:
@@ -65,6 +74,18 @@ def normalize_time(expression, source_time: datetime, source_timezone="UTC"):
         if explicit:
             year = int(explicit[1])
             return interval(date(year, 1, 1), date(year + 1, 1, 1), "year", "explicit")
+        named = re.fullmatch(_NAMED_DAY, text)
+        local = re.fullmatch(_LOCAL_DAY, text)
+        if named or local:
+            if named:
+                month, day_of_month = _MONTHS[named[1]], int(named[2])
+                year = int(named[3]) if named[3] else anchor.year
+            else:
+                month, day_of_month = int(local[1]), int(local[2])
+                year = anchor.year
+            day = date(year, month, day_of_month)
+            basis = "explicit" if named and named[3] else "source_year_calendar_day"
+            return interval(day, day + timedelta(days=1), "day", basis)
         years = {
             "前年": -2,
             "去年": -1,
@@ -122,11 +143,13 @@ def normalize_time(expression, source_time: datetime, source_timezone="UTC"):
 def query_intervals(query, query_time: datetime, source_timezone="UTC"):
     pattern = (
         r"(?<!\d)\d{4}[-/年]\d{1,2}(?:[-/月]\d{1,2}日?|月)?"
-        r"|(?<!\d)\d{4}年?|前年|去年|今年|明年|上个月|下个月|本月|上周|本周|下周"
+        rf"|{_NAMED_DAY}|{_LOCAL_DAY}"
+        r"|(?<!\d)\d{4}年|\b(?:in|during|since|before|after|as of)\s+(?P<year>\d{4})\b"
+        r"|前年|去年|今年|明年|上个月|下个月|本月|上周|本周|下周"
         r"|昨天|今天|明天|(?:last|this|next) (?:year|month|week)|yesterday|today|tomorrow"
     )
     found = [
-        normalize_time(match[0], query_time, source_timezone)
+        normalize_time(match["year"] or match[0], query_time, source_timezone)
         for match in re.finditer(pattern, query, re.I)
     ]
     return tuple(value for value in found[:4] if value.start is not None)

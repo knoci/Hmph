@@ -925,10 +925,10 @@ class Conversation:
             ]
             raw_evidence = []
             for item in ordered:
-                packed_json = (
-                    item.prompt_json() if isinstance(item, RawEvidence) else item.model_dump_json()
+                size = (
+                    item.prompt_bytes() if isinstance(item, RawEvidence)
+                    else len(item.model_dump_json().encode("utf-8")) + 64
                 )
-                size = len(packed_json.encode("utf-8")) + 64
                 if (
                     size + evidence_bytes > evidence_budget
                     or len(evidence) + len(raw_evidence) >= 12
