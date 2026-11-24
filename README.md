@@ -89,7 +89,18 @@ In **AIRI → Settings → Providers → OpenAI Compatible**:
 | :--- | :--- |
 | **Base URL** | `http://127.0.0.1:8018/v1` |
 | **API Key** | `local-hmph` *(any non-empty string; your real key stays local)* |
-| **Model** | `hmph` · `hmph/yuki` *(per-character namespace)* · `hmph/yuki@deepseek-chat` |
+| **Model** | Choose one of the formats below (type manually or fetch `hmph` from `/v1/models`) |
+
+**How `Model` routing works** (controls both the isolated memory namespace and the upstream LLM):
+
+| `Model` Value | Memory Namespace | Upstream LLM Used | Best For |
+| :--- | :--- | :--- | :--- |
+| `hmph` | `default` | Default model from `.env.local` | **Simplest setup** — single AIRI companion |
+| `hmph/<character>`<br>*(e.g. `hmph/yuki`, `hmph/airi`)* | `<character>` (strictly isolated) | Default model from `.env.local` | **Multi-character isolation** — keep separate characters' memories in one `.db` file without cross-talk |
+| `hmph/<character>@<upstream_model>`<br>*(e.g. `hmph/yuki@deepseek-reasoner`)* | `<character>` (strictly isolated) | Explicit model after `@` | **Per-character model override** — use a different upstream LLM per AIRI profile without restarting Hmph |
+| Raw upstream model name<br>*(e.g. `deepseek-chat`, `gpt-4o-mini`)* | `default` (or `X-Hmph-Namespace` header) | The exact model name you entered | Clients that expect a standard provider model ID while still using default memory |
+
+> Tip: `hmph:<character>` and `airi/<character>` are also accepted. If the `X-Hmph-Namespace` header is present, it takes precedence over the model prefix.
 
 See [integrations/airi/README.md](integrations/airi/README.md) for custom headers (`X-Hmph-Namespace`, `X-Hmph-Session-Id`, `X-Hmph-Memory-Mode`), SSE Live2D hooks, and proactive check-ins.
 

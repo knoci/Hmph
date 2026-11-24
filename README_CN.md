@@ -89,7 +89,18 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | :--- | :--- |
 | **Base URL** | `http://127.0.0.1:8018/v1` |
 | **API Key** | `local-hmph` *（任意非空字符串即可，真实密钥安全保存在本地 Hmph 进程）* |
-| **Model** | `hmph` · `hmph/yuki` *（按角色隔离命名空间）* · `hmph/yuki@deepseek-chat` |
+| **Model** | 从下表按需选择（在 AIRI 中可手动输入，或点刷新列表直接选 `hmph`） |
+
+**`Model` 字段填法与区别**（用于同时指定「记忆隔离空间」和「上游推理模型」）：
+
+| Model 填法 | 记忆命名空间 | 实际调用的上游模型 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| `hmph` | `default`（默认空间） | `.env.local` 中配置的默认模型 | **最简单**，只养一个 AIRI 伴侣时直接填它 |
+| `hmph/<角色名>`<br>*(例：`hmph/yuki`、`hmph/airi`)* | `<角色名>`（独立隔离空间） | `.env.local` 中配置的默认模型 | **多角色隔离**：同一个 `.db` 文件里养多个角色，彼此记忆完全不串台 |
+| `hmph/<角色名>@<上游模型>`<br>*(例：`hmph/yuki@deepseek-reasoner`)* | `<角色名>`（独立隔离空间） | `@` 后指定的模型 | **按角色切换模型**：无需重启网关，给不同角色/配置临时指定不同上游模型 |
+| 直接填上游模型名<br>*(例：`deepseek-chat`、`gpt-4o-mini`)* | `default`（若传 `X-Hmph-Namespace` 则以请求头为准） | 你填写的该上游模型 | 兼容只填原生模型名的客户端，同时保持默认记忆开启 |
+
+> 注：前缀也兼容 `hmph:<角色名>` 与 `airi/<角色名>`；若请求中同时带有 `X-Hmph-Namespace` 请求头，以请求头为准。
 
 自定义请求头（`X-Hmph-Namespace`、`X-Hmph-Session-Id`、`X-Hmph-Memory-Mode`）、Live2D SSE 事件订阅与主动关怀心跳接入示例请见 [integrations/airi/README.md](integrations/airi/README.md)。
 
