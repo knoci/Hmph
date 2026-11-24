@@ -2,6 +2,10 @@
 
 **Headless, single-file SQLite frontier long-term memory for [Project AIRI](https://github.com/moeru-ai/airi) and MCP agents.**
 
+<p>
+  <strong>English</strong> | <a href="README_CN.md">简体中文</a>
+</p>
+
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Storage: Single SQLite File](https://img.shields.io/badge/storage-single%20SQLite%20file-003b57.svg)](docs/architecture.md)
@@ -174,7 +178,9 @@ hmph/
 │   └── test_local_memory.py       # Bi-temporal state transitions & cascade forget tests
 ├── .env.example
 ├── LICENSE
-└── pyproject.toml
+├── pyproject.toml
+├── README.md
+└── README_CN.md
 ```
 
 ---
