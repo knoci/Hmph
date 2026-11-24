@@ -1,4 +1,4 @@
-# Connecting Project AIRI to Hmph Memory Component (v4.0)
+# Connecting Project AIRI to Hmph Memory Component
 
 Hmph operates as a **headless, single-file SQLite frontier memory component** — zero Web UI, zero Docker, zero AIRI fork required. AIRI handles Live2D/VRM visuals, STT/TTS voice, emotion tags, and desktop stage; Hmph handles bi-temporal state evolution, multi-character isolation, vector-indexed sleep consolidation, paused-plan anti-nagging, and atomic zero-resurrection forgetting.
 
@@ -6,10 +6,10 @@ Hmph operates as a **headless, single-file SQLite frontier memory component** �
 
 ## Step 1: Start Hmph Headless AIRI Gateway
 
-Ensure `.env.local` (or environment variables) contains your upstream LLM key (`HMPH_DEEPSEEK_API_KEY` or `OPENAI_API_KEY`, plus optional `HMPH_LOCAL_BASE_URL` / `HMPH_LOCAL_MODEL`):
+Ensure `.env.local` (or environment variables) contains your upstream LLM key (`HMPH_DEEPSEEK_API_KEY` or `HMPH_LOCAL_API_KEY`, plus optional `HMPH_LOCAL_BASE_URL` / `HMPH_LOCAL_MODEL`):
 
-```powershell
-hmph airi-gateway --db artifacts/local-memory/hmph.db --port 8018
+```bash
+hmph airi-gateway --db data/hmph.db --port 8018
 ```
 
 Endpoints exposed locally:
@@ -46,14 +46,14 @@ If you call the gateway from a custom AIRI plugin or middleware:
 
 Use `integrations/airi/mcp-config.json` to expose all **8 explicit memory tools** (`hmph_remember`, `hmph_recall`, `hmph_list_memories`, `hmph_forget`, `hmph_consolidate`, `hmph_graph`, `hmph_toggle_pause`, `hmph_core_memory`) directly to AIRI Desktop or any MCP client (Claude Desktop, Cursor, etc.).
 
-- **Stdio mode**: launches `python -m hmph.cli local-mcp --db artifacts/local-memory/hmph.db`
+- **Stdio mode**: launches `python -m hmph.cli local-mcp --db data/hmph.db`
 - **HTTP mode** (when `hmph airi-gateway` is already running): send MCP JSON-RPC 2.0 requests directly to `POST http://127.0.0.1:8018/mcp`.
 
 ---
 
-## Step 4 (v5.0 Deep Companion Cooperation): Core Memory, Live Event Bus & Proactive Check-In
+## Step 4: Deep Companion Cooperation — Core Memory, Live Event Bus & Proactive Check-In
 
-Hmph v5.0 goes beyond passive proxying with three dedicated AIRI companion cooperation endpoints:
+Hmph goes beyond passive proxying with four dedicated AIRI companion cooperation endpoints:
 
 1. **Always-in-Context Core Memory (`GET/PUT/DELETE /v1/memory/core`)**:
    - Auto-populated during Sleep Consolidation (and editable via REST or `hmph_core_memory` MCP tool).

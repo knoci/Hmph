@@ -7,7 +7,7 @@
         "hmph.cli",
         "local-mcp",
         "--db",
-        "artifacts/local-memory/hmph.db"
+        "data/hmph.db"
       ],
       "env": {
         "PYTHONPATH": "src"

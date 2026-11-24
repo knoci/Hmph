@@ -15,7 +15,11 @@ from zoneinfo import ZoneInfo
 from hmph.lexical import tokenize
 from hmph.local_memory.embeddings import Embedder, build_default_embedder
 from hmph.local_memory.llm import LLMClient, OpenAICompatLLM, resolve_llm_config
-from hmph.local_memory.reranker import FeatureReranker, anchor_relative_dates
+from hmph.local_memory.reranker import (
+    FeatureReranker,
+    anchor_relative_dates,
+    parse_anchor_date,
+)
 from hmph.local_memory.store import LocalMemoryStore, normalize_namespace
 from hmph.local_memory.types import (
     AmbiguityRecord,
@@ -70,6 +74,11 @@ ABSTRACT_INFERENCE_CUE = re.compile(
     r"爱好|兴趣|喜欢什么|适合什么|室内|户外|生活方式|可能|大概|偏好|"
     r"\b(?:indoor|outdoor|hobbies|interests|lifestyle|likely|potentially|prefer|preferred|favorite|"
     r"what\s+(?:could|might|would|can)\s+\w+\s+do|tips\s+for|recommend)\b",
+    re.I,
+)
+TEMPORAL_ORIGIN_CUE = re.compile(
+    r"最早|最初|一开始|哪一年|哪年|什么时候(?:开始|养|买|认识|领养)|"
+    r"\b(?:which year|what year|first|originally|initially|earliest|when did\s+\w+\s+(?:first|adopt|start|begin|get|meet))\b",
     re.I,
 )
 
@@ -140,6 +149,14 @@ def _item_directly_matched(query: str, item: ItemRecord) -> bool:
     overlap = q_tokens & i_tokens
     # Require >=2 bigram/word overlap, or 1 overlap if query is very short.
     return len(overlap) >= 2 or (len(q_tokens) <= 3 and len(overlap) >= 1)
+
+
+def _chrono_sort_key(ts_str: str | None, tie: str = "") -> tuple[int, str, str]:
+    """True chronological sort key handling both ISO dates and English dates like '1:10 pm on 27 March, 2023'."""
+    dt = parse_anchor_date(ts_str)
+    if dt is not None:
+        return (0, dt.strftime("%Y-%m-%d"), str(ts_str or "") + "|" + tie)
+    return (1, str(ts_str or ""), tie)
 
 
 def _format_version_line(v) -> str:
@@ -484,6 +501,7 @@ class LocalMemoryEngine:
             # (4) Multi-feature + Session-Diversity Reranking + Deterministic Relative-Time Anchoring
             is_multi_session = bool(MULTI_SESSION_CUE.search(query))
             is_abstract_inference = bool(ABSTRACT_INFERENCE_CUE.search(query))
+            is_temporal_origin = bool(TEMPORAL_ORIGIN_CUE.search(query))
             item_sem = self.store.search_items_semantic(
                 query, namespace=ns, limit=20, min_score=0.35
             )
@@ -641,14 +659,42 @@ class LocalMemoryEngine:
             )
             ss_hits: list[SessionSummaryRecord] = []
             seen_ss: set[str] = set()
-            # Interleave semantic-top and entity-scoped summaries so both direct & entity episodes are covered.
-            for idx_pair in range(max(len(sem_ss), len(ent_ss))):
-                if idx_pair < len(sem_ss) and sem_ss[idx_pair].id not in seen_ss:
-                    ss_hits.append(sem_ss[idx_pair])
-                    seen_ss.add(sem_ss[idx_pair].id)
+            # Interleave entity-IDF and semantic summaries, and for temporal-origin queries
+            # ("which year", "first", "originally") always include the earliest matching sessions
+            # chronologically so later mentions never drown out the original event!
+            for idx_pair in range(max(len(ent_ss), len(sem_ss))):
                 if idx_pair < len(ent_ss) and ent_ss[idx_pair].id not in seen_ss:
                     ss_hits.append(ent_ss[idx_pair])
                     seen_ss.add(ent_ss[idx_pair].id)
+                if idx_pair < len(sem_ss) and sem_ss[idx_pair].id not in seen_ss:
+                    ss_hits.append(sem_ss[idx_pair])
+                    seen_ss.add(sem_ss[idx_pair].id)
+            if is_temporal_origin:
+                all_ns_ss = self.store.list_session_summaries(namespace=ns)
+                q_ents = self.store.match_known_entities(query, namespace=ns)
+                if q_ents:
+                    matching_early = [
+                        s
+                        for s in all_ns_ss
+                        if any(
+                            self.store._entity_present_in_text(
+                                e, f"{s.summary} {' '.join(s.facts)} {' '.join(s.entities)}".lower()
+                            )
+                            for e in q_ents
+                        )
+                    ]
+                else:
+                    matching_early = all_ns_ss
+                earliest_ent = sorted(
+                    matching_early or all_ns_ss,
+                    key=lambda s: _chrono_sort_key(s.session_date, s.session_id),
+                )[:2]
+                for early_s in reversed(earliest_ent):
+                    if early_s.id not in seen_ss:
+                        ss_hits.insert(0, early_s)
+                        seen_ss.add(early_s.id)
+                    else:
+                        ss_hits = [early_s, *[s for s in ss_hits if s.id != early_s.id]]
             if second_hop_used and extra_msg_sem:
                 ss_by_sid = {s.session_id: s for s in self.store.list_session_summaries(namespace=ns)}
                 for mid in extra_msg_sem[:10]:
@@ -776,18 +822,22 @@ class LocalMemoryEngine:
                         logger.warning("Listwise evidence reranker failed gracefully: %s", exc)
 
             if not selected_summaries and ss_hits:
-                selected_summaries = ss_hits[: (8 if is_multi_session else 3)]
-            elif is_multi_session and ss_hits:
-                # Guarantee top IDF-ranked entity/semantic summaries aren't over-pruned by listwise selection.
+                selected_summaries = ss_hits[: (8 if is_multi_session else 4)]
+            elif (is_multi_session or is_temporal_origin) and ss_hits:
+                # Guarantee top IDF-ranked / earliest-origin summaries aren't over-pruned by listwise selection.
                 seen_sel = {s.id for s in selected_summaries}
-                for ss in ss_hits[:8]:
-                    if ss.id not in seen_sel and len(selected_summaries) < 9:
+                cap_preserve = 8 if is_multi_session else 4
+                for ss in ss_hits[:cap_preserve]:
+                    if ss.id not in seen_sel and len(selected_summaries) < cap_preserve:
                         selected_summaries.append(ss)
                         seen_sel.add(ss.id)
 
             if selected_summaries:
                 ss_lines = ["[Disambiguated Session Summaries & Anchored Atomic Facts (chronological)]"]
-                for ss in sorted(selected_summaries, key=lambda x: (x.session_date, x.session_id)):
+                for ss in sorted(
+                    selected_summaries,
+                    key=lambda x: _chrono_sort_key(x.session_date, x.session_id),
+                ):
                     ss_lines.append(f"- ({ss.session_date} | {ss.session_id}) {ss.summary}")
                     for f in ss.facts[:6]:
                         ss_lines.append(f"    • {f}")
@@ -843,7 +893,23 @@ class LocalMemoryEngine:
 
             if selected_msgs:
                 raw_lines = ["[Verified Original Excerpts (chronological)]"]
-                for m in sorted(selected_msgs, key=lambda x: x.created_at):
+                # Preserve exact same-timestamp turn order using SQLite rowid instead of random UUIDs.
+                rowids: dict[str, int] = {}
+                if selected_msgs:
+                    ph = ",".join("?" for _ in selected_msgs)
+                    for r in self.store._conn.execute(
+                        f"SELECT id, rowid FROM messages WHERE id IN ({ph})",
+                        [m.id for m in selected_msgs],
+                    ).fetchall():
+                        rowids[r["id"]] = int(r["rowid"])
+                for m in sorted(
+                    selected_msgs,
+                    key=lambda x: (
+                        _chrono_sort_key(x.created_at)[0],
+                        _chrono_sort_key(x.created_at)[1],
+                        rowids.get(x.id, 0),
+                    ),
+                ):
                     anchor_hint = anchor_relative_dates(m.content, m.created_at)
                     raw_lines.append(f"- ({m.created_at}){anchor_hint} {m.content}")
                 state_sections.append("\n".join(raw_lines))
@@ -2116,7 +2182,8 @@ class LocalMemoryEngine:
             ):
                 relevant_ambiguities.append(amb)
 
-        # 5b. Vector + FTS5 + Entity-Scoped consolidated dossiers (respecting paused-plan anti-nag boundary).
+        # Also check consolidations: withhold any consolidation that mentions a hidden paused item
+        # during unrelated casual chat so paused plans NEVER leak through consolidated profiles.
         is_pref_advice = bool(PREFERENCE_ADVICE_CUE.search(query)) or bool(
             ABSTRACT_INFERENCE_CUE.search(query)
         )
@@ -2137,7 +2204,7 @@ class LocalMemoryEngine:
             for cons in [*ent_cons, *sem_cons]:
                 if cons.id in seen_cids:
                     continue
-                if cons.source_item_ids and all(
+                if cons.source_item_ids and any(
                     iid in hidden_paused_ids for iid in cons.source_item_ids
                 ):
                     continue
@@ -2154,14 +2221,21 @@ class LocalMemoryEngine:
                 query, namespace=ns, limit=4
             )
             seen_ss_live: set[str] = set()
-            for ss in [*ent_ss_live, *sem_ss_live]:
+            live_pool = [*ent_ss_live, *sem_ss_live]
+            if TEMPORAL_ORIGIN_CUE.search(query):
+                earliest_live = sorted(
+                    ent_ss_live or self.store.list_session_summaries(namespace=ns),
+                    key=lambda s: _chrono_sort_key(s.session_date, s.session_id),
+                )[:2]
+                live_pool = [*earliest_live, *live_pool]
+            for ss in live_pool:
                 if ss.id not in seen_ss_live:
                     relevant_summaries.append(ss)
                     seen_ss_live.add(ss.id)
                 if len(relevant_summaries) >= 4:
                     break
 
-        # 5d. Always-in-context Letta-style Core Memory Blocks (respecting paused-plan anti-nag boundary).
+        # 5d. Always-in-context Letta-style Core Memory Blocks (strictly respecting paused-plan anti-nag boundary).
         hidden_paused_ids_all = {
             it.id
             for it in all_items
@@ -2172,7 +2246,7 @@ class LocalMemoryEngine:
             for blk in self.store.get_core_memory_blocks(namespace=ns)
             if not (
                 blk.source_item_ids
-                and all(iid in hidden_paused_ids_all for iid in blk.source_item_ids)
+                and any(iid in hidden_paused_ids_all for iid in blk.source_item_ids)
             )
         ]
 

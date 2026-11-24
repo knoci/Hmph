@@ -2,7 +2,7 @@
 
 Shared by both stdio transport (`hmph local-mcp`) and Streamable HTTP (`POST /mcp` on `hmph airi-gateway`).
 Allows AIRI Desktop (Tauri MCP), Claude Desktop, Cursor, and any MCP agent to mount
-Hmph's multi-namespace, evolving SQLite memory engine directly via 7 standard tools:
+Hmph's multi-namespace, evolving SQLite memory engine directly via 8 standard tools:
   - hmph_remember
   - hmph_recall
   - hmph_list_memories
@@ -10,6 +10,7 @@ Hmph's multi-namespace, evolving SQLite memory engine directly via 7 standard to
   - hmph_consolidate
   - hmph_graph
   - hmph_toggle_pause
+  - hmph_core_memory
 """
 
 from __future__ import annotations
