@@ -1,5 +1,7 @@
 """Hmph — Headless single-file SQLite frontier long-term memory for Project AIRI & MCP agents."""
 
+__version__ = "0.7.0"
+
 from hmph.local_memory import (
     AmbiguityRecord,
     ConsolidationRecord,
@@ -30,8 +32,6 @@ from hmph.local_memory import (
     create_airi_gateway_app,
     resolve_llm_config,
 )
-
-__version__ = "0.6.0"
 
 __all__ = [
     "__version__",

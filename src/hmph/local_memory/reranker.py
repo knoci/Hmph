@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from hmph.lexical import tokenize
@@ -191,6 +191,27 @@ def extract_anchored_search_tokens(text: str, recorded_at: str | None) -> list[s
     return tokens
 
 
+def compute_actr_activation(
+    access_count: int,
+    salience: float = 1.0,
+    ref_timestamp: str | None = None,
+    now_iso: str | None = None,
+) -> float:
+    """Cognitive ACT-R Base-Level Activation combining frequency reinforcement & power-law decay."""
+    import math
+
+    base_sal = max(0.15, min(2.0, float(salience)))
+    freq_term = 0.18 * math.log1p(max(0, int(access_count)))
+    age_days = 0.0
+    ref_dt = parse_anchor_date(ref_timestamp)
+    now_dt = parse_anchor_date(now_iso) if now_iso else datetime.now(UTC).replace(tzinfo=None)
+    if ref_dt is not None and now_dt is not None:
+        age_days = max(0.0, (now_dt - ref_dt).total_seconds() / 86400.0)
+    decay_term = 0.08 * math.log1p(age_days)
+    act = base_sal * (1.0 + freq_term - decay_term)
+    return max(0.15, min(2.0, round(act, 4)))
+
+
 class FeatureReranker:
     """Zero-dependency multi-feature + optional API Cross-Encoder reranker with session-burst awareness."""
 
@@ -244,6 +265,9 @@ class FeatureReranker:
                 else 0.0
             )
             score = rrf * 30.0 + lex_cov * 0.45 + proper_hit * 0.15 + min(ppr * 1.5, 0.15)
+            act_boost = float(cand.get("activation") or 0.0)
+            if act_boost > 0.0:
+                score += min(0.08, (act_boost - 1.0) * 0.08) if act_boost >= 1.0 else max(-0.04, (act_boost - 1.0) * 0.05)
             if intent == "current" and cand.get("is_recent_half"):
                 score += 0.05
             scored.append((score, cand))

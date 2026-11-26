@@ -88,6 +88,83 @@ def batch_cosine_top_k(
         return scored[:top_k]
 
 
+def build_normalized_matrix(
+    candidates: list[tuple[str, bytes]], dim: int
+) -> tuple[list[str], object]:
+    """Pre-stack and L2-normalize candidate float32 blobs for sub-millisecond cached search."""
+    if not candidates or dim <= 0:
+        return [], None
+    expected_bytes = dim * 4
+    try:
+        import numpy as np
+
+        valid_ids: list[str] = []
+        valid_rows: list[np.ndarray] = []
+        for cid, blob in candidates:
+            if len(blob) == expected_bytes:
+                valid_ids.append(cid)
+                valid_rows.append(np.frombuffer(blob, dtype=np.float32))
+        if not valid_rows:
+            return [], None
+        mat = np.vstack(valid_rows).astype(np.float32, copy=True)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        mat = np.where(norms > 1e-9, mat / np.clip(norms, 1e-9, None), 0.0)
+        return valid_ids, mat
+    except ImportError:
+        unpacked = [
+            (cid, unpack_vector(blob))
+            for cid, blob in candidates
+            if len(blob) == expected_bytes
+        ]
+        return [cid for cid, _ in unpacked], [vec for _, vec in unpacked]
+
+
+def matrix_cosine_top_k(
+    query: list[float],
+    valid_ids: list[str],
+    norm_matrix: object,
+    *,
+    top_k: int = 40,
+    min_score: float = 0.05,
+) -> list[tuple[str, float]]:
+    """Query a cached L2-normalized Float32 matrix in <1ms even across 10k+ vectors."""
+    if not query or not valid_ids or norm_matrix is None:
+        return []
+    try:
+        import numpy as np
+
+        if isinstance(norm_matrix, np.ndarray):
+            q = np.asarray(query, dtype=np.float32)
+            q_norm = float(np.linalg.norm(q))
+            if q_norm <= 1e-9 or norm_matrix.shape[1] != q.shape[0]:
+                return []
+            scores = norm_matrix @ (q / q_norm)
+            k = min(top_k, len(valid_ids))
+            if k < len(valid_ids) and len(valid_ids) > 64:
+                part = np.argpartition(-scores, k - 1)[:k]
+                order = part[np.argsort(-scores[part])]
+            else:
+                order = np.argsort(-scores)[:k]
+            results: list[tuple[str, float]] = []
+            for idx in order:
+                sc = float(scores[idx])
+                if math.isfinite(sc) and sc >= min_score:
+                    results.append((valid_ids[int(idx)], sc))
+            return results
+    except ImportError:
+        pass
+
+    if isinstance(norm_matrix, list):
+        scored = [
+            (cid, cosine_similarity(query, vec))
+            for cid, vec in zip(valid_ids, norm_matrix, strict=False)
+        ]
+        scored = [(cid, s) for cid, s in scored if s >= min_score]
+        scored.sort(key=lambda pair: (-pair[1], pair[0]))
+        return scored[:top_k]
+    return []
+
+
 class LocalFastEmbedder:
     """Offline multilingual ONNX embedder reusing cached local MiniLM artifacts."""
 

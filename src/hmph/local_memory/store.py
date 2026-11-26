@@ -13,11 +13,13 @@ from hmph.lexical import tokenize
 from hmph.local_memory.embeddings import (
     Embedder,
     batch_cosine_top_k,
+    build_normalized_matrix,
     cosine_similarity,
+    matrix_cosine_top_k,
     pack_vector,
     unpack_vector,
 )
-from hmph.local_memory.reranker import extract_anchored_search_tokens
+from hmph.local_memory.reranker import extract_anchored_search_tokens, parse_anchor_date
 from hmph.local_memory.types import (
     AmbiguityRecord,
     ConsolidationRecord,
@@ -305,6 +307,10 @@ class LocalMemoryStore:
             self._conn.execute(
                 "ALTER TABLE items ADD COLUMN salience REAL NOT NULL DEFAULT 1.0"
             )
+        if "access_count" not in item_cols:
+            self._conn.execute(
+                "ALTER TABLE items ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
+            )
         if "namespace" not in item_cols:
             self._conn.execute(
                 "ALTER TABLE items ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'"
@@ -328,6 +334,33 @@ class LocalMemoryStore:
             "CREATE INDEX IF NOT EXISTS idx_consolidations_ns ON consolidations (namespace, updated_at DESC)"
         )
         self._conn.commit()
+        # In-memory acceleration caches (invalidated atomically on write/merge/forget).
+        self._vec_cache: dict[tuple[str, str, str], tuple[list[str], object, dict[str, str]]] = {}
+        self._graph_cache: dict[str, object] = {}
+        self._query_vec_cache: dict[tuple[str, str], list[float]] = {}
+
+    def _invalidate_cache(self, namespace: str | None = None) -> None:
+        if namespace is None:
+            self._vec_cache.clear()
+            self._graph_cache.clear()
+            return
+        ns = normalize_namespace(namespace)
+        for key in [k for k in self._vec_cache if k[0] == ns]:
+            self._vec_cache.pop(key, None)
+        self._graph_cache.pop(ns, None)
+
+    def _embed_query_cached(self, query: str) -> list[float]:
+        if self.embedder is None or not query.strip():
+            return []
+        key = (self.embedder.name, query.strip())
+        cached = self._query_vec_cache.get(key)
+        if cached is not None:
+            return cached
+        vec = self.embedder.embed_query(query)
+        if len(self._query_vec_cache) >= 256:
+            self._query_vec_cache.clear()
+        self._query_vec_cache[key] = vec
+        return vec
 
     def close(self) -> None:
         self._conn.close()
@@ -397,6 +430,8 @@ class LocalMemoryStore:
                         """,
                         (msg_id, self.embedder.name, self.embedder.dimension, vector_blob),
                     )
+        if index_for_retrieval and role == "user":
+            self._invalidate_cache(ns)
         return MessageRecord(
             id=msg_id,
             session_id=session_id,
@@ -632,6 +667,7 @@ class LocalMemoryStore:
                     """,
                     (sid_pk, ns, self.embedder.name, self.embedder.dimension, vector_blob),
                 )
+        self._invalidate_cache(ns)
 
         return SessionSummaryRecord(
             id=sid_pk,
@@ -678,7 +714,7 @@ class LocalMemoryStore:
         scores: dict[str, float] = {}
 
         if self.embedder is not None and query.strip():
-            q_vec = self.embedder.embed_query(query)
+            q_vec = self._embed_query_cached(query)
             emb_rows = self._conn.execute(
                 """
                 SELECT summary_id, vector
@@ -836,7 +872,7 @@ class LocalMemoryStore:
 
         sem_scores: dict[str, float] = {}
         if self.embedder is not None and query.strip():
-            q_vec = self.embedder.embed_query(query)
+            q_vec = self._embed_query_cached(query)
             emb_rows = self._conn.execute(
                 "SELECT summary_id, vector FROM session_summary_embeddings WHERE namespace = ? AND model_name = ?",
                 (ns, self.embedder.name),
@@ -889,7 +925,7 @@ class LocalMemoryStore:
 
         sem_scores: dict[str, float] = {}
         if self.embedder is not None and query.strip():
-            q_vec = self.embedder.embed_query(query)
+            q_vec = self._embed_query_cached(query)
             emb_rows = self._conn.execute(
                 "SELECT consolidation_id, vector FROM consolidation_embeddings WHERE namespace = ? AND model_name = ?",
                 (ns, self.embedder.name),
@@ -1056,7 +1092,13 @@ class LocalMemoryStore:
                     (assistant_message_id, iid),
                 )
                 self._conn.execute(
-                    "UPDATE items SET last_mentioned_at = ? WHERE id = ?",
+                    """
+                    UPDATE items
+                    SET last_mentioned_at = ?,
+                        access_count = COALESCE(access_count, 0) + 1,
+                        salience = MIN(1.6, COALESCE(salience, 1.0) + 0.04)
+                    WHERE id = ?
+                    """,
                     (now, iid),
                 )
             for mid in source_message_ids:
@@ -1156,6 +1198,7 @@ class LocalMemoryStore:
                             ts,
                         ),
                     )
+                    v_from = op.get("valid_from") or ts
                     self._conn.execute(
                         """
                         INSERT INTO item_versions (
@@ -1171,7 +1214,7 @@ class LocalMemoryStore:
                             op["summary"],
                             status,
                             op.get("effective_time_text"),
-                            op.get("valid_from"),
+                            v_from,
                             op.get("valid_to"),
                             op.get("condition_text"),
                             op["change_type"],
@@ -1200,6 +1243,14 @@ class LocalMemoryStore:
                         entities,
                         vectors.get(idx),
                     )
+                    self._auto_link_zettelkasten_tx(
+                        item_id=item_id,
+                        entities=entities,
+                        vec_blob=vectors.get(idx),
+                        namespace=ns,
+                        source_message_id=source_message_id,
+                        ts=ts,
+                    )
                     touched_item_ids.append(item_id)
 
                 elif op_kind == "add_version":
@@ -1221,6 +1272,13 @@ class LocalMemoryStore:
                     merged_entities = list(
                         dict.fromkeys([*existing_entities, *(op.get("entities") or [])])
                     )
+                    v_from = op.get("valid_from") or ts
+                    if prev_ver_id:
+                        # Zep/Graphiti non-destructive fact succession: close open validity interval on superseded version.
+                        self._conn.execute(
+                            "UPDATE item_versions SET valid_to = COALESCE(valid_to, ?) WHERE id = ?",
+                            (v_from, prev_ver_id),
+                        )
                     self._conn.execute(
                         """
                         INSERT INTO item_versions (
@@ -1237,7 +1295,7 @@ class LocalMemoryStore:
                             op["summary"],
                             new_status,
                             op.get("effective_time_text"),
-                            op.get("valid_from"),
+                            v_from,
                             op.get("valid_to"),
                             op.get("condition_text"),
                             op["change_type"],
@@ -1293,6 +1351,14 @@ class LocalMemoryStore:
                         merged_entities,
                         vectors.get(idx),
                     )
+                    self._auto_link_zettelkasten_tx(
+                        item_id=item_id,
+                        entities=merged_entities,
+                        vec_blob=vectors.get(idx),
+                        namespace=ns,
+                        source_message_id=source_message_id,
+                        ts=ts,
+                    )
                     touched_item_ids.append(item_id)
 
                 elif op_kind == "add_ambiguity":
@@ -1319,7 +1385,90 @@ class LocalMemoryStore:
                 "UPDATE messages SET extracted = 1 WHERE id = ?",
                 (source_message_id,),
             )
+        self._invalidate_cache(ns)
         return touched_item_ids
+
+    def _auto_link_zettelkasten_tx(
+        self,
+        *,
+        item_id: str,
+        entities: list[str],
+        vec_blob: bytes | None,
+        namespace: str,
+        source_message_id: str,
+        ts: str,
+        max_links: int = 3,
+    ) -> int:
+        """A-MEM (NeurIPS 2025) Zettelkasten dynamic cross-linking without extra LLM calls."""
+        from hmph.local_memory.graph import normalize_entity
+
+        norm_ents = {normalize_entity(str(e)) for e in entities}
+        norm_ents.discard("")
+        other_rows = self._conn.execute(
+            """
+            SELECT i.id, i.entities_json, i.current_version_id
+            FROM items AS i
+            WHERE i.namespace = ? AND i.id != ? AND i.status IN ('active', 'paused')
+            """,
+            (namespace, item_id),
+        ).fetchall()
+        if not other_rows:
+            return 0
+
+        existing_neighbors: set[str] = set()
+        for er in self._conn.execute(
+            """
+            SELECT src_id, dst_id FROM memory_edges
+            WHERE src_type = 'item' AND dst_type = 'item' AND (src_id = ? OR dst_id = ?)
+            """,
+            (item_id, item_id),
+        ).fetchall():
+            existing_neighbors.add(er["dst_id"] if er["src_id"] == item_id else er["src_id"])
+
+        cand_scores: dict[str, float] = {}
+        for row in other_rows:
+            oid = row["id"]
+            if oid in existing_neighbors:
+                continue
+            o_ents = {normalize_entity(str(e)) for e in json.loads(row["entities_json"] or "[]")}
+            o_ents.discard("")
+            shared = norm_ents & o_ents
+            if shared:
+                cand_scores[oid] = cand_scores.get(oid, 0.0) + 0.55 * len(shared)
+
+        if vec_blob is not None and self.embedder is not None:
+            src_vec = unpack_vector(vec_blob)
+            ver_ids = [r["current_version_id"] for r in other_rows if r["current_version_id"]]
+            if ver_ids:
+                ph = ",".join("?" for _ in ver_ids)
+                vrows = self._conn.execute(
+                    f"""
+                    SELECT target_id, vector FROM embeddings
+                    WHERE target_type = 'item_version' AND model_name = ? AND target_id IN ({ph})
+                    """,
+                    [self.embedder.name, *ver_ids],
+                ).fetchall()
+                ver_to_oid = {
+                    r["current_version_id"]: r["id"]
+                    for r in other_rows
+                    if r["current_version_id"]
+                }
+                for vr in vrows:
+                    oid = ver_to_oid.get(vr["target_id"])
+                    if not oid or oid in existing_neighbors:
+                        continue
+                    sim = cosine_similarity(src_vec, unpack_vector(vr["vector"]))
+                    if 0.60 <= sim < 0.84:
+                        cand_scores[oid] = cand_scores.get(oid, 0.0) + sim
+
+        if not cand_scores:
+            return 0
+        top_oids = sorted(cand_scores.keys(), key=lambda k: (-cand_scores[k], k))[:max_links]
+        for oid in top_oids:
+            self._insert_edge_tx(
+                "item", item_id, "item", oid, "RELATED_ENTITY", source_message_id, ts
+            )
+        return len(top_oids)
 
     def _item_exists_tx(self, item_id: str) -> bool:
         row = self._conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone()
@@ -1488,6 +1637,72 @@ class LocalMemoryStore:
         ).fetchall()
         return list(dict.fromkeys(r["message_id"] for r in rows))
 
+    def _get_cached_vector_index(
+        self, namespace: str, target_type: str
+    ) -> tuple[list[str], object, dict[str, str]]:
+        """Build or return cached L2-normalized Float32 matrix for (namespace, target_type, model)."""
+        assert self.embedder is not None
+        ns = normalize_namespace(namespace)
+        cache_key = (ns, target_type, self.embedder.name)
+        cached = self._vec_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if target_type == "item_version":
+            rows = self._conn.execute(
+                """
+                SELECT e.target_id, e.vector, v.item_id
+                FROM embeddings AS e
+                JOIN item_versions AS v ON v.id = e.target_id
+                JOIN items AS i ON i.id = v.item_id
+                WHERE e.target_type = 'item_version' AND e.model_name = ? AND i.namespace = ?
+                """,
+                (self.embedder.name, ns),
+            ).fetchall()
+            aux = {r["target_id"]: r["item_id"] for r in rows}
+            ids, mat = build_normalized_matrix(
+                [(r["target_id"], r["vector"]) for r in rows], self.embedder.dimension
+            )
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT e.target_id, e.vector
+                FROM embeddings AS e
+                JOIN messages AS m ON m.id = e.target_id
+                WHERE e.target_type = 'message' AND e.model_name = ? AND m.deleted = 0 AND m.namespace = ?
+                """,
+                (self.embedder.name, ns),
+            ).fetchall()
+            aux = {}
+            ids, mat = build_normalized_matrix(
+                [(r["target_id"], r["vector"]) for r in rows], self.embedder.dimension
+            )
+        entry = (ids, mat, aux)
+        self._vec_cache[cache_key] = entry
+        return entry
+
+    def search_items_semantic_scored(
+        self,
+        query: str,
+        *,
+        namespace: str = "default",
+        limit: int = 30,
+        min_score: float = 0.18,
+    ) -> list[tuple[str, float]]:
+        if self.embedder is None or not query.strip():
+            return []
+        q_vec = self._embed_query_cached(query)
+        ids, mat, ver_to_item = self._get_cached_vector_index(namespace, "item_version")
+        if not ids:
+            return []
+        ranked = matrix_cosine_top_k(q_vec, ids, mat, top_k=limit * 2, min_score=min_score)
+        best_by_item: dict[str, float] = {}
+        for vid, sc in ranked:
+            iid = ver_to_item.get(vid)
+            if iid and sc > best_by_item.get(iid, -1.0):
+                best_by_item[iid] = sc
+        ordered = sorted(best_by_item.items(), key=lambda pair: (-pair[1], pair[0]))
+        return ordered[:limit]
+
     def search_items_semantic(
         self,
         query: str,
@@ -1496,30 +1711,12 @@ class LocalMemoryStore:
         limit: int = 30,
         min_score: float = 0.18,
     ) -> list[str]:
-        if self.embedder is None:
-            return []
-        ns = normalize_namespace(namespace)
-        q_vec = self.embedder.embed_query(query)
-        rows = self._conn.execute(
-            """
-            SELECT e.target_id, e.vector, v.item_id
-            FROM embeddings AS e
-            JOIN item_versions AS v ON v.id = e.target_id
-            JOIN items AS i ON i.id = v.item_id
-            WHERE e.target_type = 'item_version' AND e.model_name = ? AND i.namespace = ?
-            """,
-            (self.embedder.name, ns),
-        ).fetchall()
-        if not rows:
-            return []
-        ver_to_item = {r["target_id"]: r["item_id"] for r in rows}
-        ranked = batch_cosine_top_k(
-            q_vec,
-            [(r["target_id"], r["vector"]) for r in rows],
-            top_k=limit,
-            min_score=min_score,
-        )
-        return list(dict.fromkeys(ver_to_item[vid] for vid, _ in ranked))
+        return [
+            iid
+            for iid, _ in self.search_items_semantic_scored(
+                query, namespace=namespace, limit=limit, min_score=min_score
+            )
+        ]
 
     def search_messages_semantic_scored(
         self,
@@ -1529,27 +1726,13 @@ class LocalMemoryStore:
         limit: int = 30,
         min_score: float = 0.18,
     ) -> list[tuple[str, float]]:
-        if self.embedder is None:
+        if self.embedder is None or not query.strip():
             return []
-        ns = normalize_namespace(namespace)
-        q_vec = self.embedder.embed_query(query)
-        rows = self._conn.execute(
-            """
-            SELECT e.target_id, e.vector
-            FROM embeddings AS e
-            JOIN messages AS m ON m.id = e.target_id
-            WHERE e.target_type = 'message' AND e.model_name = ? AND m.deleted = 0 AND m.namespace = ?
-            """,
-            (self.embedder.name, ns),
-        ).fetchall()
-        if not rows:
+        q_vec = self._embed_query_cached(query)
+        ids, mat, _ = self._get_cached_vector_index(namespace, "message")
+        if not ids:
             return []
-        return batch_cosine_top_k(
-            q_vec,
-            [(r["target_id"], r["vector"]) for r in rows],
-            top_k=limit,
-            min_score=min_score,
-        )
+        return matrix_cosine_top_k(q_vec, ids, mat, top_k=limit, min_score=min_score)
 
     def search_messages_semantic(
         self, query: str, *, namespace: str = "default", limit: int = 30
@@ -1647,6 +1830,40 @@ class LocalMemoryStore:
             return None
         return self.get_item(ver_to_item[ranked[0][0]])
 
+    def _get_cached_graph(self, namespace: str):
+        from hmph.local_memory.graph import MemoryBipartiteGraph
+
+        ns = normalize_namespace(namespace)
+        cached = self._graph_cache.get(ns)
+        if cached is not None:
+            return cached
+        graph = MemoryBipartiteGraph.from_sqlite(self._conn, namespace=ns)
+        self._graph_cache[ns] = graph
+        return graph
+
+    def run_heterogeneous_ppr(
+        self,
+        *,
+        query: str,
+        seed_item_ids: list[str],
+        seed_message_ids: list[str],
+        seed_summary_ids: list[str] | tuple[str, ...] = (),
+        namespace: str = "default",
+        top_items: int = 12,
+        top_messages: int = 16,
+        top_summaries: int = 8,
+    ) -> tuple[list[tuple[str, float]], list[tuple[str, float]], list[tuple[str, float]]]:
+        graph = self._get_cached_graph(namespace)
+        return graph.personalized_pagerank_full(
+            query=query,
+            seed_item_ids=seed_item_ids,
+            seed_message_ids=seed_message_ids,
+            seed_summary_ids=seed_summary_ids,
+            top_items=top_items,
+            top_messages=top_messages,
+            top_summaries=top_summaries,
+        )
+
     def run_bipartite_ppr(
         self,
         *,
@@ -1657,17 +1874,15 @@ class LocalMemoryStore:
         top_items: int = 12,
         top_messages: int = 16,
     ) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
-        from hmph.local_memory.graph import MemoryBipartiteGraph
-
-        ns = normalize_namespace(namespace)
-        graph = MemoryBipartiteGraph.from_sqlite(self._conn, namespace=ns)
-        return graph.personalized_pagerank(
+        items, msgs, _ = self.run_heterogeneous_ppr(
             query=query,
             seed_item_ids=seed_item_ids,
             seed_message_ids=seed_message_ids,
+            namespace=namespace,
             top_items=top_items,
             top_messages=top_messages,
         )
+        return items, msgs
 
     # ------------------------------------------------------------------
     # Sleep Consolidation, Maintenance & Graph Export
@@ -1775,6 +1990,7 @@ class LocalMemoryStore:
                     self._insert_edge_tx(
                         "consolidation", cid, "message", mid, "DERIVED_FROM", mid, ts
                     )
+        self._invalidate_cache(ns)
         return self.list_consolidations(namespace=ns)
 
     def list_consolidations(self, *, namespace: str = "default") -> list[ConsolidationRecord]:
@@ -1828,7 +2044,7 @@ class LocalMemoryStore:
         scores: dict[str, float] = {}
         # 1. Dense semantic channel (catches abstract/paraphrased queries with zero lexical overlap).
         if self.embedder is not None and query.strip():
-            q_vec = self.embedder.embed_query(query)
+            q_vec = self._embed_query_cached(query)
             emb_rows = self._conn.execute(
                 """
                 SELECT consolidation_id, vector
@@ -1980,6 +2196,8 @@ class LocalMemoryStore:
                     self._conn.execute("DELETE FROM items WHERE id = ?", (dup["id"],))
                     merged_away.add(dup["id"])
                     merged_count += 1
+        if merged_count > 0:
+            self._invalidate_cache(ns)
         return merged_count
 
     def decay_stale_salience(
@@ -2425,6 +2643,7 @@ class LocalMemoryStore:
                 )
                 self._conn.execute(f"DELETE FROM messages WHERE id IN ({ph_m})", list(message_ids))
 
+        self._invalidate_cache(ns)
         return ForgetReceipt(
             query=target,
             namespace=ns,
@@ -2484,11 +2703,401 @@ class LocalMemoryStore:
             epistemic_type=row["epistemic_type"] if "epistemic_type" in row.keys() else "confirmed_fact",
             confidence=float(row["confidence"]) if "confidence" in row.keys() else 1.0,
             salience=float(row["salience"]) if "salience" in row.keys() else 1.0,
+            access_count=int(row["access_count"]) if "access_count" in row.keys() else 0,
             last_mentioned_at=row["last_mentioned_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             versions=versions,
         )
+
+    # ------------------------------------------------------------------
+    # Bi-Temporal Point-in-Time Snapshot, Session Idle & Export/Import
+    # ------------------------------------------------------------------
+
+    def get_latest_session_activity(
+        self, base_session_id: str, *, namespace: str = "default"
+    ) -> tuple[str | None, str | None, int]:
+        """Return (latest_session_id, latest_created_at, episode_index) for a base session family."""
+        ns = normalize_namespace(namespace)
+        row = self._conn.execute(
+            """
+            SELECT session_id, created_at
+            FROM messages
+            WHERE namespace = ? AND deleted = 0
+              AND (session_id = ? OR session_id LIKE ?)
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (ns, base_session_id, f"{base_session_id}#ep%"),
+        ).fetchone()
+        if row is None:
+            return None, None, 1
+        sid = str(row["session_id"])
+        ep_no = 1
+        if "#ep" in sid:
+            tail = sid.rsplit("#ep", 1)[1]
+            if tail.isdigit():
+                ep_no = int(tail)
+        return sid, str(row["created_at"]), ep_no
+
+    @staticmethod
+    def _ts_leq(left: str | None, right: str) -> bool:
+        if not left:
+            return True
+        try:
+            dt_l = datetime.fromisoformat(left.replace("Z", "+00:00"))
+            dt_r = datetime.fromisoformat(right.replace("Z", "+00:00"))
+            if dt_l.tzinfo is None:
+                dt_l = dt_l.replace(tzinfo=timezone.utc)
+            if dt_r.tzinfo is None:
+                dt_r = dt_r.replace(tzinfo=timezone.utc)
+            return dt_l <= dt_r
+        except ValueError:
+            dl = parse_anchor_date(left)
+            dr = parse_anchor_date(right)
+            if dl is not None and dr is not None:
+                return dl <= dr
+            return str(left) <= str(right)
+
+    def get_items_as_of(
+        self,
+        as_of: str,
+        *,
+        namespace: str = "default",
+        include_closed: bool = False,
+    ) -> list[ItemRecord]:
+        """Reconstruct exact bi-temporal state of all items in `namespace` as of `as_of` timestamp."""
+        ns = normalize_namespace(namespace)
+        all_items = self.list_items(namespace=ns)
+        snapshots: list[ItemRecord] = []
+        for item in all_items:
+            valid_vers = [
+                v
+                for v in item.versions
+                if self._ts_leq(v.valid_from or v.created_at, as_of)
+            ]
+            if not valid_vers:
+                continue
+            active_ver = valid_vers[-1]
+            if not include_closed and active_ver.status not in {"active", "paused"}:
+                continue
+            snapshots.append(
+                item.model_copy(
+                    update={
+                        "status": active_ver.status,
+                        "current_version_id": active_ver.id,
+                        "updated_at": active_ver.created_at,
+                        "versions": tuple(valid_vers),
+                    }
+                )
+            )
+        return snapshots
+
+    def export_namespace_data(self, *, namespace: str = "default") -> dict:
+        """Export a portable, lossless JSON snapshot of a character namespace."""
+        ns = normalize_namespace(namespace)
+        items = self.list_items(namespace=ns)
+        core_blocks = self.get_core_memory_blocks(namespace=ns)
+        consolidations = self.list_consolidations(namespace=ns)
+        summaries = self.list_session_summaries(namespace=ns)
+        msg_rows = self._conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE namespace = ? AND deleted = 0
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (ns,),
+        ).fetchall()
+        return {
+            "schema_version": "0.7.0",
+            "namespace": ns,
+            "exported_at": _now_iso(),
+            "core_blocks": [b.model_dump(mode="json") for b in core_blocks],
+            "items": [it.model_dump(mode="json") for it in items],
+            "consolidations": [c.model_dump(mode="json") for c in consolidations],
+            "session_summaries": [s.model_dump(mode="json") for s in summaries],
+            "messages": [self._row_to_message(r).model_dump(mode="json") for r in msg_rows],
+        }
+
+    def export_namespace_markdown(self, *, namespace: str = "default") -> str:
+        """Render a human-readable Markdown companion memory handbook for a namespace."""
+        ns = normalize_namespace(namespace)
+        data = self.export_namespace_data(namespace=ns)
+        lines = [
+            f"# Hmph Memory Handbook — `{ns}`",
+            "",
+            f"- Exported at: `{data['exported_at']}`",
+            f"- Items: {len(data['items'])} | Insights: {len(data['consolidations'])} | Session Summaries: {len(data['session_summaries'])}",
+            "",
+        ]
+        if data["core_blocks"]:
+            lines.append("## Core Memory")
+            for blk in data["core_blocks"]:
+                lines.append(f"- **{blk['block_key']}**: {blk['content']}")
+            lines.append("")
+
+        active_items = [it for it in data["items"] if it["status"] == "active"]
+        paused_items = [it for it in data["items"] if it["status"] == "paused"]
+        closed_items = [it for it in data["items"] if it["status"] not in {"active", "paused"}]
+
+        if active_items:
+            lines.append("## Active Commitments, Facts & Preferences")
+            for it in active_items:
+                cur = it["versions"][-1] if it["versions"] else {}
+                eff = f" *(time: {cur.get('effective_time_text')})*" if cur.get("effective_time_text") else ""
+                lines.append(f"- **[{it['kind']}] {it['title']}**: {cur.get('summary', '')}{eff}")
+                if len(it["versions"]) > 1:
+                    for v in it["versions"]:
+                        vf = v.get("valid_from") or v.get("created_at") or ""
+                        vt = v.get("valid_to") or "present"
+                        lines.append(
+                            f"  - `v{v['version_no']}` ({v['change_type']} -> {v['status']}, {vf} → {vt}): {v['summary']}"
+                        )
+            lines.append("")
+
+        if paused_items:
+            lines.append("## Paused Plans (Do Not Nag)")
+            for it in paused_items:
+                cur = it["versions"][-1] if it["versions"] else {}
+                lines.append(f"- **{it['title']}**: {cur.get('summary', '')}")
+            lines.append("")
+
+        if data["consolidations"]:
+            lines.append("## Consolidated User Insights")
+            for c in data["consolidations"]:
+                lines.append(f"- **{c['topic']}**: {c['summary']}")
+            lines.append("")
+
+        if data["session_summaries"]:
+            lines.append("## Episodic Session Summaries")
+            for s in data["session_summaries"]:
+                lines.append(f"- **{s['session_date']} (`{s['session_id']}`)**: {s['summary']}")
+                for f in s.get("facts") or []:
+                    lines.append(f"  - {f}")
+            lines.append("")
+
+        if closed_items:
+            lines.append("## Historical / Superseded Items")
+            for it in closed_items:
+                cur = it["versions"][-1] if it["versions"] else {}
+                lines.append(f"- **[{it['status']}] {it['title']}**: {cur.get('summary', '')}")
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    def import_namespace_data(
+        self, payload: dict, *, target_namespace: str | None = None
+    ) -> dict[str, int]:
+        """Idempotently import a JSON snapshot into `target_namespace` and rebuild search indices."""
+        ns = normalize_namespace(target_namespace or payload.get("namespace") or "default")
+        imported_msgs = 0
+        imported_items = 0
+        imported_summaries = 0
+        imported_core = 0
+
+        existing_msg_ids = {
+            r["id"]
+            for r in self._conn.execute(
+                "SELECT id FROM messages WHERE namespace = ?", (ns,)
+            ).fetchall()
+        }
+        msg_id_remap: dict[str, str] = {}
+
+        for m in payload.get("messages") or ():
+            orig_mid = str(m["id"])
+            # If importing into a different namespace on the same DB, remap message UUIDs cleanly.
+            other_row = self._conn.execute(
+                "SELECT namespace FROM messages WHERE id = ?", (orig_mid,)
+            ).fetchone()
+            if other_row is not None and other_row["namespace"] != ns:
+                new_mid = str(uuid4())
+            elif orig_mid in existing_msg_ids:
+                msg_id_remap[orig_mid] = orig_mid
+                continue
+            else:
+                new_mid = orig_mid
+            msg_id_remap[orig_mid] = new_mid
+            role = m.get("role", "user")
+            content = str(m.get("content", ""))
+            created_at = str(m.get("created_at") or _now_iso())
+            tz = str(m.get("timezone") or "UTC")
+            vec_blob = None
+            if role == "user" and self.embedder is not None and content.strip():
+                vecs = self.embedder.embed_passages([content])
+                if vecs and vecs[0]:
+                    vec_blob = pack_vector(vecs[0])
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO messages (
+                        id, session_id, namespace, role, content, created_at, timezone, extracted, deleted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)
+                    """,
+                    (new_mid, str(m.get("session_id") or "imported"), ns, role, content, created_at, tz),
+                )
+                if role == "user":
+                    anchor_toks = extract_anchored_search_tokens(content, created_at)
+                    fts_text = _fts_tokens(content)
+                    if anchor_toks:
+                        fts_text = f"{fts_text} {' '.join(anchor_toks)}".strip()
+                    self._conn.execute(
+                        "INSERT INTO messages_fts (message_id, tokens) VALUES (?, ?)",
+                        (new_mid, fts_text),
+                    )
+                    if vec_blob is not None and self.embedder is not None:
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO embeddings (target_type, target_id, model_name, dim, vector) VALUES ('message', ?, ?, ?, ?)",
+                            (new_mid, self.embedder.name, self.embedder.dimension, vec_blob),
+                        )
+            imported_msgs += 1
+
+        for it in payload.get("items") or ():
+            orig_iid = str(it["id"])
+            other_i = self._conn.execute("SELECT namespace FROM items WHERE id = ?", (orig_iid,)).fetchone()
+            if other_i is not None and other_i["namespace"] == ns:
+                continue
+            new_iid = str(uuid4()) if other_i is not None else orig_iid
+            versions = list(it.get("versions") or [])
+            if not versions:
+                continue
+            ver_remap: dict[str, str] = {}
+            for v in versions:
+                orig_vid = str(v["id"])
+                other_v = self._conn.execute("SELECT 1 FROM item_versions WHERE id = ?", (orig_vid,)).fetchone()
+                ver_remap[orig_vid] = str(uuid4()) if other_v is not None else orig_vid
+            cur_vid = ver_remap.get(str(it.get("current_version_id") or ""), ver_remap[str(versions[-1]["id"])])
+            ents = list(it.get("entities") or [])
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO items (
+                        id, namespace, title, kind, status, current_version_id, entities_json,
+                        epistemic_type, confidence, salience, access_count, last_mentioned_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_iid,
+                        ns,
+                        it["title"],
+                        it["kind"],
+                        it["status"],
+                        cur_vid,
+                        json.dumps(ents, ensure_ascii=False),
+                        it.get("epistemic_type") or "confirmed_fact",
+                        float(it.get("confidence", 1.0)),
+                        float(it.get("salience", 1.0)),
+                        int(it.get("access_count", 0)),
+                        it.get("last_mentioned_at"),
+                        it.get("created_at") or _now_iso(),
+                        it.get("updated_at") or _now_iso(),
+                    ),
+                )
+                for v in versions:
+                    n_vid = ver_remap[str(v["id"])]
+                    orig_smid = str(v["source_message_id"])
+                    smid = msg_id_remap.get(orig_smid)
+                    if smid is None:
+                        # Synthesize fallback source message if archive omitted raw messages.
+                        smid = str(uuid4())
+                        q_txt = str(v.get("source_quote") or v.get("summary") or it["title"])
+                        self._conn.execute(
+                            "INSERT INTO messages (id, session_id, namespace, role, content, created_at, timezone, extracted, deleted) VALUES (?, 'imported', ?, 'user', ?, ?, 'UTC', 1, 0)",
+                            (smid, ns, q_txt, v.get("created_at") or _now_iso()),
+                        )
+                        msg_id_remap[orig_smid] = smid
+                    sup_vid = ver_remap.get(str(v["supersedes_version_id"])) if v.get("supersedes_version_id") else None
+                    self._conn.execute(
+                        """
+                        INSERT INTO item_versions (
+                            id, item_id, version_no, summary, status, effective_time_text,
+                            valid_from, valid_to, condition_text, change_type, supersedes_version_id,
+                            source_message_id, source_quote, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            n_vid,
+                            new_iid,
+                            int(v["version_no"]),
+                            v["summary"],
+                            v["status"],
+                            v.get("effective_time_text"),
+                            v.get("valid_from") or v.get("created_at"),
+                            v.get("valid_to"),
+                            v.get("condition_text"),
+                            v["change_type"],
+                            sup_vid,
+                            smid,
+                            v.get("source_quote") or v["summary"],
+                            v.get("created_at") or _now_iso(),
+                        ),
+                    )
+                    v_blob = None
+                    if self.embedder is not None:
+                        v_text = f"{it['title']} {v['summary']} {' '.join(ents)}".strip()
+                        v_vecs = self.embedder.embed_passages([v_text])
+                        if v_vecs and v_vecs[0]:
+                            v_blob = pack_vector(v_vecs[0])
+                    self._index_version_tx(
+                        new_iid,
+                        n_vid,
+                        it["title"],
+                        v["summary"],
+                        v.get("effective_time_text"),
+                        v.get("condition_text"),
+                        ents,
+                        v_blob,
+                    )
+            imported_items += 1
+
+        for blk in payload.get("core_blocks") or ():
+            self.upsert_core_memory_block(
+                str(blk["block_key"]),
+                str(blk["content"]),
+                namespace=ns,
+                source_item_ids=[],
+                updated_at=blk.get("updated_at"),
+            )
+            imported_core += 1
+
+        for ss in payload.get("session_summaries") or ():
+            self.upsert_session_summary(
+                str(ss["session_id"]),
+                namespace=ns,
+                session_date=str(ss["session_date"]),
+                summary=str(ss["summary"]),
+                facts=list(ss.get("facts") or ()),
+                entities=list(ss.get("entities") or ()),
+                source_message_ids=[
+                    msg_id_remap.get(str(mid), str(mid))
+                    for mid in (ss.get("source_message_ids") or ())
+                ],
+                updated_at=ss.get("updated_at"),
+            )
+            imported_summaries += 1
+
+        if payload.get("consolidations"):
+            self.replace_consolidations(
+                [
+                    {
+                        "topic": c["topic"],
+                        "summary": c["summary"],
+                        "source_item_ids": [],
+                        "source_message_ids": [],
+                        "confidence": c.get("confidence", 0.85),
+                    }
+                    for c in payload["consolidations"]
+                ],
+                namespace=ns,
+            )
+
+        self._invalidate_cache(ns)
+        return {
+            "namespace": 1,
+            "imported_messages": imported_msgs,
+            "imported_items": imported_items,
+            "imported_summaries": imported_summaries,
+            "imported_core_blocks": imported_core,
+        }
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> MessageRecord:

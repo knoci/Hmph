@@ -126,7 +126,7 @@ def run_airi_gateway(
     engine = LocalMemoryEngine.from_env(db_path)
     engine.auto_consolidate_every = max(0, int(auto_consolidate_every))
     app = create_airi_gateway_app(engine, owns_engine=True)
-    print(f"Hmph v0.6 Headless Memory Gateway 已启动 | http://{host}:{port}")
+    print(f"Hmph Headless Memory Gateway 已启动 | http://{host}:{port}")
     print(f"  • AIRI OpenAI-Compatible Base URL : http://{host}:{port}/v1")
     print(f"  • MCP HTTP JSON-RPC Endpoint      : http://{host}:{port}/mcp")
     print(f"  • Headless Memory REST / SSE API  : http://{host}:{port}/v1/memory")

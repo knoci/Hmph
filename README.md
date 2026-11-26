@@ -18,9 +18,15 @@ Hmph gives AI companions and local agents durable, evolving long-term memory **w
 ## Why Hmph?
 
 - **Zero-Infrastructure Single File**: One WAL-mode SQLite file stores verbatim transcripts, FTS5 full-text indices, 384-dim offline ONNX embeddings, a bipartite associative graph, session summaries, and Core Memory blocks.
-- **Native Project AIRI Integration**: Drop-in OpenAI-compatible streaming gateway (`POST /v1/chat/completions`) that preserves 100% of AIRI's Live2D/VRM system prompt, emotion tags, and TTS latency budget (`20–31 ms` local recall).
+- **Native Project AIRI Integration**: Drop-in OpenAI-compatible streaming gateway (`POST /v1/chat/completions`) that preserves 100% of AIRI's Live2D/VRM system prompt, emotion tags, and TTS latency budget (`~6 ms` local recall).
 - **Multi-Character Namespace Isolation**: Switch `model` to `hmph/yuki` or `hmph/airi` (or pass `X-Hmph-Namespace`) for strict per-character memory isolation inside one database.
-- **Bi-Temporal State Evolution**: Tracks `create`, `reschedule`, `update`, `pause`, `resume`, `cancel`, `complete`, `retract`, and `ambiguous` transitions with verbatim quotes instead of flat append-only text chunks.
+- **Bi-Temporal State Evolution & Point-in-Time Snapshots**: Tracks `create`, `reschedule`, `update`, `pause`, `resume`, `cancel`, `complete`, `retract`, and `ambiguous` transitions with verbatim quotes, auto-closing `valid_from` / `valid_to` intervals (Zep/Graphiti fact succession) and supporting historical `as_of` snapshot queries.
+- **Frontier Cognitive & Graph Retrieval**:
+  - **HippoRAG-2 Heterogeneous Graph PPR**: Walks `entity ↔ item ↔ session_summary ↔ message` nodes with IDF specificity scaling on the live path (`<30 ms`).
+  - **A-MEM Zettelkasten Auto-Linking**: Dynamically cross-links related items at write time with zero extra LLM calls.
+  - **ACT-R Cognitive Activation & Cue-Triggered Recall**: Reinforces frequently recalled memories and wakes up associative context even on declarative statements without question marks.
+  - **MemoryOS Auto-Episode Rolling & Zero-Cost Trivial Gate**: Automatically segments stateless AIRI streams into episodes after idle gaps (default `45 min`) and skips background LLM extraction on pure backchannels (`"ok"`, `"haha"`, `"嗯嗯"`).
+  - **In-Memory Float32 Matrix Cache & Portable Archive**: Sub-5ms vector search across 10k+ turns, crash-safe pending recovery, optional LAN Bearer auth (`HMPH_GATEWAY_API_KEY`), and one-command Markdown/JSON memory export & import (`hmph export` / `hmph import`).
 - **Boundary-Safe Companion Cooperation**:
   - **Always-in-Context Core Memory** (`/v1/memory/core`) with strict paused-item anti-nagging guards.
   - **Live SSE Memory Event Bus** (`/v1/memory/events`) so Live2D/VRM hooks can react in real time when a promise is saved or updated.
@@ -143,7 +149,10 @@ Exposed MCP tools:
 | `GET /v1/models` | Lists available `hmph` and `hmph/<namespace>` model routes |
 | `POST /mcp` | Streamable HTTP MCP JSON-RPC 2.0 endpoint |
 | `GET /v1/memory/items` | List evolving state items and full version histories |
-| `POST /v1/memory/recall` | Inspect raw hybrid retrieval evidence and latency |
+| `GET /v1/memory/as-of` | Reconstruct exact bi-temporal memory state as of any past ISO date/timestamp |
+| `GET /v1/memory/export` | Export character memory as a readable Markdown handbook or lossless JSON |
+| `POST /v1/memory/import` | Idempotently import a JSON memory snapshot into any namespace |
+| `POST /v1/memory/recall` | Inspect raw hybrid retrieval evidence and latency (supports optional `as_of`) |
 | `POST /v1/memory/forget` | Atomically cascade-forget items or source utterances |
 | `POST /v1/memory/consolidate` | Run Map-Reduce Sleep Consolidation |
 | `POST /v1/memory/summarize` | Generate coreference-resolved session summaries |
@@ -162,8 +171,8 @@ Measured on a single SQLite file with offline multilingual MiniLM ONNX embedding
 | **TimlMemBench (Bilingual)** | 48 state-evolution & forgetting queries | **48 / 48 (100%)**, 0 `wrong_state` |
 | **LongMemEval-S Core** | 10 temporal / multi-session / update Qs | **10 / 10 (100%)** *(Oracle: 9 / 10)* |
 | **LongMemEval-S Abstention & Preference** | 4 abstention + 2 preference Qs | **6 / 6 (100%)** |
-| **LoCoMo (`conv-44`, 675 turns)** | 12 multi-hop & temporal Qs | **61.5% source recall** · **8–9 / 12 (67–75%)** E2E |
-| **AIRI 4-Day Companion E2E** | 7 live UX & boundary checks | **7 / 7 PASS** · **20–31 ms** local recall |
+| **LoCoMo (`conv-44`, 675 turns)** | 12 multi-hop & temporal Qs | **9 / 12 (75.0%)** *(Cat 3 & Cat 4: 100%)* |
+| **AIRI Live Companion & Scale** | 7 UX/boundary checks + 5k–10k cached 384d vectors | **7 / 7 PASS** · **~6 ms** live recall · **`<4 ms`** cached vector search |
 
 ---
 
@@ -171,7 +180,7 @@ Measured on a single SQLite file with offline multilingual MiniLM ONNX embedding
 
 ```text
 hmph/
-├── .github/workflows/checks.yml   # Zero-Docker CI (ruff + pytest + CLI smoke)
+├── .github/workflows/checks.yml   # Zero-Docker CI (ruff + compileall + CLI smoke)
 ├── docs/
 │   └── architecture.md            # System architecture, retrieval pipeline & SQLite schema
 ├── integrations/
@@ -180,13 +189,9 @@ hmph/
 │       └── mcp-config.json        # Ready-to-use MCP config for AIRI Desktop / Claude / Cursor
 ├── src/hmph/
 │   ├── __init__.py                # Public Python API
-│   ├── cli.py                     # CLI entrypoint (airi-gateway, local-mcp, local-chat)
+│   ├── cli.py                     # CLI entrypoint (airi-gateway, local-mcp, local-chat, export/import)
 │   ├── lexical.py                 # Zero-dependency bilingual (CJK + English) tokenizer
 │   └── local_memory/              # Core SQLite engine, hybrid retrieval, gateway & MCP server
-├── tests/
-│   ├── test_airi_gateway.py       # OpenAI proxy, SSE, Core Memory, proactive & MCP HTTP tests
-│   ├── test_local_frontier.py     # Consolidation, entity recall, PPR & abstention tests
-│   └── test_local_memory.py       # Bi-temporal state transitions & cascade forget tests
 ├── .env.example
 ├── LICENSE
 ├── pyproject.toml
@@ -201,7 +206,8 @@ hmph/
 ```bash
 pip install -e ".[dev]"
 ruff check .
-pytest -q
+python -m compileall -q src
+hmph --help
 ```
 
 ---

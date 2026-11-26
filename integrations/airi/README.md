@@ -63,5 +63,9 @@ Hmph goes beyond passive proxying with four dedicated AIRI companion cooperation
    - AIRI Desktop plugins / Live2D hooks can subscribe with `EventSource("http://127.0.0.1:8018/v1/memory/events?namespace=yuki")` to trigger subtle nod/blush reactions when a promise is saved or updated.
 3. **Boundary-Safe Proactive Companion Check-In (`GET /v1/companion/proactive?namespace=yuki&cooldown_hours=12`)**:
    - Called on AIRI's idle/heartbeat timer. Strictly excludes `paused`, `cancelled`, `retracted`, and `completed` items, returning `{should_initiate, reason, topic, suggested_cue}` so AIRI only speaks up politely for open ambiguities or due active commitments.
-4. **Coreference-Resolved Session Summaries (`POST /v1/memory/summarize`)**:
-   - Distills completed sessions into pronoun-resolved, temporally-anchored atomic facts (zero unresolved `"my GF"` / `"them"` / `"last week"` gaps).
+4. **Coreference-Resolved Session Summaries & Auto-Episode Rolling (`POST /v1/memory/summarize`)**:
+   - Automatically rolls default `airi-<character>` streams into fresh episodes after `HMPH_SESSION_IDLE_MINUTES` (default `45` min) of inactivity and distills completed episodes into pronoun-resolved, temporally-anchored atomic facts.
+5. **Bi-Temporal Snapshots, Portable Export/Import & LAN Auth**:
+   - Query historical state at any timestamp via `GET /v1/memory/as-of?namespace=yuki&as_of=2026-01-15`.
+   - Export/import character memories via `GET /v1/memory/export?namespace=yuki&format=markdown` (or `hmph export --namespace yuki --format markdown`).
+   - Set `HMPH_GATEWAY_API_KEY` in `.env.local` when hosting Hmph on a LAN/NAS to require Bearer authentication.

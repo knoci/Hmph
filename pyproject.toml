@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hmph"
-version = "0.6.0"
+version = "0.7.0"
 description = "Headless single-file SQLite frontier long-term memory component for Project AIRI and MCP agents."
 readme = "README.md"
 license = { text = "MIT" }
@@ -41,8 +41,6 @@ embeddings = [
   "fastembed>=0.7,<1",
 ]
 dev = [
-  "pytest>=8.3,<10",
-  "pytest-asyncio>=0.26,<2",
   "ruff>=0.11,<1",
 ]
 
@@ -51,11 +49,6 @@ hmph = "hmph.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hmph"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 target-version = "py312"

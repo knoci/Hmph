@@ -67,16 +67,16 @@ flowchart LR
 
 ---
 
-## 3. Retrieval Pipeline (<35 ms Local)
+## 3. Retrieval Pipeline (<10 ms Local)
 
 When a turn arrives, Hmph assembles context in parallel across six lightweight local channels (zero extra LLM calls on the hot path):
 
 1. **Always-in-Context Core Memory**: Compact Letta-style persona/user blocks (`core_memory_blocks`), filtered against paused-item provenance.
 2. **Dense Semantic Search**: Offline 384-dim `paraphrase-multilingual-MiniLM-L12-v2` ONNX embeddings (or OpenAI-compatible embeddings) using NumPy vectorized cosine top-k over messages, items, session summaries, and consolidated insights.
-3. **Lexical BM25 (SQLite FTS5)**: Bilingual CJK + English tokenization (`src/hmph/lexical.py`) over verbatim messages, version summaries, and session summaries.
-4. **Bipartite Personalized PageRank (HippoRAG-inspired)**: Multi-hop entity–item–message graph walk for cross-session associative recall ("connecting the dots").
-5. **IDF-Weighted Entity-Scoped Recall**: Automatically extracts salient named entities and rare query terms (weighted by inverse document frequency), boosting verbatim turns and coreference-resolved session summaries that share specific people/topics across months of history.
-6. **Reciprocal Rank Fusion (RRF) + Cross-Encoder / Feature Reranker**: Merges all channels, classifies query intent (`temporal`, `history`, `abstention`, `preference`, `detail`, `general`), and enforces strict character/token budgets.
+3. **Lexical BM25 (SQLite FTS5)**: Bilingual CJK + English tokenization (`src/hmph/lexical.py`) over verbatim messages, version summaries, and session summaries, augmented with deterministic relative-date tokens.
+4. **HippoRAG-2 Heterogeneous Personalized PageRank**: Multi-hop walk across `entity ↔ item ↔ session_summary ↔ message` nodes with inverse-degree (IDF) entity specificity scaling and A-MEM Zettelkasten dynamic cross-links (`RELATED_ENTITY`), running on both benchmark and live AIRI chat paths.
+5. **IDF-Weighted Entity-Scoped & Cue-Triggered Recall**: Automatically activates associative recall even on declarative statements without question marks when known entities or strong semantic cues fire, while skipping pure backchannels (`"ok"`, `"哈哈"`).
+6. **Reciprocal Rank Fusion (RRF) + ACT-R Cognitive Activation + Feature Reranker**: Merges all channels, reinforces accessed items (`access_count` + power-law decay), closes bi-temporal `valid_from`/`valid_to` intervals for `as_of` queries, and caches L2-normalized Float32 matrices in memory (`<5 ms` across 10k+ vectors).
 
 ---
 
@@ -113,5 +113,5 @@ All numbers below were measured against real upstream LLM inference (`deepseek-f
 | **TimlMemBench (Bilingual)** | 48 state-evolution queries | **48 / 48 (100%)**, 0 `wrong_state` | Exact tracking across create, reschedule, pause, resume, retract, and forget |
 | **LongMemEval-S Core** | 10 multi-session / temporal / update Qs | **10 / 10 (100%)** | Outperforms single-pass Oracle baseline (9 / 10) |
 | **LongMemEval-S Abstention & Preference** | 4 abstention + 2 preference Qs | **6 / 6 (100%)** | Zero-hallucination abstention & grounded preference recall |
-| **LoCoMo (`conv-44`)** | 675 turns, 12 multi-hop & temporal Qs | **61.5% source recall**; **8–9 / 12 (67–75%)** E2E | >2× source recall vs. TiMem+Mem0 baseline (30.0%) at ~38% write cost |
-| **AIRI 4-Day Companion E2E** | 7 live UX invariants (latency, anti-nag, forget) | **7 / 7 PASS**, **20–31 ms** local recall | Real-time voice-safe retrieval with zero paused-plan leakage |
+| **LoCoMo (`conv-44`)** | 675 turns, 12 multi-hop & temporal Qs | **9 / 12 (75.0%)** (Cat 3 & Cat 4: 100%) | >2× source recall vs. TiMem+Mem0 baseline (30.0%) at ~38% write cost |
+| **AIRI Live Companion & Scale** | 7 UX/boundary checks + 5k–10k cached 384d vectors | **7 / 7 PASS**, **~6 ms** live recall (`<4 ms` cached) | Real-time voice-safe retrieval with zero paused-plan leakage |

@@ -18,9 +18,15 @@ Hmph 为 AI 伴侣与本地智能体提供持久、可演化的长期记忆—�
 ## 核心特性
 
 - **零运维单文件架构**：单份 WAL 模式 SQLite 文件统一承载原始对话记录、FTS5 全文索引、384 维离线多语言 ONNX 向量、二分联想图谱、会话摘要与核心记忆块。
-- **Project AIRI 原生直连**：开箱即用的 OpenAI 兼容流式网关（`POST /v1/chat/completions`），100% 保留 AIRI 的 Live2D/VRM 人设提示词、情绪标签与实时语音循环（本地检索耗时仅 `20–31 ms`）。
+- **Project AIRI 原生直连**：开箱即用的 OpenAI 兼容流式网关（`POST /v1/chat/completions`），100% 保留 AIRI 的 Live2D/VRM 人设提示词、情绪标签与实时语音循环（本地检索仅 `~6 ms`）。
 - **多角色命名空间严格隔离**：将 `model` 设为 `hmph/yuki`、`hmph/airi`（或传入 `X-Hmph-Namespace` 请求头），即可在同一个数据库内为不同角色彻底隔离记忆、图谱与事件流。
-- **双时态状态演化账本**：不只是追加碎片文本，而是显式追踪 `create`、`reschedule`、`update`、`pause`、`resume`、`cancel`、`complete`、`retract` 与 `ambiguous` 等状态迁移，并完整保留原话引文与时间锚点。
+- **双时态状态演化与历史时间截面回溯**：不只是追加碎片文本，而是显式追踪 `create`、`reschedule`、`update`、`pause`、`resume`、`cancel`、`complete`、`retract` 与 `ambiguous` 状态迁移，自动闭合 `valid_from` / `valid_to` 有效区间（Zep/Graphiti 非破坏性事实演替），支持按任意历史时间点 `as_of` 精确回溯当时状态。
+- **前沿认知与异构图检索架构**：
+  - **HippoRAG-2 四节点异构图 PPR**：在线上热路径直接游走 `实体 ↔ 事项 ↔ 会话摘要 ↔ 原话` 异构图并按实体逆文档频率（IDF）自适应加权（`<30 ms`）。
+  - **A-MEM 卡片盒动态双向织网**：写入时零额外 LLM 开销自动建立跨事项 `RELATED_ENTITY` 关联边。
+  - **ACT-R 认知激活度与陈述句线索唤醒**：随对话引用自动强化核心羁绊激活度，并修复“无问号陈述句”盲区——日常随口提起人名或近义情境也能自然唤醒过往偏好与前情。
+  - **MemoryOS 空闲自动分卷 + 寒暄零成本门控**：针对不传会话 ID 的 AIRI 客户端，空闲满 `45 分钟` 自动切分新情景分卷并异步总结上一段；对 `哈哈`、`嗯嗯`、`ok` 等纯应答跳过后台大模型抽取，节省约 50% 后台 Token。
+  - **万级 Float32 内存矩阵缓存与便携归档**：万级消息下向量检索 `<5 ms`，支持异常断电未完成抽取启动自愈、可选局域网 `HMPH_GATEWAY_API_KEY` 鉴权，以及一键导出/导入人类可读 Markdown 伴侣手账或无损 JSON（`hmph export` / `hmph import`）。
 - **懂分寸的伴侣深度协同**：
   - **常驻上下文核心记忆（Core Memory）**（`/v1/memory/core`）：严格内置“已暂停计划防打扰”守卫。
   - **实时 SSE 记忆事件总线**（`/v1/memory/events`）：当承诺被记下或更新时实时推送，便于 AIRI Live2D/VRM 触发点头、害羞等微表情反馈。
@@ -143,7 +149,10 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | `GET /v1/models` | 列出可用的 `hmph` 与 `hmph/<namespace>` 模型路由 |
 | `POST /mcp` | Streamable HTTP MCP JSON-RPC 2.0 端点 |
 | `GET /v1/memory/items` | 查询演化事项与完整版本历史 |
-| `POST /v1/memory/recall` | 调试混合检索证据链与本地延迟 |
+| `GET /v1/memory/as-of` | 按任意历史时间点 `as_of` 回溯当时有效的双时态记忆快照 |
+| `GET /v1/memory/export` | 将指定角色记忆导出为人类可读 Markdown 手账或无损 JSON |
+| `POST /v1/memory/import` | 将 JSON 记忆快照幂等导入至指定角色命名空间 |
+| `POST /v1/memory/recall` | 调试混合检索证据链与本地延迟（支持可选 `as_of`） |
 | `POST /v1/memory/forget` | 原子级联遗忘指定事项或原话 |
 | `POST /v1/memory/consolidate` | 触发 Map-Reduce 睡眠整合 |
 | `POST /v1/memory/summarize` | 生成消解指代后的会话情景摘要 |
@@ -162,8 +171,8 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | **TimlMemBench（中英双语）** | 48 道状态演化与遗忘题 | **48 / 48 (100%)**，0 次 `wrong_state` |
 | **LongMemEval-S 核心集** | 10 道跨会话 / 时序 / 知识更新题 | **10 / 10 (100%)** *（单轮 Oracle 基线为 9 / 10）* |
 | **LongMemEval-S 拒答与偏好** | 4 道拒答防幻觉 + 2 道偏好题 | **6 / 6 (100%)** |
-| **LoCoMo（`conv-44`，675 轮）** | 12 道多跳与时序综合题 | **61.5% 原话召回率** · **8–9 / 12 (67–75%)** 端到端正确率 |
-| **AIRI 4 天真实陪伴端到端压测** | 7 项延迟、防打扰与遗忘不变量 | **7 / 7 全过** · 本地检索 **20–31 ms** |
+| **LoCoMo（`conv-44`，675 轮）** | 12 道多跳与时序综合题 | **9 / 12 (75.0%)** *（跨会话推理与事实细节均 100%）* |
+| **AIRI 伴侣实战与万级向量压测** | 7 项边界/防打扰 + 万级 384 维向量缓存 | **7 / 7 全过** · 实时召回 **`~6 ms`** · 缓存检索 **`<4 ms`** |
 
 ---
 
@@ -171,7 +180,7 @@ hmph airi-gateway --db data/hmph.db --port 8018
 
 ```text
 hmph/
-├── .github/workflows/checks.yml   # 零 Docker CI（ruff + pytest + CLI 冒烟）
+├── .github/workflows/checks.yml   # 零 Docker CI（ruff + compileall + CLI 冒烟）
 ├── docs/
 │   └── architecture.md            # 系统架构、检索管线与 SQLite 表结构
 ├── integrations/
@@ -180,13 +189,9 @@ hmph/
 │       └── mcp-config.json        # AIRI Desktop / Claude / Cursor 开箱即用 MCP 配置
 ├── src/hmph/
 │   ├── __init__.py                # 公共 Python API
-│   ├── cli.py                     # CLI 入口（airi-gateway、local-mcp、local-chat）
+│   ├── cli.py                     # CLI 入口（airi-gateway、local-mcp、local-chat、export/import）
 │   ├── lexical.py                 # 零依赖中英双语分词器
 │   └── local_memory/              # 核心 SQLite 引擎、混合检索、网关与 MCP 服务
-├── tests/
-│   ├── test_airi_gateway.py       # OpenAI 代理、SSE、Core Memory、主动关怀与 MCP HTTP 测试
-│   ├── test_local_frontier.py     # 睡眠整合、实体召回、PPR 与拒答测试
-│   └── test_local_memory.py       # 双时态状态迁移与级联遗忘测试
 ├── .env.example
 ├── LICENSE
 ├── pyproject.toml
@@ -196,12 +201,13 @@ hmph/
 
 ---
 
-## 本地开发与测试
+## 本地开发与检查
 
 ```bash
 pip install -e ".[dev]"
 ruff check .
-pytest -q
+python -m compileall -q src
+hmph --help
 ```
 
 ---

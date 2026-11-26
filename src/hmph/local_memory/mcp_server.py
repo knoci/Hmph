@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from hmph import __version__
 from hmph.local_memory.engine import LocalMemoryEngine
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -64,6 +65,10 @@ TOOLS_SPEC = [
                     "type": "string",
                     "description": "Optional current session ID (default: mcp-default).",
                 },
+                "as_of": {
+                    "type": "string",
+                    "description": "Optional ISO timestamp/date to reconstruct historical bi-temporal memory state as of that moment.",
+                },
                 "namespace": _NS_PROP,
             },
             "required": ["query"],
@@ -79,6 +84,14 @@ TOOLS_SPEC = [
                     "type": "string",
                     "enum": ["active", "paused", "completed", "cancelled", "retracted"],
                     "description": "Optional status filter.",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": "Optional ISO date/timestamp for point-in-time snapshot.",
+                },
+                "export_markdown": {
+                    "type": "boolean",
+                    "description": "If true, include a human-readable Markdown handbook rendering.",
                 },
                 "namespace": _NS_PROP,
             },
@@ -190,7 +203,7 @@ class LocalMCPServer:
                 "result": {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "hmph-local-memory", "version": "0.5.0"},
+                    "serverInfo": {"name": "hmph-local-memory", "version": __version__},
                 },
             }
 
@@ -256,18 +269,28 @@ class LocalMCPServer:
             if not query:
                 raise ValueError("query is required")
             sid = str(args.get("session_id") or "mcp-default")
-            evidence = self.engine.recall_context(query, namespace=ns, session_id=sid)
+            as_of = str(args["as_of"]).strip() if args.get("as_of") else None
+            evidence = self.engine.recall_context(
+                query, namespace=ns, session_id=sid, as_of=as_of
+            )
             return evidence.model_dump(mode="json")
 
         if name == "hmph_list_memories":
             status = args.get("status")
-            items = (
-                self.engine.list_items(namespace=ns, status=status)
-                if status
-                else self.engine.list_items(namespace=ns)
-            )
-            return {
+            as_of = str(args["as_of"]).strip() if args.get("as_of") else None
+            if as_of:
+                items = self.engine.get_items_as_of(as_of, namespace=ns, include_closed=True)
+                if status:
+                    items = [it for it in items if it.status == status]
+            else:
+                items = (
+                    self.engine.list_items(namespace=ns, status=status)
+                    if status
+                    else self.engine.list_items(namespace=ns)
+                )
+            out: dict[str, Any] = {
                 "namespace": ns,
+                "as_of": as_of,
                 "namespaces": self.engine.list_namespaces(),
                 "items": [it.model_dump(mode="json") for it in items],
                 "consolidations": [
@@ -279,6 +302,9 @@ class LocalMCPServer:
                     for a in self.engine.list_open_ambiguities(namespace=ns)
                 ],
             }
+            if args.get("export_markdown"):
+                out["markdown"] = self.engine.export_namespace(namespace=ns, fmt="markdown")
+            return out
 
         if name == "hmph_forget":
             target = str(args.get("target", "")).strip()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import re
 import time
 from collections import defaultdict
@@ -18,6 +19,7 @@ from hmph.local_memory.llm import LLMClient, OpenAICompatLLM, resolve_llm_config
 from hmph.local_memory.reranker import (
     FeatureReranker,
     anchor_relative_dates,
+    compute_actr_activation,
     parse_anchor_date,
 )
 from hmph.local_memory.store import LocalMemoryStore, normalize_namespace
@@ -81,6 +83,21 @@ TEMPORAL_ORIGIN_CUE = re.compile(
     r"\b(?:which year|what year|first|originally|initially|earliest|when did\s+\w+\s+(?:first|adopt|start|begin|get|meet))\b",
     re.I,
 )
+TRIVIAL_BACKCHANNEL_RE = re.compile(
+    r"^(?:哈哈+|嘿嘿+|呵呵+|嗯+|哦+|噢+|好[的呀啦呗]?|行[的吧呀]?|收到|明白|了解|"
+    r"谢谢[你啦]?|多谢|早安|早上好|晚安|拜拜|再见|"
+    r"ok|okay|k|yes|yep|yeah|no|nope|sure|got it|thanks|thank you|thx|lol|haha|gm|gn|"
+    r"[?？!！。.,，~～…👍❤️😂🤣😊🙏]+)$",
+    re.I,
+)
+
+
+def is_trivial_backchannel(text: str) -> bool:
+    """Return True only for unambiguous short acknowledgments/greetings with zero memory payload."""
+    cleaned = (text or "").strip()
+    if not cleaned or len(cleaned) > 12:
+        return False
+    return bool(TRIVIAL_BACKCHANNEL_RE.match(cleaned))
 
 ACTION_TO_STATUS: dict[str, ItemStatus] = {
     "create": "active",
@@ -163,6 +180,8 @@ def _format_version_line(v) -> str:
     parts = [f"v{v.version_no} [{v.change_type} -> {v.status}]: {v.summary}"]
     if v.effective_time_text:
         parts.append(f"(时间: {v.effective_time_text})")
+    if v.valid_from and v.valid_to:
+        parts.append(f"(有效区间: {v.valid_from[:10]}~{v.valid_to[:10]})")
     if v.condition_text:
         parts.append(f"(条件: {v.condition_text})")
     return " ".join(parts)
@@ -186,6 +205,8 @@ class LocalMemoryEngine:
         enable_dedup: bool = True,
         auto_consolidate_every: int = 12,
         auto_summarize_turns: int = 6,
+        session_idle_minutes: float = 45.0,
+        enable_trivial_gate: bool = True,
     ):
         self.embedder = embedder if embedder is not None else build_default_embedder()
         self.store = LocalMemoryStore(db_path, embedder=self.embedder)
@@ -199,6 +220,8 @@ class LocalMemoryEngine:
         self.enable_dedup = enable_dedup
         self.auto_consolidate_every = max(0, int(auto_consolidate_every))
         self.auto_summarize_turns = max(0, int(auto_summarize_turns))
+        self.session_idle_minutes = max(0.0, float(session_idle_minutes))
+        self.enable_trivial_gate = enable_trivial_gate
         self.reranker = FeatureReranker()
         self._bg_tasks: set[asyncio.Task] = set()
         self._extract_lock = asyncio.Lock()
@@ -208,6 +231,7 @@ class LocalMemoryEngine:
         self._event_subscribers: dict[str, set[asyncio.Queue[MemoryEvent]]] = defaultdict(set)
         self.last_extraction_usage: dict[str, int] | None = None
         self.extraction_errors: list[str] = []
+        self.skipped_trivial_extractions: int = 0
         self._ttft_history_ms: list[float] = []
         self._total_history_ms: list[float] = []
 
@@ -220,13 +244,21 @@ class LocalMemoryEngine:
         temperature: float = 0.3,
     ) -> LocalMemoryEngine:
         api_key, base_url, model, tz = resolve_llm_config()
+        idle_env = os.getenv("HMPH_SESSION_IDLE_MINUTES", "").strip()
+        idle_mins = float(idle_env) if idle_env else 45.0
         llm = OpenAICompatLLM(
             api_key,
             base_url=base_url,
             model=model,
             temperature=temperature,
         )
-        return cls(db_path, llm=llm, embedder=embedder, timezone_name=tz)
+        return cls(
+            db_path,
+            llm=llm,
+            embedder=embedder,
+            timezone_name=tz,
+            session_idle_minutes=idle_mins,
+        )
 
     def _now_iso(self) -> str:
         return datetime.now(ZoneInfo(self.timezone_name)).isoformat(timespec="seconds")
@@ -523,7 +555,7 @@ class LocalMemoryEngine:
                 ppr_item_ids = [iid for iid, _ in ppr_items]
                 ppr_msg_scores = dict(ppr_msgs)
 
-            # Adaptive 2-Hop Bridge Planning (3-condition v4.0 gate):
+            # Adaptive 2-Hop Bridge Planning (3-condition gate):
             # 1) multi-session enumeration/ordering, OR
             # 2) mathematically low first-pass dense confidence (< 0.52), OR
             # 3) abstract category / preference / indirect inference query on a long history.
@@ -648,7 +680,7 @@ class LocalMemoryEngine:
                     clines.append(f"- {cons.topic}: {cons.summary}")
                 state_sections.append("\n".join(clines))
 
-            # Channel 5 (v6.0): Coreference-resolved Session Summaries + Entity-Scoped Recall
+            # Channel 5: Coreference-resolved Session Summaries + Entity-Scoped Recall
             # Ensures asking about any person/relationship surfaces ALL their cross-session episodes
             # (even when turns omit abstract umbrella words like "indoor").
             sem_ss = self.store.search_session_summaries(
@@ -1326,6 +1358,7 @@ class LocalMemoryEngine:
         *,
         namespace: str = "default",
         session_id: str = "mcp-default",
+        as_of: str | None = None,
     ) -> TurnEvidence:
         """Public read-only memory recall API (used by AIRI Gateway, MCP hmph_recall & SDK callers)."""
         t0 = time.perf_counter()
@@ -1334,8 +1367,87 @@ class LocalMemoryEngine:
             query=query,
             current_user_message_id="",
             namespace=namespace,
+            as_of=as_of,
         )
         return ev.model_copy(update={"retrieval_ms": round((time.perf_counter() - t0) * 1000.0, 2)})
+
+    def get_items_as_of(
+        self,
+        as_of: str,
+        *,
+        namespace: str = "default",
+        include_closed: bool = False,
+    ) -> list[ItemRecord]:
+        return self.store.get_items_as_of(
+            as_of, namespace=namespace, include_closed=include_closed
+        )
+
+    def export_namespace(
+        self, *, namespace: str = "default", fmt: str = "json"
+    ) -> dict | str:
+        if fmt.strip().lower() in {"md", "markdown"}:
+            return self.store.export_namespace_markdown(namespace=namespace)
+        return self.store.export_namespace_data(namespace=namespace)
+
+    def import_namespace(
+        self, payload: dict, *, target_namespace: str | None = None
+    ) -> dict[str, int]:
+        return self.store.import_namespace_data(payload, target_namespace=target_namespace)
+
+    async def recover_pending_extractions(self, *, namespace: str | None = None) -> int:
+        """Crash-safe startup recovery: resume any `extracted = 0` user turns left behind."""
+        namespaces = (
+            [normalize_namespace(namespace)] if namespace else self.list_namespaces()
+        )
+        scheduled = 0
+        for ns in namespaces:
+            pending = self.store.get_pending_messages(namespace=ns)
+            for msg in pending:
+                recent = [
+                    m
+                    for m in self.store.get_session_messages(
+                        msg.session_id, namespace=ns, limit=self.recent_turn_limit
+                    )
+                    if m.id != msg.id and m.created_at <= msg.created_at
+                ]
+                self._schedule_extraction(msg, recent, msg.created_at)
+                scheduled += 1
+        return scheduled
+
+    def resolve_episode_session_id(
+        self,
+        base_session_id: str,
+        *,
+        namespace: str = "default",
+        now_iso: str | None = None,
+        explicit: bool = False,
+    ) -> str:
+        """MemoryOS-style idle-gap episode auto-rolling for stateless OpenAI clients (AIRI)."""
+        clean_base = (base_session_id or "").strip() or f"airi-{normalize_namespace(namespace)}"
+        if explicit or self.session_idle_minutes <= 0.0:
+            return clean_base
+        ns = normalize_namespace(namespace)
+        latest_sid, latest_ts, ep_no = self.store.get_latest_session_activity(
+            clean_base, namespace=ns
+        )
+        if latest_sid is None or latest_ts is None:
+            return clean_base
+        ts = now_iso or self._now_iso()
+        try:
+            dt_prev = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
+            dt_now = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt_prev.tzinfo is None:
+                dt_prev = dt_prev.replace(tzinfo=timezone.utc)
+            if dt_now.tzinfo is None:
+                dt_now = dt_now.replace(tzinfo=timezone.utc)
+            idle_mins = (dt_now - dt_prev).total_seconds() / 60.0
+            if idle_mins >= self.session_idle_minutes:
+                # Track previous episode so `_maybe_schedule_auto_summary` summarizes it even across restarts!
+                self._last_active_session.setdefault(ns, latest_sid)
+                return f"{clean_base}#ep{ep_no + 1}"
+        except ValueError:
+            pass
+        return latest_sid
 
     def list_sessions(self, *, namespace: str = "default", limit: int = 40) -> list[dict]:
         return self.store.list_sessions(namespace=namespace, limit=limit)
@@ -1785,6 +1897,10 @@ class LocalMemoryEngine:
         recent_before: list[MessageRecord],
         now_iso: str,
     ) -> None:
+        if self.enable_trivial_gate and is_trivial_backchannel(user_msg.content):
+            self.store.mark_message_extracted(user_msg.id)
+            self.skipped_trivial_extractions += 1
+            return
         task = asyncio.create_task(self._run_extraction(user_msg, recent_before, now_iso))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -2060,7 +2176,7 @@ class LocalMemoryEngine:
         return operations
 
     # ------------------------------------------------------------------
-    # Read Path: 4-Channel Hybrid Retrieval + Mention Gating + Narrator
+    # Read Path: Unified 6-Channel Hybrid Retrieval + HippoRAG-2 PPR + ACT-R
     # ------------------------------------------------------------------
 
     def _assemble_working_memory(
@@ -2070,49 +2186,130 @@ class LocalMemoryEngine:
         query: str,
         current_user_message_id: str,
         namespace: str = "default",
+        as_of: str | None = None,
     ) -> TurnEvidence:
         ns = normalize_namespace(namespace)
         intent = classify_query_intent(query)
         asks_overview = bool(PLAN_OVERVIEW_CUE.search(query))
+
+        # Optional Zep/Graphiti point-in-time snapshot recall (`as_of`).
+        if as_of:
+            snap_items = self.store.get_items_as_of(as_of, namespace=ns, include_closed=True)
+            active_snap = [it for it in snap_items if it.status == "active"][:8]
+            paused_snap = [it for it in snap_items if it.status == "paused"][:6]
+            closed_snap = [it for it in snap_items if it.status not in {"active", "paused"}][:6]
+            narrated_snap = self._narrate_context(
+                intent="history",
+                active_items=active_snap,
+                paused_items=paused_snap,
+                closed_items=closed_snap,
+                pending_msgs=[],
+                drilled_messages=[],
+                ambiguities=[],
+                as_of=as_of,
+            )
+            return TurnEvidence(
+                namespace=ns,
+                query_intent="history",
+                embedding_backend=self.embedder.name,
+                used_item_ids=tuple(it.id for it in [*active_snap, *paused_snap, *closed_snap]),
+                as_of=as_of,
+                narrated_context=narrated_snap,
+            )
 
         # 1. Short-term pending raw utterances (background extraction not finished yet).
         pending_msgs = self.store.get_pending_messages(
             namespace=ns, exclude_id=current_user_message_id
         )
 
-        # 2. Four-channel hybrid retrieval scoped strictly to namespace:
-        #    (a) Item semantic vectors, (b) Item FTS5, (c) Raw message semantic+FTS5, (d) 1-hop graph + PPR.
-        item_sem = self.store.search_items_semantic(query, namespace=ns, limit=20)
+        # 2. Cached multi-channel hybrid retrieval + Cue-Triggered Associative Activation:
+        item_sem_scored = self.store.search_items_semantic_scored(query, namespace=ns, limit=20)
+        item_sem = [iid for iid, _ in item_sem_scored]
+        top_item_sem = item_sem_scored[0][1] if item_sem_scored else 0.0
         item_fts = self.store.search_items_fts(query, namespace=ns, limit=20)
-        msg_sem = self.store.search_messages_semantic(query, namespace=ns, limit=20)
-        msg_fts = self.store.search_messages_fts(query, namespace=ns, limit=20)
+
+        msg_sem_scored = self.store.search_messages_semantic_scored(query, namespace=ns, limit=20)
+        msg_sem = [mid for mid, _ in msg_sem_scored if mid != current_user_message_id]
+        non_self_msg_scores = [sc for mid, sc in msg_sem_scored if mid != current_user_message_id]
+        top_msg_sem = non_self_msg_scores[0] if non_self_msg_scores else 0.0
+        msg_fts = [
+            mid
+            for mid in self.store.search_messages_fts(query, namespace=ns, limit=20)
+            if mid != current_user_message_id
+        ]
+
+        matched_entities = self.store.match_known_entities(query, namespace=ns)
+        is_pref_advice = bool(PREFERENCE_ADVICE_CUE.search(query)) or bool(
+            ABSTRACT_INFERENCE_CUE.search(query)
+        )
+        # Fix declarative statement blindspot: wake up associative memory when a non-question
+        # statement mentions known entities or hits high-confidence semantic memory (>=0.52).
+        cue_activated = (not is_trivial_backchannel(query)) and (
+            bool(matched_entities) or top_item_sem >= 0.52 or top_msg_sem >= 0.52
+        )
+        effective_associative = (intent != "casual") or cue_activated or is_pref_advice
 
         fused_item_ids = reciprocal_rank_fusion([item_sem, item_fts], limit=12)
         graph_item_ids = self.store.expand_one_hop_items(fused_item_ids[:6], limit=6)
-        candidate_item_ids = list(dict.fromkeys([*fused_item_ids, *graph_item_ids]))
+        fused_msg_ids = reciprocal_rank_fusion([msg_sem, msg_fts], limit=12)
 
-        fused_msg_ids = reciprocal_rank_fusion([msg_sem, msg_fts], limit=10)
-        fused_msg_ids = [mid for mid in fused_msg_ids if mid != current_user_message_id]
+        # HippoRAG-2 Heterogeneous PPR on the live path (entities + items + summaries + messages).
+        ppr_item_ids: list[str] = []
+        ppr_msg_scores: dict[str, float] = {}
+        ppr_sum_ids: list[str] = []
+        if self.enable_ppr and effective_associative:
+            ppr_items, ppr_msgs, ppr_sums = self.store.run_heterogeneous_ppr(
+                query=query,
+                seed_item_ids=fused_item_ids[:8],
+                seed_message_ids=fused_msg_ids[:8],
+                namespace=ns,
+                top_items=8,
+                top_messages=12,
+                top_summaries=4,
+            )
+            ppr_item_ids = [iid for iid, _ in ppr_items]
+            ppr_msg_scores = {
+                mid: sc for mid, sc in ppr_msgs if mid != current_user_message_id
+            }
+            ppr_sum_ids = [sid for sid, _ in ppr_sums]
+
+        candidate_item_ids = reciprocal_rank_fusion(
+            [fused_item_ids, graph_item_ids, ppr_item_ids], limit=14
+        )
 
         # Hydrate candidate items strictly within this namespace.
+        all_items = self.store.list_items(namespace=ns)
+        by_item_id = {it.id: it for it in all_items}
         recalled_items: list[ItemRecord] = []
         for iid in candidate_item_ids:
-            item = self.store.get_item(iid)
-            if item is not None and item.namespace == ns:
+            item = by_item_id.get(iid)
+            if item is not None:
                 recalled_items.append(item)
 
-        # Also check all active/paused items in this namespace for direct lexical/entity match.
-        all_items = self.store.list_items(namespace=ns)
         recalled_ids_set = {it.id for it in recalled_items}
         for it in all_items:
             if it.id not in recalled_ids_set and _item_directly_matched(query, it):
                 recalled_items.insert(0, it)
                 recalled_ids_set.add(it.id)
 
+        # Weight recalled items with ACT-R cognitive activation while keeping direct matches first.
+        base_rank = {it.id: idx for idx, it in enumerate(recalled_items)}
+        recalled_items.sort(
+            key=lambda it: (
+                0 if _item_directly_matched(query, it) else 1,
+                base_rank[it.id]
+                - 0.6
+                * compute_actr_activation(
+                    it.access_count, it.salience, it.last_mentioned_at or it.updated_at
+                ),
+            )
+        )
+
         # 3. Companion Mention Gating:
         active_to_show: list[ItemRecord] = []
         paused_to_show: list[ItemRecord] = []
         closed_to_show: list[ItemRecord] = []
+        top_candidate_gate = set(candidate_item_ids[:6])
 
         if asks_overview:
             active_to_show = [it for it in all_items if it.status == "active"][:8]
@@ -2121,10 +2318,10 @@ class LocalMemoryEngine:
             for item in recalled_items:
                 direct = _item_directly_matched(query, item)
                 if item.status == "active":
-                    if direct or (intent != "casual" and item.id in fused_item_ids[:4]):
+                    if direct or (effective_associative and item.id in top_candidate_gate):
                         active_to_show.append(item)
                 elif item.status == "paused":
-                    # Strict anti-nag rule: never surface paused plans unless directly referenced.
+                    # Strict anti-nag rule: NEVER surface paused plans unless directly referenced!
                     if direct:
                         paused_to_show.append(item)
                 else:
@@ -2136,10 +2333,10 @@ class LocalMemoryEngine:
         closed_to_show = closed_to_show[:4]
         selected_items = [*active_to_show, *paused_to_show, *closed_to_show]
 
-        # 4. Raw provenance drill-down (for exact wording, history questions, and unextracted details).
+        # 4. Raw provenance drill-down + Multi-Feature Reranking:
         drilled_messages: list[MessageRecord] = []
         seen_msg_ids: set[str] = {current_user_message_id}
-        if intent != "casual" or selected_items:
+        if effective_associative or selected_items:
             for item in selected_items:
                 versions_to_cite = (
                     item.versions if intent in {"history", "both"} else item.versions[-2:]
@@ -2151,8 +2348,39 @@ class LocalMemoryEngine:
                             drilled_messages.append(msg)
                             seen_msg_ids.add(msg.id)
 
-            if intent != "casual":
-                for mid in fused_msg_ids[:4]:
+            if effective_associative:
+                raw_pool_ids = list(
+                    dict.fromkeys([*fused_msg_ids, *ppr_msg_scores.keys()])
+                )[:20]
+                if self.enable_reranker and raw_pool_ids:
+                    sem_r_map = {mid: r for r, mid in enumerate(msg_sem, start=1)}
+                    fts_r_map = {mid: r for r, mid in enumerate(msg_fts, start=1)}
+                    cand_dicts = []
+                    for mid in raw_pool_ids:
+                        mrec = self.store.get_message(mid)
+                        if mrec is not None and mrec.namespace == ns:
+                            cand_dicts.append(
+                                {
+                                    "id": mrec.id,
+                                    "session_id": mrec.session_id,
+                                    "content": mrec.content,
+                                    "created_at": mrec.created_at,
+                                    "sem_rank": sem_r_map.get(mrec.id),
+                                    "fts_rank": fts_r_map.get(mrec.id),
+                                    "ppr_score": ppr_msg_scores.get(mrec.id, 0.0),
+                                }
+                            )
+                    ordered_raw_ids = self.reranker.rerank_messages(
+                        query,
+                        cand_dicts,
+                        intent=intent if intent != "casual" else "current",
+                        limit=8,
+                        diverse_sessions=bool(MULTI_SESSION_CUE.search(query)),
+                    )
+                else:
+                    ordered_raw_ids = raw_pool_ids[:6]
+
+                for mid in ordered_raw_ids[:5]:
                     if mid in seen_msg_ids:
                         continue
                     msg = self.store.get_message(mid)
@@ -2162,7 +2390,7 @@ class LocalMemoryEngine:
                         continue
                     drilled_messages.append(msg)
                     seen_msg_ids.add(msg.id)
-                    if intent in {"current", "both"}:
+                    if intent in {"current", "both"} or cue_activated:
                         for nb in self.store.get_neighbor_user_messages(msg.id, radius=1):
                             if nb.id not in seen_msg_ids and not self._belongs_to_hidden_paused_item(
                                 nb.id, paused_to_show, all_items
@@ -2176,19 +2404,15 @@ class LocalMemoryEngine:
         open_ambiguities = self.store.list_open_ambiguities(namespace=ns, limit=4)
         relevant_ambiguities: list[AmbiguityRecord] = []
         for amb in open_ambiguities:
-            amb_items = [self.store.get_item(cid) for cid in amb.candidate_item_ids]
+            amb_items = [by_item_id.get(cid) for cid in amb.candidate_item_ids]
             if intent != "casual" or any(
                 it is not None and _item_directly_matched(query, it) for it in amb_items
             ):
                 relevant_ambiguities.append(amb)
 
-        # Also check consolidations: withhold any consolidation that mentions a hidden paused item
-        # during unrelated casual chat so paused plans NEVER leak through consolidated profiles.
-        is_pref_advice = bool(PREFERENCE_ADVICE_CUE.search(query)) or bool(
-            ABSTRACT_INFERENCE_CUE.search(query)
-        )
+        # 5b. Consolidated insights (strictly withholding hidden paused items).
         relevant_consolidations: list[ConsolidationRecord] = []
-        if intent != "casual" or is_pref_advice:
+        if effective_associative:
             hidden_paused_ids = {
                 it.id
                 for it in all_items
@@ -2213,15 +2437,18 @@ class LocalMemoryEngine:
                 if len(relevant_consolidations) >= 4:
                     break
 
-        # 5c. Coreference-resolved Session Summaries + Entity-Scoped Recall (<10ms local, 0 LLM cost).
+        # 5c. Coreference-resolved Session Summaries + Entity-Scoped + HippoRAG-2 Passage PPR.
         relevant_summaries: list[SessionSummaryRecord] = []
-        if intent != "casual" or is_pref_advice:
+        if effective_associative:
             sem_ss_live = self.store.search_session_summaries(query, namespace=ns, limit=3)
             ent_ss_live = self.store.search_session_summaries_by_entities(
                 query, namespace=ns, limit=4
             )
+            all_ss_ns = self.store.list_session_summaries(namespace=ns) if ppr_sum_ids else []
+            ss_by_id = {s.id: s for s in all_ss_ns}
+            ppr_ss_live = [ss_by_id[sid] for sid in ppr_sum_ids if sid in ss_by_id]
             seen_ss_live: set[str] = set()
-            live_pool = [*ent_ss_live, *sem_ss_live]
+            live_pool = [*ent_ss_live, *sem_ss_live, *ppr_ss_live]
             if TEMPORAL_ORIGIN_CUE.search(query):
                 earliest_live = sorted(
                     ent_ss_live or self.store.list_session_summaries(namespace=ns),
@@ -2250,7 +2477,7 @@ class LocalMemoryEngine:
             )
         ]
 
-        # 6. Narrate working memory cleanly (no raw UUID JSON).
+        # 6. Narrate working memory cleanly (with deterministic relative-time anchoring).
         narrated = self._narrate_context(
             intent=intent,
             active_items=active_to_show,
@@ -2262,6 +2489,7 @@ class LocalMemoryEngine:
             consolidations=relevant_consolidations,
             session_summaries=relevant_summaries,
             core_blocks=core_blocks,
+            show_excerpts=effective_associative,
         )
 
         used_item_ids = tuple(dict.fromkeys(it.id for it in selected_items))
@@ -2284,6 +2512,7 @@ class LocalMemoryEngine:
             used_session_summary_ids=tuple(s.id for s in relevant_summaries),
             pending_message_ids=tuple(m.id for m in pending_msgs),
             ambiguity_ids=tuple(a.id for a in relevant_ambiguities),
+            cue_activated=cue_activated,
             narrated_context=narrated,
         )
 
@@ -2313,8 +2542,12 @@ class LocalMemoryEngine:
         consolidations: list[ConsolidationRecord] = (),  # type: ignore[assignment]
         session_summaries: list[SessionSummaryRecord] = (),  # type: ignore[assignment]
         core_blocks: list[CoreMemoryBlock] = (),  # type: ignore[assignment]
+        show_excerpts: bool = False,
+        as_of: str | None = None,
     ) -> str:
         sections: list[str] = []
+        if as_of:
+            sections.append(f"[历史时间截面快照（截至 {as_of} 当时有效的记忆状态）]")
 
         if core_blocks:
             lines = ["[常驻核心记忆（始终生效的长期默契与边界）]"]
@@ -2392,10 +2625,11 @@ class LocalMemoryEngine:
                 lines.append(f"- 原话：“{amb.source_quote}”｜可能指向：{cand_str}｜疑点：{amb.note}")
             sections.append("\n".join(lines))
 
-        if drilled_messages and intent in {"history", "both", "current"}:
+        if drilled_messages and (show_excerpts or intent in {"history", "both", "current"}):
             lines = ["[可核对的相关用户原话]"]
             for msg in drilled_messages[:6]:
-                lines.append(f"- ({msg.created_at}) “{msg.content}”")
+                anchor_hint = anchor_relative_dates(msg.content, msg.created_at)
+                lines.append(f"- ({msg.created_at}){anchor_hint} “{msg.content}”")
             sections.append("\n".join(lines))
 
         if not sections and intent in {"history", "both", "current"}:

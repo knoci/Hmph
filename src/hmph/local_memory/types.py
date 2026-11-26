@@ -78,6 +78,7 @@ class ItemRecord(BaseModel):
     epistemic_type: EpistemicType = "confirmed_fact"
     confidence: float = 1.0
     salience: float = 1.0
+    access_count: int = 0
     last_mentioned_at: str | None = None
     created_at: str
     updated_at: str
@@ -160,6 +161,8 @@ class TurnEvidence(BaseModel):
     used_session_summary_ids: tuple[str, ...] = ()
     pending_message_ids: tuple[str, ...] = ()
     ambiguity_ids: tuple[str, ...] = ()
+    as_of: str | None = None
+    cue_activated: bool = False
     narrated_context: str = ""
     retrieval_ms: float = 0.0
 

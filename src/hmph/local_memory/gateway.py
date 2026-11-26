@@ -25,7 +25,9 @@ Protocols exposed on one single-process SQLite daemon:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -33,9 +35,10 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from hmph import __version__
 from hmph.local_memory.engine import LocalMemoryEngine
 from hmph.local_memory.mcp_server import LocalMCPServer
 from hmph.local_memory.store import normalize_namespace
@@ -56,6 +59,7 @@ class RecallRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     namespace: str = Field(default="default", max_length=64)
     session_id: str = Field(default="airi-default", max_length=120)
+    as_of: str | None = Field(default=None, max_length=64)
 
 
 class RememberRequest(BaseModel):
@@ -88,6 +92,11 @@ class CoreMemoryUpsertRequest(BaseModel):
 class SummarizeRequest(BaseModel):
     namespace: str = Field(default="default", max_length=64)
     force: bool = False
+
+
+class ImportMemoryRequest(BaseModel):
+    payload: dict[str, Any]
+    target_namespace: str | None = Field(default=None, max_length=64)
 
 
 def resolve_namespace_and_model(
@@ -141,13 +150,22 @@ def _extract_delta_text(chunk: dict[str, Any]) -> str:
 
 
 def create_airi_gateway_app(
-    engine: LocalMemoryEngine, *, owns_engine: bool = False
+    engine: LocalMemoryEngine,
+    *,
+    owns_engine: bool = False,
+    gateway_api_key: str | None = None,
 ) -> FastAPI:
     """Create the headless FastAPI AIRI Memory Gateway (OpenAI-compatible + MCP HTTP + REST)."""
     mcp_server = LocalMCPServer(engine)
+    expected_key = (
+        gateway_api_key
+        if gateway_api_key is not None
+        else os.getenv("HMPH_GATEWAY_API_KEY", "")
+    ).strip() or None
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await engine.recover_pending_extractions()
         try:
             yield
         finally:
@@ -158,10 +176,26 @@ def create_airi_gateway_app(
 
     app = FastAPI(
         title="Hmph Memory Gateway (AIRI & MCP)",
-        version="0.5.0",
+        version=__version__,
         description="Headless single-file SQLite frontier memory component for Project AIRI and MCP agents.",
         lifespan=lifespan,
     )
+
+    if expected_key:
+        @app.middleware("http")
+        async def _bearer_auth_guard(request: Request, call_next):
+            if request.method == "OPTIONS" or request.url.path in {"/", "/v1/health"}:
+                return await call_next(request)
+            auth = request.headers.get("authorization", "").strip()
+            token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+            if not token:
+                token = request.headers.get("x-hmph-api-key", "").strip()
+            if not token or not hmac.compare_digest(token, expected_key):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": {"message": "Unauthorized: invalid or missing gateway API key"}},
+                )
+            return await call_next(request)
 
     # Enable permissive CORS so AIRI Web (airi.moeru.ai / localhost) and AIRI Desktop (Tauri)
     # can talk directly to http://127.0.0.1:8018/v1 without browser preflight errors.
@@ -184,7 +218,7 @@ def create_airi_gateway_app(
     async def root():
         return {
             "service": "hmph-memory-gateway",
-            "version": "0.5.0",
+            "version": __version__,
             "mode": "headless-memory-component",
             "target_frontends": ["Project AIRI (Web & Desktop)", "MCP Agents"],
             "protocols": ["openai-compatible", "mcp-http", "memory-rest", "memory-events-sse"],
@@ -194,6 +228,9 @@ def create_airi_gateway_app(
                 "mcp_jsonrpc": "/mcp",
                 "health": "/v1/health",
                 "memory_list": "/v1/memory",
+                "memory_as_of": "/v1/memory/as-of",
+                "memory_export": "/v1/memory/export",
+                "memory_import": "/v1/memory/import",
                 "memory_core": "/v1/memory/core",
                 "memory_events_sse": "/v1/memory/events",
                 "companion_proactive": "/v1/companion/proactive",
@@ -211,7 +248,8 @@ def create_airi_gateway_app(
         namespaces = engine.list_namespaces()
         return {
             "status": "ok",
-            "version": "0.5.0",
+            "version": __version__,
+            "auth_enabled": bool(expected_key),
             "upstream_model": engine.llm.model_name,
             "embedding": engine.embedder.name,
             "db_path": str(engine.store.db_path.resolve())
@@ -220,6 +258,8 @@ def create_airi_gateway_app(
             "timezone": engine.timezone_name,
             "namespaces": namespaces,
             "auto_consolidate_every": engine.auto_consolidate_every,
+            "session_idle_minutes": engine.session_idle_minutes,
+            "skipped_trivial_extractions": engine.skipped_trivial_extractions,
             "latency": engine.latency_stats(),
         }
 
@@ -258,7 +298,14 @@ def create_airi_gateway_app(
         ns, upstream_model = resolve_namespace_and_model(
             req.model, x_hmph_namespace, engine.llm.model_name
         )
-        session_id = (x_hmph_session_id or req.user or f"airi-{ns}").strip() or f"airi-{ns}"
+        explicit_sid = bool(
+            (x_hmph_session_id and x_hmph_session_id.strip())
+            or (req.user and req.user.strip())
+        )
+        base_sid = (x_hmph_session_id or req.user or f"airi-{ns}").strip() or f"airi-{ns}"
+        session_id = engine.resolve_episode_session_id(
+            base_sid, namespace=ns, explicit=explicit_sid
+        )
         memory_mode = (x_hmph_memory_mode or "auto").strip().lower()
         extra_params = req.model_extra or {}
 
@@ -520,7 +567,7 @@ def create_airi_gateway_app(
         async def event_stream():
             emitted = 0
             try:
-                yield f"event: connected\ndata: {json.dumps({'namespace': ns, 'version': '0.5.0'})}\n\n"
+                yield f"event: connected\ndata: {json.dumps({'namespace': ns, 'version': __version__})}\n\n"
                 while True:
                     if max_events is not None and emitted >= max_events:
                         break
@@ -545,6 +592,38 @@ def create_airi_gateway_app(
             },
         )
 
+    @app.get("/v1/memory/as-of")
+    async def get_memory_as_of(
+        as_of: str,
+        namespace: str = "default",
+        include_closed: bool = False,
+    ):
+        ns = normalize_namespace(namespace)
+        items = engine.get_items_as_of(as_of, namespace=ns, include_closed=include_closed)
+        return {
+            "namespace": ns,
+            "as_of": as_of,
+            "items": [it.model_dump(mode="json") for it in items],
+        }
+
+    @app.get("/v1/memory/export")
+    async def export_memory(namespace: str = "default", format: str = "json"):
+        ns = normalize_namespace(namespace)
+        if format.strip().lower() in {"md", "markdown"}:
+            md = engine.export_namespace(namespace=ns, fmt="markdown")
+            return PlainTextResponse(
+                content=str(md),
+                media_type="text/markdown; charset=utf-8",
+            )
+        return engine.export_namespace(namespace=ns, fmt="json")
+
+    @app.post("/v1/memory/import")
+    async def import_memory(req: ImportMemoryRequest):
+        stats = engine.import_namespace(
+            req.payload, target_namespace=req.target_namespace
+        )
+        return {"imported": stats}
+
     @app.get("/v1/memory/graph")
     async def get_memory_graph(namespace: str = "default"):
         return engine.export_graph_data(namespace=namespace)
@@ -552,7 +631,10 @@ def create_airi_gateway_app(
     @app.post("/v1/memory/recall")
     async def recall_memory(req: RecallRequest):
         ev = engine.recall_context(
-            req.query, namespace=req.namespace, session_id=req.session_id
+            req.query,
+            namespace=req.namespace,
+            session_id=req.session_id,
+            as_of=req.as_of,
         )
         return {"evidence": ev.model_dump(mode="json")}
 
