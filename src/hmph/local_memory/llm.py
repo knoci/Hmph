@@ -463,6 +463,7 @@ class OpenAICompatLLM:
             raise ValueError("API key is required for OpenAICompatLLM")
         self._api_key = api_key.strip()
         self._base_url = base_url.rstrip("/")
+        self._claude_compat = httpx.URL(self._base_url).host == "api.anthropic.com"
         self.model_name = model
         self._max_reply_tokens = max_reply_tokens
         self._max_extract_tokens = max_extract_tokens
@@ -486,6 +487,14 @@ class OpenAICompatLLM:
             await self._client.aclose()
             self._client = None
 
+    def _apply_provider_defaults(self, body: dict[str, Any]) -> None:
+        if self._claude_compat:
+            # Recent Claude models require default sampling through the compatibility endpoint.
+            body.pop("temperature", None)
+            body.pop("top_p", None)
+        elif self._disable_thinking and "deepseek" in self._base_url.lower():
+            body.setdefault("thinking", {"type": "disabled"})
+
     async def _chat_completion(
         self,
         messages: list[dict[str, str]],
@@ -506,8 +515,9 @@ class OpenAICompatLLM:
             "temperature": temperature,
             "stream": False,
         }
-        if self._disable_thinking and "deepseek" in self._base_url.lower():
-            body["thinking"] = {"type": "disabled"}
+        self._apply_provider_defaults(body)
+        # Claude's compatibility endpoint accepts strict schemas, but rejects JSON object mode.
+        json_mode = json_mode and not self._claude_compat
         if json_mode:
             body["response_format"] = {"type": "json_object"}
 
@@ -565,7 +575,7 @@ class OpenAICompatLLM:
         for item in candidate_items:
             cur = item.current
             history_brief = [
-                f"v{v.version_no}({v.change_type}/{v.status}): {v.summary}"
+                f"{v.change_type} ({v.status}): {v.summary}"
                 + (f" [{v.effective_time_text}]" if v.effective_time_text else "")
                 for v in item.versions[-4:]
             ]
@@ -619,7 +629,7 @@ class OpenAICompatLLM:
         for item in candidate_items:
             cur = item.current
             history_brief = [
-                f"v{v.version_no}({v.change_type}/{v.status}): {v.summary}"
+                f"{v.change_type} ({v.status}): {v.summary}"
                 + (f" [{v.effective_time_text}]" if v.effective_time_text else "")
                 + (f" [cond: {v.condition_text}]" if v.condition_text else "")
                 for v in item.versions[-4:]
@@ -1092,8 +1102,7 @@ class OpenAICompatLLM:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if self._disable_thinking and "deepseek" in self._base_url.lower():
-            body["thinking"] = {"type": "disabled"}
+        self._apply_provider_defaults(body)
 
         last_error: Exception | None = None
         for attempt in range(4):
@@ -1171,8 +1180,7 @@ class OpenAICompatLLM:
             for k, v in extra_params.items():
                 if k not in {"model", "messages", "stream"} and v is not None:
                     body[k] = v
-        if self._disable_thinking and "deepseek" in self._base_url.lower() and "thinking" not in body:
-            body["thinking"] = {"type": "disabled"}
+        self._apply_provider_defaults(body)
 
         last_error: Exception | None = None
         for attempt in range(4):
@@ -1226,8 +1234,7 @@ class OpenAICompatLLM:
             for k, v in extra_params.items():
                 if k not in {"model", "messages", "stream"} and v is not None:
                     body[k] = v
-        if self._disable_thinking and "deepseek" in self._base_url.lower() and "thinking" not in body:
-            body["thinking"] = {"type": "disabled"}
+        self._apply_provider_defaults(body)
 
         last_error: Exception | None = None
         for attempt in range(4):

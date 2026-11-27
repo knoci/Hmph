@@ -67,7 +67,7 @@ TOOLS_SPEC = [
                 },
                 "as_of": {
                     "type": "string",
-                    "description": "Optional ISO timestamp/date to reconstruct historical bi-temporal memory state as of that moment.",
+                    "description": "Optional ISO date or timestamp for a lookup by effective date.",
                 },
                 "namespace": _NS_PROP,
             },

@@ -1,6 +1,6 @@
 # Hmph
 
-**面向 [Project AIRI](https://github.com/moeru-ai/airi) 与 MCP 智能体的无头、单文件 SQLite 前沿长期记忆组件。**
+**供 [Project AIRI](https://github.com/moeru-ai/airi) 和 MCP 智能体使用的本地记忆后端。**
 
 <p>
   <a href="README.md">English</a> | <strong>简体中文</strong>
@@ -11,30 +11,14 @@
 [![Storage: Single SQLite File](https://img.shields.io/badge/storage-single%20SQLite%20file-003b57.svg)](docs/architecture.md)
 [![Protocol: OpenAI + MCP](https://img.shields.io/badge/protocol-OpenAI%20%2B%20MCP-blueviolet.svg)](integrations/airi/README.md)
 
-Hmph 为 AI 伴侣与本地智能体提供持久、可演化的长期记忆——**无需 Docker、Postgres、Neo4j，也无需魔改前端源码**。只需将 AIRI 的 OpenAI 兼容服务地址指向 `http://127.0.0.1:8018/v1`（或通过 MCP 挂载），每个角色即可在同一份便携式 `.db` 文件中拥有严格隔离、双时态演化且会自动睡眠整合的长期记忆。
+Hmph 用一个 SQLite 数据库保存可跨会话使用的记忆。你把周六的练琴计划改到周一，当前安排会更新，原话和旧安排仍可查。角色和交互界面由 AIRI 提供。
 
----
+## 核心功能
 
-## 核心特性
-
-- **零运维单文件架构**：单份 WAL 模式 SQLite 文件统一承载原始对话记录、FTS5 全文索引、384 维离线多语言 ONNX 向量、二分联想图谱、会话摘要与核心记忆块。
-- **Project AIRI 原生直连**：开箱即用的 OpenAI 兼容流式网关（`POST /v1/chat/completions`），100% 保留 AIRI 的 Live2D/VRM 人设提示词、情绪标签与实时语音循环（本地检索仅 `~6 ms`）。
-- **多角色命名空间严格隔离**：将 `model` 设为 `hmph/yuki`、`hmph/airi`（或传入 `X-Hmph-Namespace` 请求头），即可在同一个数据库内为不同角色彻底隔离记忆、图谱与事件流。
-- **双时态状态演化与历史时间截面回溯**：不只是追加碎片文本，而是显式追踪 `create`、`reschedule`、`update`、`pause`、`resume`、`cancel`、`complete`、`retract` 与 `ambiguous` 状态迁移，自动闭合 `valid_from` / `valid_to` 有效区间（Zep/Graphiti 非破坏性事实演替），支持按任意历史时间点 `as_of` 精确回溯当时状态。
-- **前沿认知与异构图检索架构**：
-  - **HippoRAG-2 四节点异构图 PPR**：在线上热路径直接游走 `实体 ↔ 事项 ↔ 会话摘要 ↔ 原话` 异构图并按实体逆文档频率（IDF）自适应加权（`<30 ms`）。
-  - **A-MEM 卡片盒动态双向织网**：写入时零额外 LLM 开销自动建立跨事项 `RELATED_ENTITY` 关联边。
-  - **ACT-R 认知激活度与陈述句线索唤醒**：随对话引用自动强化核心羁绊激活度，并修复“无问号陈述句”盲区——日常随口提起人名或近义情境也能自然唤醒过往偏好与前情。
-  - **MemoryOS 空闲自动分卷 + 寒暄零成本门控**：针对不传会话 ID 的 AIRI 客户端，空闲满 `45 分钟` 自动切分新情景分卷并异步总结上一段；对 `哈哈`、`嗯嗯`、`ok` 等纯应答跳过后台大模型抽取，节省约 50% 后台 Token。
-  - **万级 Float32 内存矩阵缓存与便携归档**：万级消息下向量检索 `<5 ms`，支持异常断电未完成抽取启动自愈、可选局域网 `HMPH_GATEWAY_API_KEY` 鉴权，以及一键导出/导入人类可读 Markdown 伴侣手账或无损 JSON（`hmph export` / `hmph import`）。
-- **懂分寸的伴侣深度协同**：
-  - **常驻上下文核心记忆（Core Memory）**（`/v1/memory/core`）：严格内置“已暂停计划防打扰”守卫。
-  - **实时 SSE 记忆事件总线**（`/v1/memory/events`）：当承诺被记下或更新时实时推送，便于 AIRI Live2D/VRM 触发点头、害羞等微表情反馈。
-  - **边界安全的主动关怀接口**（`/v1/companion/proactive`）：仅针对未决指代与到期活跃约定生成温和提醒，严格排除已暂停、已取消或已撤回事项。
-- **双传输协议 MCP 服务（8 个工具）**：支持 stdio（`hmph local-mcp`）与 Streamable HTTP（`POST /mcp`），可直接接入 AIRI Desktop（Tauri MCP）、Claude Desktop 或 Cursor。
-- **零复活原子级联遗忘**：按事项 ID、原话 ID 或关键词一键遗忘，在单个 SQLite 事务内同步清除版本链、关联原话与回复、图边、向量、会话摘要、睡眠整合洞察与 Core Memory 引用。
-
----
+- 按事项记录计划和偏好的变化，每次变更都可追溯到原话。对话可以分别询问现状、变更和历史。
+- 结合全文、向量和关联记录找回证据，每轮只把相关内容送给模型。
+- 后台按接收顺序处理新消息。单条提取结果反复无法解析时，队列会隔离该消息并继续处理后续消息。
+- 提供流式聊天网关和 MCP 工具。角色可使用独立命名空间，记忆可导出为 JSON 或 Markdown。
 
 ## 系统架构
 
@@ -53,54 +37,64 @@ flowchart LR
 
 ---
 
-## 30 秒快速上手（接入 Project AIRI）
+## 快速接入 Project AIRI
 
-### 1. 安装
-
-```bash
-git clone https://github.com/<your-org>/hmph.git
-cd hmph
-pip install -e ".[embeddings]"
-```
-
-> 不安装 `[embeddings]` 亦可零原生依赖运行，系统会自动退化为 FTS5 + 哈希向量（或使用你配置的云端/本地 Embedding 接口）。
-
-### 2. 配置上游模型
-
-复制 `.env.example` 为 `.env.local` 并填入你的 API Key：
+使用 Python 3.12 或 3.13。可以克隆仓库，也可以从 GitHub 下载源码包。
 
 ```bash
-cp .env.example .env.local
+git clone https://github.com/knoci/Hmph.git
+cd Hmph
+python -m pip install .
 ```
+
+如需可选的本地向量编码依赖，使用 `python -m pip install ".[embeddings]"`。基础安装可使用全文检索和哈希向量。
+
+### 配置上游模型
+
+将 `.env.example` 复制为 `.env.local`，填入模型服务的密钥和模型名。以下以 DeepSeek Flash 为例。
 
 ```env
-HMPH_DEEPSEEK_API_KEY=sk-your-key
-HMPH_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-HMPH_DEEPSEEK_MODEL=deepseek-chat
+HMPH_DEEPSEEK_API_KEY=your-key
+HMPH_DEEPSEEK_MODEL=deepseek-flash
 ```
 
-*（同时支持 DeepSeek、OpenAI、OpenRouter、Ollama 及任意 OpenAI 兼容接口，可通过 `HMPH_LOCAL_API_KEY`、`HMPH_LOCAL_BASE_URL`、`HMPH_LOCAL_MODEL` 覆盖。）*
+**接入其他模型**
+
+在 `.env.local` 中同时设置下面三个变量，再重启 Hmph。密钥和支持 Chat Completions 的模型 ID 要来自同一服务。以下以已下载模型的 Ollama 为例：
+
+```env
+HMPH_LOCAL_API_KEY=ollama
+HMPH_LOCAL_BASE_URL=http://127.0.0.1:11434/v1
+HMPH_LOCAL_MODEL=qwen3:8b
+```
+
+- **自建模型**：填写服务的 OpenAI 兼容地址和实际部署的模型名。vLLM 的模型需要有聊天模板。[Ollama 文档](https://docs.ollama.com/api/openai-compatibility) · [vLLM 文档](https://docs.vllm.ai/en/latest/serving/online_serving/)
+- **Gemini API**：地址用 `https://generativelanguage.googleapis.com/v1beta/openai/`。[Google 文档](https://ai.google.dev/gemini-api/docs/openai)
+- **Claude API**：地址用 `https://api.anthropic.com/v1`，使用已绑定工作区的 API Key。Hmph 使用 Claude 的默认采样参数，并在本地校验抽取 JSON。[Anthropic 文档](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk)
+- **Grok API**：地址用 `https://api.x.ai/v1`，选择该接口提供的 Chat Completions 模型。[xAI 文档](https://docs.x.ai/developers/rest-api-reference/inference/chat-completions)
+
+AIRI 继续连接 Hmph，Model 可以填 `hmph`。每个 Hmph 进程使用一个上游地址和密钥。换模型后，先验证流式回复和一次完整的记忆保存、更新、召回。
 
 `HMPH_LOCALE=auto` 按当前对话选择中英文记忆提示，CLI 默认为英文。设为 `en` 或 `zh` 可以固定两者的语言。`HMPH_SOURCE_TIMEZONE` 独立设置解释相对日期时使用的时区。
 
-AIRI 兼容网关已完成中英文端到端验证。Unicode 分词和默认多语言向量也适用于假名、韩文、西里尔字母和带重音符号的拉丁字母等文字的检索。
+DeepSeek Flash 已通过网关完成中英文真实模型联调。Ollama、vLLM、Gemini、Claude 和 Grok 使用模拟上游响应验证接入。Unicode 分词和可选的多语言编码器也支持假名、韩文、西里尔字母和带重音符号的拉丁字母等文字。
 
 打开使用旧全文索引的数据库时，Hmph 会从已存记录重建索引，并在启用哈希向量后端时刷新旧向量。单条消息连续三次返回无效结构后会被隔离，队列继续处理后续消息。上游服务故障时，消息保持待处理。
 
-### 3. 启动无头 AIRI 记忆网关
+### 启动网关
 
 ```bash
 hmph airi-gateway --db data/hmph.db --port 8018
 ```
 
-### 4. 连接 Project AIRI
+### 连接 AIRI
 
 打开 **AIRI → Settings → Providers → OpenAI Compatible**：
 
 | 配置项 | 填写内容 |
 | :--- | :--- |
 | **Base URL** | `http://127.0.0.1:8018/v1` |
-| **API Key** | `local-hmph` *（任意非空字符串即可，真实密钥安全保存在本地 Hmph 进程）* |
+| **API Key** | 本机网关未启用认证时填 `local-hmph`。启用认证后填网关密钥。 |
 | **Model** | 从下表按需选择（在 AIRI 中可手动输入，或点刷新列表直接选 `hmph`） |
 
 **`Model` 字段填法与区别**（用于同时指定「记忆隔离空间」和「上游推理模型」）：
@@ -109,10 +103,14 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | :--- | :--- | :--- | :--- |
 | `hmph` | `default`（默认空间） | `.env.local` 中配置的默认模型 | **最简单**，只养一个 AIRI 伴侣时直接填它 |
 | `hmph/<角色名>`<br>*(例：`hmph/yuki`、`hmph/airi`)* | `<角色名>`（独立隔离空间） | `.env.local` 中配置的默认模型 | **多角色隔离**：同一个 `.db` 文件里养多个角色，彼此记忆完全不串台 |
-| `hmph/<角色名>@<上游模型>`<br>*(例：`hmph/yuki@deepseek-reasoner`)* | `<角色名>`（独立隔离空间） | `@` 后指定的模型 | **按角色切换模型**：无需重启网关，给不同角色/配置临时指定不同上游模型 |
-| 直接填上游模型名<br>*(例：`deepseek-chat`、`gpt-4o-mini`)* | `default`（若传 `X-Hmph-Namespace` 则以请求头为准） | 你填写的该上游模型 | 兼容只填原生模型名的客户端，同时保持默认记忆开启 |
+| `hmph/<角色名>@<上游模型>`<br>*(例：`hmph/yuki@deepseek-flash`)* | `<角色名>`（独立隔离空间） | `@` 后指定的模型 | **按角色切换模型**：无需重启网关，给不同角色/配置临时指定不同上游模型 |
+| 直接填上游模型名<br>*(例：`deepseek-flash`、`gpt-4o-mini`)* | `default`（若传 `X-Hmph-Namespace` 则以请求头为准） | 你填写的该上游模型 | 兼容只填原生模型名的客户端，同时保持默认记忆开启 |
 
 > 注：前缀也兼容 `hmph:<角色名>` 与 `airi/<角色名>`；若请求中同时带有 `X-Hmph-Namespace` 请求头，以请求头为准。
+
+### 试一次改期
+
+先告诉 AIRI「我周六练琴」，再说「练琴改到周一」。在同一个记忆空间里开新会话，问「我现在约的是哪天练琴？」预期回答是周一。可用 `GET /v1/memory` 查事项状态，用 `POST /v1/memory/recall` 核对召回的证据。
 
 自定义请求头（`X-Hmph-Namespace`、`X-Hmph-Session-Id`、`X-Hmph-Memory-Mode`）、Live2D SSE 事件订阅与主动关怀心跳接入示例请见 [integrations/airi/README.md](integrations/airi/README.md)。
 
@@ -136,7 +134,7 @@ hmph airi-gateway --db data/hmph.db --port 8018
 如果 `hmph airi-gateway` 已在运行，也可以直接通过 Streamable HTTP 调用 `POST http://127.0.0.1:8018/mcp`。
 
 内置 8 个 MCP 工具：
-- `hmph_remember` — 写入用户原话并执行双时态状态演化抽取
+- `hmph_remember` — 保存用户原话并抽取记忆变化
 - `hmph_recall` — 六通道混合召回（Core Memory + ONNX + FTS5 + 实体定向召回 + 二分 PPR）
 - `hmph_list_memories` — 查看演化记忆事项、整合洞察与未决指代疑点
 - `hmph_forget` — 按 ID、消息 ID 或关键词执行零复活原子级联遗忘
@@ -154,9 +152,9 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | `POST /v1/chat/completions` | OpenAI 兼容流式/非流式对话代理，透明注入 `<hmph_memory>` |
 | `GET /v1/models` | 列出可用的 `hmph` 与 `hmph/<namespace>` 模型路由 |
 | `POST /mcp` | Streamable HTTP MCP JSON-RPC 2.0 端点 |
-| `GET /v1/memory/items` | 查询演化事项与完整版本历史 |
-| `GET /v1/memory/as-of` | 按任意历史时间点 `as_of` 回溯当时有效的双时态记忆快照 |
-| `GET /v1/memory/export` | 将指定角色记忆导出为人类可读 Markdown 手账或无损 JSON |
+| `GET /v1/memory` | 查看事项、版本记录和未解决的指代疑点 |
+| `GET /v1/memory/as-of` | 基于当前掌握的记录，按生效日期查询历史状态 |
+| `GET /v1/memory/export` | 将指定角色记忆导出为可读的 Markdown 或 JSON |
 | `POST /v1/memory/import` | 将 JSON 记忆快照幂等导入至指定角色命名空间 |
 | `POST /v1/memory/recall` | 调试混合检索证据链与本地延迟（支持可选 `as_of`） |
 | `GET /v1/memory/extractions` | 列出指定命名空间内被隔离的抽取失败消息 |
@@ -164,15 +162,16 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | `POST /v1/memory/forget` | 原子级联遗忘指定事项或原话 |
 | `POST /v1/memory/consolidate` | 触发 Map-Reduce 睡眠整合 |
 | `POST /v1/memory/summarize` | 生成消解指代后的会话情景摘要 |
-| `GET/PUT/DELETE /v1/memory/core` | 管理常驻上下文 Core Memory 记忆块 |
+| `GET /v1/memory/core` | 查看核心记忆块 |
+| `PUT/DELETE /v1/memory/core/{block_key}` | 更新或删除指定核心记忆块 |
 | `GET /v1/memory/events` | 实时 SSE 记忆事件流（`item_updated`、`ambiguity_detected`、`memory_forgotten` 等） |
 | `GET /v1/companion/proactive` | 边界安全的主动关怀建议（严格排除已暂停事项） |
 
 ---
 
-## 实测基准表现
+## 评测记录
 
-全部数据均在单文件 SQLite + 离线多语言 MiniLM ONNX 向量 + `deepseek-flash` 真实推理下测得：
+以下是项目用离线多语言 MiniLM 向量和 `deepseek-flash` 测过的选定子集。本地召回耗时与模型生成耗时分开计算。
 
 | 评测基准 | 评测范围 | 实测结果 |
 | :--- | :--- | :--- |
@@ -180,7 +179,7 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | **LongMemEval-S 核心集** | 10 道跨会话 / 时序 / 知识更新题 | **10 / 10 (100%)** *（单轮 Oracle 基线为 9 / 10）* |
 | **LongMemEval-S 拒答与偏好** | 4 道拒答防幻觉 + 2 道偏好题 | **6 / 6 (100%)** |
 | **LoCoMo（`conv-44`，675 轮）** | 12 道多跳与时序综合题 | **9 / 12 (75.0%)** *（跨会话推理与事实细节均 100%）* |
-| **AIRI 伴侣实战与万级向量压测** | 7 项边界/防打扰 + 万级 384 维向量缓存 | **7 / 7 全过** · 实时召回 **`~6 ms`** · 缓存检索 **`<4 ms`** |
+| **网关与向量检索** | 7 项边界/防打扰 + 万级 384 维向量缓存 | **7 / 7 全过** · 实时召回 **`~6 ms`** · 缓存检索 **`<4 ms`** |
 
 ---
 

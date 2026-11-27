@@ -177,7 +177,7 @@ def create_airi_gateway_app(
     app = FastAPI(
         title="Hmph Memory Gateway (AIRI & MCP)",
         version=__version__,
-        description="Headless single-file SQLite frontier memory component for Project AIRI and MCP agents.",
+        description="Local SQLite memory gateway for Project AIRI and MCP agents.",
         lifespan=lifespan,
     )
 

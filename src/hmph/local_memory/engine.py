@@ -1,9 +1,10 @@
-"""Three-layer local memory engine: short-term, bi-temporal versioned long-term, and working memory."""
+"""Assemble working context from recent messages and stored memory."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import re
@@ -97,6 +98,27 @@ TRIVIAL_BACKCHANNEL_RE = re.compile(
     r"[?？!！。.,，~～…👍❤️😂🤣😊🙏]+)$",
     re.I,
 )
+
+
+_AIRI_CONTEXT_RE = re.compile(r"\r?\n\[Context\]\s*\r?\n-\s*system:")
+_AIRI_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\]\s*")
+
+
+def sanitize_gateway_user_text(raw: str) -> str:
+    """Strip client telemetry wrappers (AIRI ping/notify/runtime-prompt) before memory storage."""
+    cleaned = (raw or "").strip()
+    if not cleaned or cleaned.lower() == "ping":
+        return ""
+    if cleaned.startswith("{"):
+        try:
+            decoded, _ = json.JSONDecoder().raw_decode(cleaned)
+            if isinstance(decoded, dict) and "notify" in decoded:
+                return ""
+        except json.JSONDecodeError:
+            pass
+    text = _AIRI_CONTEXT_RE.split(cleaned, maxsplit=1)[0].strip()
+    text = _AIRI_TIMESTAMP_PREFIX_RE.sub("", text).strip()
+    return text
 
 
 def is_trivial_backchannel(text: str) -> bool:
@@ -530,11 +552,6 @@ class LocalMemoryEngine:
             source_heading = "[Retrieved Original Conversation Excerpts (chronological)]"
             source_messages = sorted(selected_msgs, key=lambda m: m.created_at)
         elif mode == "local_state":
-            # Frontier multi-channel retrieval:
-            # (1) Dense ONNX + FTS5 on items & raw messages
-            # Spread relevance through entity, item, and message links without another model call.
-            # (3) Adaptive 2-Hop Query Decomposition only for multi-session / ordering / enumeration queries
-            # (4) Multi-feature + Session-Diversity Reranking + Deterministic Relative-Time Anchoring
             is_multi_session = bool(MULTI_SESSION_CUE.search(query))
             is_abstract_inference = bool(ABSTRACT_INFERENCE_CUE.search(query))
             is_temporal_origin = bool(TEMPORAL_ORIGIN_CUE.search(query))
@@ -559,10 +576,7 @@ class LocalMemoryEngine:
                 ppr_item_ids = [iid for iid, _ in ppr_items]
                 ppr_msg_scores = dict(ppr_msgs)
 
-            # Adaptive 2-Hop Bridge Planning (3-condition gate):
-            # 1) multi-session enumeration/ordering, OR
-            # 2) mathematically low first-pass dense confidence (< 0.52), OR
-            # 3) abstract category / preference / indirect inference query on a long history.
+            # Run an extra planning request only when the query or the initial results suggest missing evidence.
             msg_total = self.store.count_user_messages(namespace=ns)
             low_confidence_gap = (
                 top_sem_score < 0.52 and msg_total >= 40 and intent != "casual"
@@ -1564,7 +1578,7 @@ class LocalMemoryEngine:
 
     @staticmethod
     def extract_latest_user_text(messages: list[dict]) -> str:
-        """Extract latest user utterance text from OpenAI messages[] (handles string & multimodal list)."""
+        """Extract and sanitize latest user utterance text from OpenAI messages[] (string or multimodal list)."""
         for msg in reversed(messages):
             if msg.get("role") != "user":
                 continue
@@ -1572,7 +1586,7 @@ class LocalMemoryEngine:
             if isinstance(content, str):
                 text = content.strip()
                 if text:
-                    return text
+                    return sanitize_gateway_user_text(text)
             elif isinstance(content, list):
                 parts = [
                     str(part.get("text", "")).strip()
@@ -1581,7 +1595,7 @@ class LocalMemoryEngine:
                 ]
                 joined = "\n".join(p for p in parts if p).strip()
                 if joined:
-                    return joined
+                    return sanitize_gateway_user_text(joined)
         return ""
 
     @staticmethod
@@ -2301,8 +2315,7 @@ class LocalMemoryEngine:
         is_pref_advice = bool(PREFERENCE_ADVICE_CUE.search(query)) or bool(
             ABSTRACT_INFERENCE_CUE.search(query)
         )
-        # Fix declarative statement blindspot: wake up associative memory when a non-question
-        # statement mentions known entities or hits high-confidence semantic memory (>=0.52).
+        # Relevant statements can trigger associative recall even when they are not questions.
         cue_activated = (not is_trivial_backchannel(query)) and (
             bool(matched_entities) or top_item_sem >= 0.52 or top_msg_sem >= 0.52
         )
@@ -2364,7 +2377,7 @@ class LocalMemoryEngine:
             )
         )
 
-        # 3. Companion Mention Gating:
+        # Select states appropriate to the query.
         active_to_show: list[ItemRecord] = []
         paused_to_show: list[ItemRecord] = []
         closed_to_show: list[ItemRecord] = []
@@ -2380,7 +2393,7 @@ class LocalMemoryEngine:
                     if direct or (effective_associative and item.id in top_candidate_gate):
                         active_to_show.append(item)
                 elif item.status == "paused":
-                    # Strict anti-nag rule: NEVER surface paused plans unless directly referenced!
+                    # Show paused plans when the query refers to them directly.
                     if direct:
                         paused_to_show.append(item)
                 else:
@@ -2469,7 +2482,7 @@ class LocalMemoryEngine:
             ):
                 relevant_ambiguities.append(amb)
 
-        # 5b. Consolidated insights (strictly withholding hidden paused items).
+        # Exclude consolidated evidence that refers to a hidden paused item.
         relevant_consolidations: list[ConsolidationRecord] = []
         if effective_associative:
             hidden_paused_ids = {
@@ -2536,7 +2549,7 @@ class LocalMemoryEngine:
             )
         ]
 
-        # 6. Narrate working memory cleanly (with deterministic relative-time anchoring).
+        # Include anchored dates in the context sent to the model.
         narrated = self._narrate_context(
             locale=memory_locale(self.locale, query),
             intent=intent,

@@ -1,6 +1,6 @@
-"""Hmph — Headless single-file SQLite frontier long-term memory for Project AIRI & MCP agents."""
+"""Local SQLite memory for Project AIRI and MCP agents."""
 
-__version__ = "0.8.0"
+__version__ = "0.1.0"
 
 from hmph.local_memory import (
     AmbiguityRecord,

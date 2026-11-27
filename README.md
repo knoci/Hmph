@@ -1,6 +1,6 @@
 # Hmph
 
-**Headless, single-file SQLite frontier long-term memory for [Project AIRI](https://github.com/moeru-ai/airi) and MCP agents.**
+**Local memory for [Project AIRI](https://github.com/moeru-ai/airi) and MCP agents.**
 
 <p>
   <strong>English</strong> | <a href="README_CN.md">简体中文</a>
@@ -11,30 +11,14 @@
 [![Storage: Single SQLite File](https://img.shields.io/badge/storage-single%20SQLite%20file-003b57.svg)](docs/architecture.md)
 [![Protocol: OpenAI + MCP](https://img.shields.io/badge/protocol-OpenAI%20%2B%20MCP-blueviolet.svg)](integrations/airi/README.md)
 
-Hmph gives AI companions and local agents durable, evolving long-term memory **without Docker, Postgres, Neo4j, or a custom frontend fork**. Point AIRI's OpenAI-Compatible provider at `http://127.0.0.1:8018/v1` (or mount Hmph via MCP) and every character gets isolated, bi-temporal, self-consolidating memory stored in one portable `.db` file.
+Hmph keeps memory across chats in a single SQLite database. If you move a piano session from Saturday to Monday, the current plan changes and the original wording stays in the history. AIRI still supplies the character and the interface.
 
----
+## What Hmph does
 
-## Why Hmph?
-
-- **Zero-Infrastructure Single File**: One WAL-mode SQLite file stores verbatim transcripts, FTS5 full-text indices, 384-dim offline ONNX embeddings, a bipartite associative graph, session summaries, and Core Memory blocks.
-- **Native Project AIRI Integration**: Drop-in OpenAI-compatible streaming gateway (`POST /v1/chat/completions`) that preserves 100% of AIRI's Live2D/VRM system prompt, emotion tags, and TTS latency budget (`~6 ms` local recall).
-- **Multi-Character Namespace Isolation**: Switch `model` to `hmph/yuki` or `hmph/airi` (or pass `X-Hmph-Namespace`) for strict per-character memory isolation inside one database.
-- **Bi-Temporal State Evolution & Point-in-Time Snapshots**: Tracks `create`, `reschedule`, `update`, `pause`, `resume`, `cancel`, `complete`, `retract`, and `ambiguous` transitions with verbatim quotes, auto-closing `valid_from` / `valid_to` intervals (Zep/Graphiti fact succession) and supporting historical `as_of` snapshot queries.
-- **Frontier Cognitive & Graph Retrieval**:
-  - **HippoRAG-2 Heterogeneous Graph PPR**: Walks `entity ↔ item ↔ session_summary ↔ message` nodes with IDF specificity scaling on the live path (`<30 ms`).
-  - **A-MEM Zettelkasten Auto-Linking**: Dynamically cross-links related items at write time with zero extra LLM calls.
-  - **ACT-R Cognitive Activation & Cue-Triggered Recall**: Reinforces frequently recalled memories and wakes up associative context even on declarative statements without question marks.
-  - **MemoryOS Auto-Episode Rolling & Zero-Cost Trivial Gate**: Automatically segments stateless AIRI streams into episodes after idle gaps (default `45 min`) and skips background LLM extraction on pure backchannels (`"ok"`, `"haha"`, `"嗯嗯"`).
-  - **In-Memory Float32 Matrix Cache & Portable Archive**: Sub-5ms vector search across 10k+ turns, crash-safe pending recovery, optional LAN Bearer auth (`HMPH_GATEWAY_API_KEY`), and one-command Markdown/JSON memory export & import (`hmph export` / `hmph import`).
-- **Boundary-Safe Companion Cooperation**:
-  - **Always-in-Context Core Memory** (`/v1/memory/core`) with strict paused-item anti-nagging guards.
-  - **Live SSE Memory Event Bus** (`/v1/memory/events`) so Live2D/VRM hooks can react in real time when a promise is saved or updated.
-  - **Proactive Check-In API** (`/v1/companion/proactive`) that surfaces due commitments and open ambiguities while strictly excluding paused or retracted plans.
-- **Dual-Transport MCP (8 Tools)**: Connect AIRI Desktop (Tauri MCP), Claude Desktop, or Cursor over stdio (`hmph local-mcp`) or Streamable HTTP (`POST /mcp`).
-- **Atomic Zero-Resurrection Forgetting**: Forgetting an item or utterance cascades cleanly across versions, verbatim turns, graph edges, vectors, summaries, consolidations, and Core Memory in one transaction.
-
----
+- Tracks plans, preferences, and other facts as source-linked changes. You can ask what changed, what is current, or what was recorded before.
+- Finds relevant conversation history with full-text search, vectors, and links between related records. Each reply gets a small selection of that evidence.
+- Handles new messages in receipt order. If an extraction reply repeatedly has invalid structure, the queue isolates that message and keeps processing later ones.
+- Runs as a streaming chat gateway or an MCP server. Characters can use separate namespaces, and memory can be exported to JSON or Markdown.
 
 ## Architecture
 
@@ -53,54 +37,64 @@ Read the full technical deep dive in [docs/architecture.md](docs/architecture.md
 
 ---
 
-## 30-Second Quickstart (Project AIRI)
+## Quickstart for Project AIRI
 
-### 1. Install
-
-```bash
-git clone https://github.com/<your-org>/hmph.git
-cd hmph
-pip install -e ".[embeddings]"
-```
-
-> Without `[embeddings]`, Hmph still runs with zero native dependencies using FTS5 + hashing vectors (or an OpenAI-compatible embedding endpoint).
-
-### 2. Configure Your Upstream LLM
-
-Copy `.env.example` to `.env.local` and set your provider key:
+Use Python 3.12 or 3.13. Clone the repository or download a source archive from GitHub.
 
 ```bash
-cp .env.example .env.local
+git clone https://github.com/knoci/Hmph.git
+cd Hmph
+python -m pip install .
 ```
+
+Install with `python -m pip install ".[embeddings]"` to enable the optional local embedding dependencies. The base installation can use hashing vectors alongside full-text search.
+
+### Configure an upstream model
+
+Copy `.env.example` to `.env.local`, then set your provider credentials and model. The following uses DeepSeek Flash.
 
 ```env
-HMPH_DEEPSEEK_API_KEY=sk-your-key
-HMPH_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-HMPH_DEEPSEEK_MODEL=deepseek-chat
+HMPH_DEEPSEEK_API_KEY=your-key
+HMPH_DEEPSEEK_MODEL=deepseek-flash
 ```
 
-*(Works with DeepSeek, OpenAI, OpenRouter, Ollama, or any OpenAI-compatible API via `HMPH_LOCAL_API_KEY`, `HMPH_LOCAL_BASE_URL`, and `HMPH_LOCAL_MODEL`.)*
+**Other model providers**
+
+Set all three overrides in `.env.local` and restart Hmph. Use the API key and a Chat Completions model ID from the same provider. For example, with an Ollama model already installed:
+
+```env
+HMPH_LOCAL_API_KEY=ollama
+HMPH_LOCAL_BASE_URL=http://127.0.0.1:11434/v1
+HMPH_LOCAL_MODEL=qwen3:8b
+```
+
+- **Self-hosted** — Use the server's OpenAI-compatible base URL and served model ID. For vLLM, a chat template is required. [Ollama](https://docs.ollama.com/api/openai-compatibility) · [vLLM](https://docs.vllm.ai/en/latest/serving/online_serving/)
+- **Gemini API** — Use `https://generativelanguage.googleapis.com/v1beta/openai/`. [Google docs](https://ai.google.dev/gemini-api/docs/openai)
+- **Claude API** — Use `https://api.anthropic.com/v1` and a workspace-scoped API key. Hmph uses Claude's default sampling and validates extraction JSON locally. [Anthropic docs](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk)
+- **Grok API** — Use `https://api.x.ai/v1` with a model available through Chat Completions. [xAI docs](https://docs.x.ai/developers/rest-api-reference/inference/chat-completions)
+
+AIRI still connects to Hmph and can use `hmph` as the model. Each Hmph process uses one upstream URL and credential. A new model should pass a streaming reply and a save–update–recall check before you rely on it for memory.
 
 With `HMPH_LOCALE=auto`, memory prompts follow English and Chinese conversation and the CLI uses English. Use `en` or `zh` to set both explicitly. Set `HMPH_SOURCE_TIMEZONE` independently to control how relative dates are interpreted.
 
-The AIRI-compatible gateway has been tested end to end in English and Chinese. Unicode tokenization and the default multilingual embeddings also support lexical and semantic search across scripts such as kana, Hangul, Cyrillic, and accented Latin.
+DeepSeek Flash was exercised with live requests in English and Chinese through the gateway. The Ollama, vLLM, Gemini, Claude, and Grok configurations were exercised with simulated upstream responses. Unicode tokenization and the optional multilingual encoder also cover scripts such as kana, Hangul, Cyrillic, and accented Latin.
 
 When opening a database with older full-text indexes, Hmph rebuilds them from stored records. Older hashing vectors are refreshed when the hashing backend is active. Messages that produce three invalid extraction responses are isolated so the queue can continue. Provider failures leave messages pending.
 
-### 3. Start the Headless AIRI Gateway
+### Start the gateway
 
 ```bash
 hmph airi-gateway --db data/hmph.db --port 8018
 ```
 
-### 4. Connect Project AIRI
+### Connect AIRI
 
 In **AIRI → Settings → Providers → OpenAI Compatible**:
 
 | Setting | Value |
 | :--- | :--- |
 | **Base URL** | `http://127.0.0.1:8018/v1` |
-| **API Key** | `local-hmph` *(any non-empty string; your real key stays local)* |
+| **API Key** | `local-hmph` for an unauthenticated local gateway. Use the configured gateway key when authentication is enabled. |
 | **Model** | Choose one of the formats below (type manually or fetch `hmph` from `/v1/models`) |
 
 **How `Model` routing works** (controls both the isolated memory namespace and the upstream LLM):
@@ -109,10 +103,14 @@ In **AIRI → Settings → Providers → OpenAI Compatible**:
 | :--- | :--- | :--- | :--- |
 | `hmph` | `default` | Default model from `.env.local` | **Simplest setup** — single AIRI companion |
 | `hmph/<character>`<br>*(e.g. `hmph/yuki`, `hmph/airi`)* | `<character>` (strictly isolated) | Default model from `.env.local` | **Multi-character isolation** — keep separate characters' memories in one `.db` file without cross-talk |
-| `hmph/<character>@<upstream_model>`<br>*(e.g. `hmph/yuki@deepseek-reasoner`)* | `<character>` (strictly isolated) | Explicit model after `@` | **Per-character model override** — use a different upstream LLM per AIRI profile without restarting Hmph |
-| Raw upstream model name<br>*(e.g. `deepseek-chat`, `gpt-4o-mini`)* | `default` (or `X-Hmph-Namespace` header) | The exact model name you entered | Clients that expect a standard provider model ID while still using default memory |
+| `hmph/<character>@<upstream_model>`<br>*(e.g. `hmph/yuki@deepseek-flash`)* | `<character>` (strictly isolated) | Explicit model after `@` | **Per-character model override** — use a different upstream LLM per AIRI profile without restarting Hmph |
+| Raw upstream model name<br>*(e.g. `deepseek-flash`, `gpt-4o-mini`)* | `default` (or `X-Hmph-Namespace` header) | The exact model name you entered | Clients that expect a standard provider model ID while still using default memory |
 
 > Tip: `hmph:<character>` and `airi/<character>` are also accepted. If the `X-Hmph-Namespace` header is present, it takes precedence over the model prefix.
+
+### Try a memory update
+
+Tell AIRI “I’m practicing piano on Saturday,” then “Move piano practice to Monday.” Start a new chat in the same memory namespace and ask “When am I practicing piano?” The expected answer is Monday. To inspect the stored state and its evidence, use `GET /v1/memory` and `POST /v1/memory/recall`.
 
 See [integrations/airi/README.md](integrations/airi/README.md) for custom headers (`X-Hmph-Namespace`, `X-Hmph-Session-Id`, `X-Hmph-Memory-Mode`), SSE Live2D hooks, and proactive check-ins.
 
@@ -136,7 +134,7 @@ Mount Hmph in AIRI Desktop, Claude Desktop, or Cursor using [integrations/airi/m
 Or talk directly to the running gateway over Streamable HTTP at `POST http://127.0.0.1:8018/mcp`.
 
 Exposed MCP tools:
-- `hmph_remember` — Store verbatim text and run bi-temporal state-evolution extraction
+- `hmph_remember` — Store verbatim text and extract changes to memory
 - `hmph_recall` — 6-channel hybrid recall (Core Memory + ONNX + FTS5 + Entity-Scoped + Bipartite PPR)
 - `hmph_list_memories` — Inspect evolving items, consolidated insights, and open ambiguities
 - `hmph_forget` — Atomic cascade-forget by ID, message ID, or keyword
@@ -154,9 +152,9 @@ Exposed MCP tools:
 | `POST /v1/chat/completions` | OpenAI-compatible streaming & non-streaming proxy with memory injection |
 | `GET /v1/models` | Lists available `hmph` and `hmph/<namespace>` model routes |
 | `POST /mcp` | Streamable HTTP MCP JSON-RPC 2.0 endpoint |
-| `GET /v1/memory/items` | List evolving state items and full version histories |
-| `GET /v1/memory/as-of` | Reconstruct exact bi-temporal memory state as of any past ISO date/timestamp |
-| `GET /v1/memory/export` | Export character memory as a readable Markdown handbook or lossless JSON |
+| `GET /v1/memory` | List items, their version histories, and open ambiguities |
+| `GET /v1/memory/as-of` | Look up state by effective date using the records available now |
+| `GET /v1/memory/export` | Export character memory as readable Markdown or JSON |
 | `POST /v1/memory/import` | Idempotently import a JSON memory snapshot into any namespace |
 | `POST /v1/memory/recall` | Inspect raw hybrid retrieval evidence and latency (supports optional `as_of`) |
 | `GET /v1/memory/extractions` | List isolated extraction failures in a namespace |
@@ -164,15 +162,16 @@ Exposed MCP tools:
 | `POST /v1/memory/forget` | Atomically cascade-forget items or source utterances |
 | `POST /v1/memory/consolidate` | Run Map-Reduce Sleep Consolidation |
 | `POST /v1/memory/summarize` | Generate coreference-resolved session summaries |
-| `GET/PUT/DELETE /v1/memory/core` | Manage always-in-context Core Memory blocks |
+| `GET /v1/memory/core` | List core memory blocks |
+| `PUT/DELETE /v1/memory/core/{block_key}` | Update or delete a core memory block |
 | `GET /v1/memory/events` | Real-time SSE stream (`item_updated`, `ambiguity_detected`, `memory_forgotten`, …) |
 | `GET /v1/companion/proactive` | Boundary-safe proactive check-in suggestions (strictly excludes paused items) |
 
 ---
 
-## Verified Benchmarks
+## Evaluation notes
 
-Measured on a single SQLite file with offline multilingual MiniLM ONNX embeddings and `deepseek-flash`:
+The results below come from selected project evaluation subsets with offline multilingual MiniLM embeddings and `deepseek-flash`. Local recall latency excludes upstream model generation.
 
 | Benchmark | Scope | Result |
 | :--- | :--- | :--- |
@@ -180,7 +179,7 @@ Measured on a single SQLite file with offline multilingual MiniLM ONNX embedding
 | **LongMemEval-S Core** | 10 temporal / multi-session / update Qs | **10 / 10 (100%)** *(Oracle: 9 / 10)* |
 | **LongMemEval-S Abstention & Preference** | 4 abstention + 2 preference Qs | **6 / 6 (100%)** |
 | **LoCoMo (`conv-44`, 675 turns)** | 12 multi-hop & temporal Qs | **9 / 12 (75.0%)** *(Cat 3 & Cat 4: 100%)* |
-| **AIRI Live Companion & Scale** | 7 UX/boundary checks + 5k–10k cached 384d vectors | **7 / 7 PASS** · **~6 ms** live recall · **`<4 ms`** cached vector search |
+| **Gateway and vector search** | 7 UX/boundary checks + 5k–10k cached 384d vectors | **7 / 7 PASS** · **~6 ms** live recall · **`<4 ms`** cached vector search |
 
 ---
 

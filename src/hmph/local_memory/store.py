@@ -1,4 +1,4 @@
-"""Single-file SQLite memory store: versioned items, bi-temporal graph, FTS5, vectors, and DAG forget."""
+"""SQLite persistence for memory records, source links, and search indexes."""
 
 from __future__ import annotations
 
@@ -1327,7 +1327,7 @@ class LocalMemoryStore:
     ) -> list[str]:
         """Apply one source's entire extraction once and mark it complete in the same transaction."""
         ts = created_at or _now_iso()
-        # Pre-compute embeddings outside the SQLite write lock so the transaction stays sub-ms.
+        # Compute embeddings before taking the SQLite write lock.
         texts_to_embed: list[str] = []
         embed_indices: list[int] = []
         for idx, op in enumerate(operations):
@@ -1964,7 +1964,7 @@ class LocalMemoryStore:
         return int(row["n"]) if row else 0
 
     def rebuild_fts_anchors(self) -> int:
-        """Rebuild messages_fts with relative-date/year anchored tokens (zero LLM cost)."""
+        """Rebuild the message index with tokens for anchored relative dates."""
         rows = self._conn.execute(
             "SELECT id, content, created_at FROM messages WHERE role = 'user' AND deleted = 0"
         ).fetchall()
@@ -2558,7 +2558,7 @@ class LocalMemoryStore:
         }
 
     # ------------------------------------------------------------------
-    # Atomic Cascade Forgetting (DAG-based, namespace-scoped, zero resurrection)
+    # Cascade deletion
     # ------------------------------------------------------------------
 
     def forget(self, target: str, *, namespace: str = "default") -> ForgetReceipt:
@@ -2922,7 +2922,7 @@ class LocalMemoryStore:
         )
 
     # ------------------------------------------------------------------
-    # Bi-Temporal Point-in-Time Snapshot, Session Idle & Export/Import
+    # Historical queries and snapshots
     # ------------------------------------------------------------------
 
     def get_latest_session_activity(
@@ -2977,7 +2977,7 @@ class LocalMemoryStore:
         namespace: str = "default",
         include_closed: bool = False,
     ) -> list[ItemRecord]:
-        """Reconstruct exact bi-temporal state of all items in `namespace` as of `as_of` timestamp."""
+        """Select item versions by effective date using the records currently available."""
         ns = normalize_namespace(namespace)
         all_items = self.list_items(namespace=ns)
         snapshots: list[ItemRecord] = []
@@ -3020,7 +3020,7 @@ class LocalMemoryStore:
             (ns,),
         ).fetchall()
         return {
-            "schema_version": "0.8.0",
+            "schema_version": "0.1.0",
             "namespace": ns,
             "exported_at": _now_iso(),
             "core_blocks": [b.model_dump(mode="json") for b in core_blocks],

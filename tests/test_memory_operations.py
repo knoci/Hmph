@@ -36,6 +36,52 @@ def create_item(title, summary):
     }
 
 
+class ProviderCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_accepts_memory_extraction_and_reply_parameters(self):
+        bodies = []
+
+        def respond(request):
+            self.assertEqual(str(request.url), "https://api.anthropic.com/v1/chat/completions")
+            body = json.loads(request.content)
+            bodies.append(body)
+            self.assertNotIn("temperature", body)
+            self.assertNotIn("top_p", body)
+            if body["stream"]:
+                return httpx.Response(
+                    200, text='data: {"choices":[{"delta":{"content":"Monday"}}]}\n\ndata: [DONE]\n\n',
+                    headers={"content-type": "text/event-stream"},
+                )
+            return chat_response('{"changes":[]}')
+
+        model = OpenAICompatLLM("fixture", base_url="https://api.anthropic.com/v1/", model="claude-fixture")
+        model._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.addAsyncCleanup(model.aclose)
+
+        question = "When did we reschedule?"
+        time_options = {"now_iso": "2026-11-27T09:00:00Z", "timezone_name": "UTC"}
+        extraction, _ = await model.extract_changes(
+            user_message=question, candidate_items=[], recent_messages=[], **time_options,
+        )
+        self.assertEqual(extraction.changes, [])
+        self.assertNotIn("response_format", bodies[0])
+
+        messages = [{"role": "user", "content": question}]
+        await model.proxy_chat_completion(messages=messages, temperature=0.3, extra_params={"top_p": 0.8})
+        chunks = [
+            chunk async for chunk in model.proxy_chat_completion_stream(
+                messages=messages, temperature=0.3, extra_params={"top_p": 0.8},
+            )
+        ]
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "Monday")
+        standalone = [
+            chunk async for chunk in model.generate_reply_stream(
+                user_message=question, recent_messages=[], narrated_context="", **time_options,
+            )
+        ]
+        self.assertEqual(standalone[0]["delta"], "Monday")
+        self.assertEqual(len(bodies), 4)
+
+
 class ExtractionReleaseTests(unittest.IsolatedAsyncioTestCase):
     def test_malformed_output_is_distinct_from_no_changes(self):
         for raw in ("chat", "{}", '{"changes":[', '{"changes":{}}', '{"changes":[{"action":"typo"}]}'):
@@ -153,6 +199,82 @@ class ExtractionReleaseTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(bool(re.search(r"[\u4e00-\u9fff]", system)), zh)
                 finally:
                     await engine.close()
+
+    async def test_airi_desktop_wrapper_and_notify_payloads_are_sanitized(self):
+        forwarded_users = []
+        extract_inputs = []
+
+        def respond(request):
+            body = json.loads(request.content)
+            messages = body["messages"]
+            if "response_format" in body:
+                payload = json.loads(messages[-1]["content"])
+                user_msg = payload["current_user_message"]
+                extract_inputs.append(user_msg)
+                change = {
+                    "action": "create",
+                    "title": "Piano practice",
+                    "kind": "plan",
+                    "summary": "Practice piano on Saturday",
+                    "effective_time_text": "周六",
+                    "source_quote": user_msg,
+                }
+                return chat_response(json.dumps({"changes": [change]}, ensure_ascii=False))
+            forwarded_users.append(messages[-1]["content"])
+            if len(forwarded_users) == 1:
+                return chat_response("Pong!")
+            return chat_response('<|ACT {"emotion":"happy"}|> 收到')
+
+        engine = make_engine(http_model(respond))
+        try:
+            app = create_airi_gateway_app(engine, gateway_api_key="")
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://app") as client:
+                # 1. Connectivity ping: forwarded upstream, zero DB writes or extraction calls.
+                r_ping = await client.post(
+                    "/v1/chat/completions",
+                    json={"stream": False, "messages": [{"role": "user", "content": "ping"}]},
+                )
+                self.assertEqual(r_ping.status_code, 200)
+                self.assertEqual(r_ping.json()["choices"][0]["message"]["content"], "Pong!")
+
+                # 2. Avatar poke notification + runtime prompt: forwarded upstream, zero DB writes.
+                poke_payload = (
+                    '{\n  "notify": {\n    "id": "avatar-touch:1",\n    "kind": "ping"\n  }\n}\n\n'
+                    '流式控制 token 必须严格使用 `<|NAME payload|>` 形式。'
+                )
+                r_poke = await client.post(
+                    "/v1/chat/completions",
+                    json={"stream": False, "messages": [{"role": "user", "content": poke_payload}]},
+                )
+                self.assertEqual(r_poke.status_code, 200)
+                await engine.flush()
+                self.assertEqual(engine.get_session_messages("airi-default"), [])
+                self.assertEqual(extract_inputs, [])
+
+                # 3. Normal AIRI Desktop utterance with timestamp & [Context] wrapper.
+                wrapped_turn = (
+                    "[2026-11-27 13:27] 周六练琴\n"
+                    "[Context]\n"
+                    "- system:airi-runtime-prompt: 流式控制 token ... <|ACT {\"emotion\":\"surprised\"}|> 哇... 你给我准备了礼物吗？"
+                )
+                r_chat = await client.post(
+                    "/v1/chat/completions",
+                    json={"stream": False, "messages": [{"role": "user", "content": wrapped_turn}]},
+                )
+                self.assertEqual(r_chat.status_code, 200)
+                await engine.flush()
+
+                # Upstream receives the full original wrapper intact; DB & extraction store ONLY "周六练琴".
+                self.assertEqual(forwarded_users[-1], wrapped_turn)
+                self.assertEqual(extract_inputs, ["周六练琴"])
+                stored_user = [m for m in engine.get_session_messages("airi-default") if m.role == "user"]
+                self.assertEqual([m.content for m in stored_user], ["周六练琴"])
+
+                ev = engine.recall_context("练琴约在周几？", session_id="s-new")
+                self.assertIn("周六", ev.narrated_context)
+                self.assertNotIn("airi-runtime-prompt", ev.narrated_context)
+        finally:
+            await engine.close()
 
 
 class TextIndexUpgradeTests(unittest.TestCase):
