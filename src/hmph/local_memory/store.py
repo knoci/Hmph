@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from hmph.lexical import tokenize
+from hmph.lexical import TOKENIZER_VERSION, tokenize
 from hmph.local_memory.embeddings import (
     Embedder,
+    HashingEmbedder,
     batch_cosine_top_k,
     build_normalized_matrix,
     cosine_similarity,
@@ -49,8 +50,25 @@ CREATE TABLE IF NOT EXISTS messages (
     timezone TEXT NOT NULL DEFAULT 'UTC',
     extracted INTEGER NOT NULL DEFAULT 0,
     deleted INTEGER NOT NULL DEFAULT 0,
-    reply_to_message_id TEXT
+    reply_to_message_id TEXT,
+    extract_attempts INTEGER NOT NULL DEFAULT 0,
+    extraction_failure TEXT
 );
+
+CREATE TABLE IF NOT EXISTS memory_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS message_ingest_order (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_assign_ingest_order AFTER INSERT ON messages
+BEGIN
+    INSERT INTO message_ingest_order (message_id) VALUES (NEW.id);
+END;
 
 CREATE INDEX IF NOT EXISTS idx_messages_session_time
     ON messages (session_id, created_at);
@@ -227,12 +245,16 @@ def normalize_namespace(namespace: str | None) -> str:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _fts_tokens(text: str) -> str:
     tokens = tokenize(text)
     return " ".join(tokens) if tokens else text.strip()
+
+
+def _timed_fts_tokens(text: str, recorded_at: str) -> str:
+    return " ".join([_fts_tokens(text), *extract_anchored_search_tokens(text, recorded_at)]).strip()
 
 
 def _fts_expand_token(token: str) -> list[str]:
@@ -268,6 +290,10 @@ def _fts_query(text: str) -> str:
     return " OR ".join(expanded[:28])
 
 
+class StaleExtraction(ValueError):
+    """The source was received before the item's current version."""
+
+
 class LocalMemoryStore:
     """Authoritative SQLite store for raw turns, evolving items, edges, vectors, and FTS5."""
 
@@ -279,8 +305,24 @@ class LocalMemoryStore:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
+        # Use the legacy insertion order once to migrate databases without a durable sequence.
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO message_ingest_order (message_id)
+                SELECT m.id FROM messages AS m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM message_ingest_order AS seq WHERE seq.message_id = m.id
+                )
+                ORDER BY m.rowid
+                """
+            )
         # Backward-compatible optional columns for provenance mapping, epistemic layering & multi-namespace.
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "extract_attempts" not in cols:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN extract_attempts INTEGER NOT NULL DEFAULT 0")
+        if "extraction_failure" not in cols:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN extraction_failure TEXT")
         if "external_id" not in cols:
             self._conn.execute("ALTER TABLE messages ADD COLUMN external_id TEXT")
             self._conn.execute(
@@ -334,10 +376,105 @@ class LocalMemoryStore:
             "CREATE INDEX IF NOT EXISTS idx_consolidations_ns ON consolidations (namespace, updated_at DESC)"
         )
         self._conn.commit()
+        self._upgrade_text_indexes()
         # In-memory acceleration caches (invalidated atomically on write/merge/forget).
         self._vec_cache: dict[tuple[str, str, str], tuple[list[str], object, dict[str, str]]] = {}
         self._graph_cache: dict[str, object] = {}
         self._query_vec_cache: dict[tuple[str, str], list[float]] = {}
+
+    def _upgrade_text_indexes(self) -> None:
+        """Rebuild pretokenized indexes atomically, and refresh legacy local hashes on use."""
+        specs = (
+            ("message", "messages_fts", "message_id", """
+                SELECT id, content AS text, created_at AS anchor FROM messages
+                WHERE role = 'user' AND deleted = 0
+            """),
+            ("item_version", "items_fts", "version_id", """
+                SELECT v.id, v.item_id, i.title || ' ' || v.summary || ' '
+                       || COALESCE(v.effective_time_text, '') || ' ' || COALESCE(v.condition_text, '') AS text,
+                       i.entities_json, NULL AS anchor
+                FROM item_versions AS v JOIN items AS i ON i.id = v.item_id
+            """),
+            ("session_summary", "session_summaries_fts", "summary_id", """
+                SELECT id, summary AS text, facts_json, entities_json,
+                       session_date AS anchor FROM session_summaries
+            """),
+            ("consolidation", "consolidations_fts", "consolidation_id", """
+                SELECT id, topic || ' ' || summary AS text, NULL AS anchor FROM consolidations
+            """),
+        )
+        hash_embedder = self.embedder if isinstance(self.embedder, HashingEmbedder) else None
+        with self._conn:
+            fts_changed = self._conn.execute(
+                """
+                INSERT INTO memory_metadata (key, value) VALUES ('tokenizer_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                WHERE value != excluded.value
+                """,
+                (str(TOKENIZER_VERSION),),
+            ).rowcount == 1
+            hashes_changed = hash_embedder is not None and self._conn.execute(
+                "INSERT OR IGNORE INTO memory_metadata (key, value) VALUES (?, 'ready')",
+                (hash_embedder.name,),
+            ).rowcount == 1
+            if not fts_changed and not hashes_changed:
+                return
+            for kind, fts_table, id_column, query in specs:
+                if kind in {"message", "item_version"}:
+                    vector_table = "embeddings"
+                    vector_id = "target_id"
+                    legacy_filter = "target_type = ? AND model_name = ?"
+                    legacy_params = (kind, hash_embedder.legacy_name) if hash_embedder else ()
+                else:
+                    vector_table = kind + "_embeddings"
+                    vector_id = id_column
+                    legacy_filter = "model_name = ?"
+                    legacy_params = (hash_embedder.legacy_name,) if hash_embedder else ()
+                legacy_ids = set()
+                if hashes_changed:
+                    legacy_ids = {
+                        row[0] for row in self._conn.execute(
+                            f"SELECT {vector_id} FROM {vector_table} WHERE {legacy_filter}",
+                            legacy_params,
+                        )
+                    }
+                if not fts_changed and not legacy_ids:
+                    continue
+                if fts_changed:
+                    indexed_messages = {
+                        row[0] for row in self._conn.execute("SELECT message_id FROM messages_fts")
+                    } if kind == "message" else set()
+                    self._conn.execute(f"DELETE FROM {fts_table}")
+                for row in self._conn.execute(query):
+                    identity = row["id"]
+                    fields = row.keys()
+                    parts = [row["text"]]
+                    if "facts_json" in fields:
+                        parts.extend(json.loads(row["facts_json"]))
+                    if "entities_json" in fields:
+                        parts.extend(json.loads(row["entities_json"]))
+                    content = " ".join(parts).strip()
+                    if fts_changed and (kind != "message" or identity in indexed_messages):
+                        tokens = _timed_fts_tokens(content, row["anchor"]) if row["anchor"] else _fts_tokens(content)
+                        if kind == "item_version":
+                            self._conn.execute(
+                                "INSERT INTO items_fts (item_id, version_id, tokens) VALUES (?, ?, ?)",
+                                (row["item_id"], identity, tokens),
+                            )
+                        else:
+                            self._conn.execute(
+                                f"INSERT INTO {fts_table} ({id_column}, tokens) VALUES (?, ?)",
+                                (identity, tokens),
+                            )
+                    if identity in legacy_ids and hash_embedder is not None:
+                        [vector] = hash_embedder.embed_passages([content])
+                        self._conn.execute(
+                            f"UPDATE {vector_table} SET model_name = ?, dim = ?, vector = ?"
+                            f" WHERE {vector_id} = ? AND {legacy_filter}",
+                            (hash_embedder.name, hash_embedder.dimension, pack_vector(vector), identity, *legacy_params),
+                        )
+                if legacy_ids:
+                    self._conn.execute(f"DELETE FROM {vector_table} WHERE {legacy_filter}", legacy_params)
 
     def _invalidate_cache(self, namespace: str | None = None) -> None:
         if namespace is None:
@@ -381,11 +518,12 @@ class LocalMemoryStore:
         reply_to_message_id: str | None = None,
         index_for_retrieval: bool = True,
         external_id: str | None = None,
+        extract_state: bool = True,
     ) -> MessageRecord:
         ns = normalize_namespace(namespace)
         msg_id = str(uuid4())
         ts = created_at or _now_iso()
-        extracted = 1 if role == "assistant" else 0
+        extracted = int(role != "user" or not extract_state)
         vector_blob: bytes | None = None
         if index_for_retrieval and role == "user" and self.embedder is not None:
             vecs = self.embedder.embed_passages([content])
@@ -442,6 +580,7 @@ class LocalMemoryStore:
             timezone=timezone_name,
             extracted=bool(extracted),
             deleted=False,
+            extraction_status="done" if extracted else "pending",
         )
 
     def get_message(self, message_id: str) -> MessageRecord | None:
@@ -463,9 +602,10 @@ class LocalMemoryStore:
         ns = normalize_namespace(namespace)
         row = self._conn.execute(
             """
-            SELECT * FROM messages
-            WHERE namespace = ? AND session_id = ? AND role = 'user' AND deleted = 0
-            ORDER BY created_at DESC, rowid DESC
+            SELECT m.* FROM messages AS m
+            JOIN message_ingest_order AS seq ON seq.message_id = m.id
+            WHERE m.namespace = ? AND m.session_id = ? AND m.role = 'user' AND m.deleted = 0
+            ORDER BY seq.sequence DESC
             LIMIT 1
             """,
             (ns, session_id),
@@ -475,8 +615,8 @@ class LocalMemoryStore:
         try:
             prev_dt = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
             if prev_dt.tzinfo is None:
-                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
-            now_dt = datetime.now(timezone.utc)
+                prev_dt = prev_dt.replace(tzinfo=UTC)
+            now_dt = datetime.now(UTC)
             if abs((now_dt - prev_dt).total_seconds()) <= within_seconds:
                 return self._row_to_message(row)
         except ValueError:
@@ -493,13 +633,19 @@ class LocalMemoryStore:
         ).fetchall()
         return {r["id"]: r["external_id"] for r in rows}
 
-    def get_message_ids_by_external(self, external_ids: list[str] | tuple[str, ...]) -> list[str]:
+    def get_message_ids_by_external(
+        self, external_ids: list[str] | tuple[str, ...], *, namespace: str | None = None
+    ) -> list[str]:
         if not external_ids:
             return []
         ph = ",".join("?" for _ in external_ids)
+        ns = normalize_namespace(namespace) if namespace is not None else None
         rows = self._conn.execute(
-            f"SELECT id, external_id FROM messages WHERE external_id IN ({ph}) AND deleted = 0",
-            list(external_ids),
+            f"""
+            SELECT id, external_id FROM messages
+            WHERE external_id IN ({ph}) AND deleted = 0 AND (? IS NULL OR namespace = ?)
+            """,
+            [*external_ids, ns, ns],
         ).fetchall()
         by_ext = {r["external_id"]: r["id"] for r in rows}
         return [by_ext[ext] for ext in external_ids if ext in by_ext]
@@ -575,7 +721,7 @@ class LocalMemoryStore:
         return found
 
     # ------------------------------------------------------------------
-    # Coreference-Resolved Session Summaries (SimpleMem / Hindsight Layer)
+    # Session summaries and their search indexes
     # ------------------------------------------------------------------
 
     def upsert_session_summary(
@@ -958,7 +1104,7 @@ class LocalMemoryStore:
         return [c for _, c in scored[:limit]]
 
     # ------------------------------------------------------------------
-    # Letta-Style Core Memory Blocks (Always-in-Context Companion Profile)
+    # Core memory blocks
     # ------------------------------------------------------------------
 
     def get_core_memory_blocks(self, *, namespace: str = "default") -> list[CoreMemoryBlock]:
@@ -1046,28 +1192,78 @@ class LocalMemoryStore:
         return [self._row_to_message(rows[i]) for i in range(lo, hi) if i != idx]
 
     def get_pending_messages(
-        self, *, namespace: str = "default", exclude_id: str | None = None
+        self, *, namespace: str = "default", exclude_id: str | None = None, limit: int = -1
     ) -> list[MessageRecord]:
-        ns = normalize_namespace(namespace)
-        if exclude_id:
-            rows = self._conn.execute(
+        rows = self._conn.execute(
+            """
+            SELECT m.* FROM messages AS m
+            JOIN message_ingest_order AS seq ON seq.message_id = m.id
+            WHERE m.namespace = ? AND m.role = 'user' AND m.extracted = 0 AND m.deleted = 0
+              AND m.extraction_failure IS NULL AND (? IS NULL OR m.id != ?)
+            ORDER BY seq.sequence
+            LIMIT ?
+            """,
+            (normalize_namespace(namespace), exclude_id, exclude_id, limit),
+        ).fetchall()
+        return [self._row_to_message(row) for row in rows]
+
+    def record_extraction_failure(self, message_id: str, *, stale: bool = False) -> bool:
+        """Count structural failures and quarantine at the limit or on a stale write."""
+        with self._conn:
+            self._conn.execute(
                 """
-                SELECT * FROM messages
-                WHERE namespace = ? AND role = 'user' AND extracted = 0 AND deleted = 0 AND id != ?
-                ORDER BY created_at ASC, rowid ASC
+                UPDATE messages
+                SET extract_attempts = extract_attempts + CASE WHEN ? THEN 0 ELSE 1 END,
+                    extraction_failure = CASE
+                        WHEN ? THEN 'stale_source'
+                        WHEN extract_attempts >= 2 THEN 'invalid_output'
+                        ELSE NULL
+                    END
+                WHERE id = ? AND extracted = 0 AND deleted = 0 AND extraction_failure IS NULL
                 """,
-                (ns, exclude_id),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
+                (stale, stale, message_id),
+            )
+        message = self.get_message(message_id)
+        return message is None or message.extraction_status == "quarantined"
+
+    def list_quarantined_messages(self, *, namespace: str = "default") -> list[MessageRecord]:
+        rows = self._conn.execute(
+            """
+            SELECT m.* FROM messages AS m
+            JOIN message_ingest_order AS seq ON seq.message_id = m.id
+            WHERE m.namespace = ? AND m.deleted = 0 AND m.extraction_failure IS NOT NULL
+            ORDER BY seq.sequence
+            """,
+            (normalize_namespace(namespace),),
+        ).fetchall()
+        return [self._row_to_message(row) for row in rows]
+
+    def requeue_extraction(self, message_id: str, *, namespace: str) -> bool:
+        with self._conn:
+            result = self._conn.execute(
                 """
-                SELECT * FROM messages
-                WHERE namespace = ? AND role = 'user' AND extracted = 0 AND deleted = 0
-                ORDER BY created_at ASC, rowid ASC
+                UPDATE messages SET extract_attempts = 0, extraction_failure = NULL
+                WHERE id = ? AND namespace = ? AND deleted = 0 AND extraction_failure IS NOT NULL
                 """,
-                (ns,),
-            ).fetchall()
-        return [self._row_to_message(r) for r in rows]
+                (message_id, normalize_namespace(namespace)),
+            )
+        return result.rowcount == 1
+
+    def get_messages_before(self, message: MessageRecord, *, limit: int) -> list[MessageRecord]:
+        rows = self._conn.execute(
+            """
+            SELECT m.* FROM messages AS m
+            JOIN message_ingest_order AS seq ON seq.message_id = m.id
+            WHERE m.namespace = ? AND m.session_id = ? AND m.deleted = 0
+              AND seq.sequence < (
+                  SELECT sequence FROM message_ingest_order WHERE message_id = ?
+              )
+            ORDER BY seq.sequence DESC
+            LIMIT ?
+            """,
+            (message.namespace, message.session_id, message.id, limit),
+        ).fetchall()
+        return [self._row_to_message(row) for row in reversed(rows)]
 
     def mark_message_extracted(self, message_id: str) -> None:
         with self._conn:
@@ -1129,7 +1325,7 @@ class LocalMemoryStore:
         *,
         created_at: str | None = None,
     ) -> list[str]:
-        """Atomically persist all extracted state changes, versions, edges, vectors, and FTS5."""
+        """Apply one source's entire extraction once and mark it complete in the same transaction."""
         ts = created_at or _now_iso()
         # Pre-compute embeddings outside the SQLite write lock so the transaction stays sub-ms.
         texts_to_embed: list[str] = []
@@ -1159,13 +1355,24 @@ class LocalMemoryStore:
 
         touched_item_ids: list[str] = []
         with self._conn:
-            # Verify source message is still alive (not forgotten while extraction was in flight).
+            # Claim the source with a write first so simultaneous commits cannot both apply it.
+            claimed = self._conn.execute(
+                """
+                UPDATE messages SET extracted = 1
+                WHERE id = ? AND role = 'user' AND deleted = 0 AND extracted = 0
+                  AND extraction_failure IS NULL
+                """,
+                (source_message_id,),
+            )
+            if claimed.rowcount == 0:
+                return []
             msg_row = self._conn.execute(
-                "SELECT id, namespace FROM messages WHERE id = ? AND deleted = 0",
+                """
+                SELECT m.namespace, seq.sequence FROM messages AS m
+                JOIN message_ingest_order AS seq ON seq.message_id = m.id WHERE m.id = ?
+                """,
                 (source_message_id,),
             ).fetchone()
-            if msg_row is None:
-                return []
             ns = normalize_namespace(msg_row["namespace"])
 
             for idx, op in enumerate(operations):
@@ -1256,11 +1463,18 @@ class LocalMemoryStore:
                 elif op_kind == "add_version":
                     item_id = op["item_id"]
                     item_row = self._conn.execute(
-                        "SELECT * FROM items WHERE id = ?",
-                        (item_id,),
+                        """
+                        SELECT i.*, seq.sequence AS source_sequence FROM items AS i
+                        LEFT JOIN item_versions AS v ON v.id = i.current_version_id
+                        LEFT JOIN message_ingest_order AS seq ON seq.message_id = v.source_message_id
+                        WHERE i.id = ? AND i.namespace = ?
+                        """,
+                        (item_id, ns),
                     ).fetchone()
                     if item_row is None:
                         continue
+                    if item_row["source_sequence"] is not None and item_row["source_sequence"] > msg_row["sequence"]:
+                        raise StaleExtraction("A newer source already updated this item")
                     prev_ver_id = item_row["current_version_id"]
                     max_no = self._conn.execute(
                         "SELECT COALESCE(MAX(version_no), 0) AS n FROM item_versions WHERE item_id = ?",
@@ -1274,7 +1488,7 @@ class LocalMemoryStore:
                     )
                     v_from = op.get("valid_from") or ts
                     if prev_ver_id:
-                        # Zep/Graphiti non-destructive fact succession: close open validity interval on superseded version.
+                        # Close the open validity interval when a new version supersedes it.
                         self._conn.execute(
                             "UPDATE item_versions SET valid_to = COALESCE(valid_to, ?) WHERE id = ?",
                             (v_from, prev_ver_id),
@@ -1381,11 +1595,8 @@ class LocalMemoryStore:
                         ),
                     )
 
-            self._conn.execute(
-                "UPDATE messages SET extracted = 1 WHERE id = ?",
-                (source_message_id,),
-            )
-        self._invalidate_cache(ns)
+        if touched_item_ids:
+            self._invalidate_cache(ns)
         return touched_item_ids
 
     def _auto_link_zettelkasten_tx(
@@ -1399,7 +1610,7 @@ class LocalMemoryStore:
         ts: str,
         max_links: int = 3,
     ) -> int:
-        """A-MEM (NeurIPS 2025) Zettelkasten dynamic cross-linking without extra LLM calls."""
+        """Link items with related entities during extraction."""
         from hmph.local_memory.graph import normalize_entity
 
         norm_ents = {normalize_entity(str(e)) for e in entities}
@@ -2210,7 +2421,7 @@ class LocalMemoryStore:
     ) -> int:
         """Gently decay salience of stale non-plan episodes without hiding them from explicit recall."""
         ns = normalize_namespace(namespace)
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         rows = self._conn.execute(
             "SELECT id, updated_at, last_mentioned_at, salience FROM items WHERE namespace = ? AND kind = 'episode' AND salience > ?",
             (ns, floor),
@@ -2222,7 +2433,7 @@ class LocalMemoryStore:
                 try:
                     dt = datetime.fromisoformat(str(ref_ts).replace("Z", "+00:00"))
                     if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
+                        dt = dt.replace(tzinfo=UTC)
                     age_days = (now_dt - dt).total_seconds() / 86400.0
                 except ValueError:
                     age_days = 0.0
@@ -2272,7 +2483,7 @@ class LocalMemoryStore:
                     "effective_time": cur.effective_time_text if cur else None,
                     "updated_at": it.updated_at,
                     "evolution": [
-                        f"v{v.version_no}({v.change_type}): {v.summary}" for v in it.versions
+                        f"{v.change_type}: {v.summary}" for v in it.versions
                     ],
                 }
             )
@@ -2748,9 +2959,9 @@ class LocalMemoryStore:
             dt_l = datetime.fromisoformat(left.replace("Z", "+00:00"))
             dt_r = datetime.fromisoformat(right.replace("Z", "+00:00"))
             if dt_l.tzinfo is None:
-                dt_l = dt_l.replace(tzinfo=timezone.utc)
+                dt_l = dt_l.replace(tzinfo=UTC)
             if dt_r.tzinfo is None:
-                dt_r = dt_r.replace(tzinfo=timezone.utc)
+                dt_r = dt_r.replace(tzinfo=UTC)
             return dt_l <= dt_r
         except ValueError:
             dl = parse_anchor_date(left)
@@ -2809,7 +3020,7 @@ class LocalMemoryStore:
             (ns,),
         ).fetchall()
         return {
-            "schema_version": "0.7.0",
+            "schema_version": "0.8.0",
             "namespace": ns,
             "exported_at": _now_iso(),
             "core_blocks": [b.model_dump(mode="json") for b in core_blocks],
@@ -2851,7 +3062,7 @@ class LocalMemoryStore:
                         vf = v.get("valid_from") or v.get("created_at") or ""
                         vt = v.get("valid_to") or "present"
                         lines.append(
-                            f"  - `v{v['version_no']}` ({v['change_type']} -> {v['status']}, {vf} → {vt}): {v['summary']}"
+                            f"  - {v['change_type']} → {v['status']} ({vf} to {vt}): {v['summary']}"
                         )
             lines.append("")
 
@@ -2921,6 +3132,10 @@ class LocalMemoryStore:
             content = str(m.get("content", ""))
             created_at = str(m.get("created_at") or _now_iso())
             tz = str(m.get("timezone") or "UTC")
+            failure = m.get("extraction_failure")
+            if role != "user" or failure not in ("invalid_output", "stale_source"):
+                failure = None
+            attempts = int(m.get("extract_attempts") or 0) if failure else 0
             vec_blob = None
             if role == "user" and self.embedder is not None and content.strip():
                 vecs = self.embedder.embed_passages([content])
@@ -2930,10 +3145,14 @@ class LocalMemoryStore:
                 self._conn.execute(
                     """
                     INSERT INTO messages (
-                        id, session_id, namespace, role, content, created_at, timezone, extracted, deleted
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)
+                        id, session_id, namespace, role, content, created_at, timezone,
+                        extracted, deleted, extract_attempts, extraction_failure
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     """,
-                    (new_mid, str(m.get("session_id") or "imported"), ns, role, content, created_at, tz),
+                    (
+                        new_mid, str(m.get("session_id") or "imported"), ns, role, content,
+                        created_at, tz, int(failure is None), attempts, failure,
+                    ),
                 )
                 if role == "user":
                     anchor_toks = extract_anchored_search_tokens(content, created_at)
@@ -3111,6 +3330,11 @@ class LocalMemoryStore:
             timezone=row["timezone"],
             extracted=bool(row["extracted"]),
             deleted=bool(row["deleted"]),
+            extraction_status=(
+                "quarantined" if row["extraction_failure"] else "done" if row["extracted"] else "pending"
+            ),
+            extract_attempts=row["extract_attempts"],
+            extraction_failure=row["extraction_failure"],
         )
 
     @staticmethod

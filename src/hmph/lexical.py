@@ -1,8 +1,12 @@
-"""Shared word/CJK ranking, extracted unchanged from the evaluation baseline."""
+"""Unicode tokenization shared by full-text search and the local hash encoder."""
 
 import math
-import re
+import unicodedata
 from collections import Counter
+from itertools import groupby
+
+TOKENIZER_VERSION = 2
+
 
 STOP_WORDS = set(
     "a an the i me my we our you your he she it they them this that these those "
@@ -12,18 +16,37 @@ STOP_WORDS = set(
 )
 
 
-def tokenize(text):
-    words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text.lower())
-    return [
-        part
-        for word in words
-        if word not in STOP_WORDS
-        for part in (
-            [word]
-            if not re.fullmatch(r"[\u4e00-\u9fff]+", word) or len(word) < 2
-            else [word[i : i + 2] for i in range(len(word) - 1)]
-        )
-    ]
+def _script_group(char: str) -> str:
+    category = unicodedata.category(char)[0]
+    if category not in {"L", "M", "N"}:
+        return "separator"
+    point = ord(char)
+    if (
+        0x1100 <= point <= 0x11FF
+        or 0x3040 <= point <= 0x30FF
+        or 0x31F0 <= point <= 0x31FF
+        or 0x3400 <= point <= 0x4DBF
+        or 0x4E00 <= point <= 0x9FFF
+        or 0xAC00 <= point <= 0xD7FF
+        or 0xF900 <= point <= 0xFAFF
+        or 0x20000 <= point <= 0x323AF
+    ):
+        return "cjk"
+    return "word"
+
+
+def tokenize(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    tokens: list[str] = []
+    for script, chars in groupby(normalized, _script_group):
+        if script == "separator":
+            continue
+        word = "".join(chars)
+        if script == "cjk" and len(word) >= 2:
+            tokens.extend(word[i : i + 2] for i in range(len(word) - 1))
+        elif word not in STOP_WORDS:
+            tokens.append(word)
+    return tokens
 
 
 def bm25_order(documents, question):

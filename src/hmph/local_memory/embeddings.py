@@ -9,7 +9,7 @@ import struct
 from pathlib import Path
 from typing import Protocol
 
-from hmph.lexical import tokenize
+from hmph.lexical import TOKENIZER_VERSION, tokenize
 
 
 class Embedder(Protocol):
@@ -289,7 +289,8 @@ class HashingEmbedder:
 
     def __init__(self, dimension: int = 128):
         self.dimension = dimension
-        self.name = f"hashing:{dimension}"
+        self.name = f"hashing-v{TOKENIZER_VERSION}:{dimension}"
+        self.legacy_name = f"hashing:{dimension}"
 
     def _encode(self, text: str) -> list[float]:
         vec = [0.0] * self.dimension

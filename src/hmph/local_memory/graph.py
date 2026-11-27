@@ -1,11 +1,4 @@
-"""Heterogeneous Entity-Item-Summary-Message graph and Personalized PageRank (HippoRAG-2 inspired).
-
-Zero external graph DB required: builds an in-memory sparse adjacency graph directly from
-SQLite items, entities, versions, coreference-resolved session summaries (passage nodes),
-and Zettelkasten memory_edges in milliseconds, weights entity bridges by inverse degree (IDF
-specificity), and runs sparse Personalized PageRank to surface multi-hop cross-session evidence
-with zero LLM cost.
-"""
+"""Rank cross-session evidence with personalized PageRank on a sparse graph built from SQLite."""
 
 from __future__ import annotations
 
@@ -51,7 +44,7 @@ def normalize_entity(raw: str) -> str:
 
 
 class MemoryBipartiteGraph:
-    """HippoRAG-2 style sparse heterogeneous graph over entities, items, summaries, and messages."""
+    """Weighted links between entities, items, summaries, and messages."""
 
     def __init__(self) -> None:
         # node_key -> list of (neighbor_key, weight)
@@ -90,7 +83,7 @@ class MemoryBipartiteGraph:
     ) -> MemoryBipartiteGraph:
         graph = cls()
 
-        # 1. Connect items to normalized entities and title tokens within this namespace.
+        # Connect items to normalized entities and title tokens within the namespace.
         item_rows = conn.execute(
             "SELECT id, title, kind, status, entities_json FROM items WHERE namespace = ?",
             (namespace,),
@@ -122,7 +115,7 @@ class MemoryBipartiteGraph:
                 weight = 1.45 if norm in explicit_norms else 0.70
                 graph._add_undirected(item_key, ent_key, weight)
 
-        # 2. Connect item versions to their authoritative source messages & session nodes.
+        # Link each item version to its source message and session.
         ver_rows = conn.execute(
             """
             SELECT v.item_id, v.source_message_id, v.status, m.session_id
@@ -140,7 +133,7 @@ class MemoryBipartiteGraph:
             sess_key = f"sess:{row['session_id']}"
             graph._add_undirected(msg_key, sess_key, 0.35)
 
-        # 3. HippoRAG-2 Passage Integration: include coreference-resolved session_summaries (`sum:`)
+        # Include session summaries (`sum:`) as evidence nodes.
         # so unextracted conversational episodes participate in multi-hop associative PPR!
         try:
             ss_rows = conn.execute(
@@ -171,7 +164,7 @@ class MemoryBipartiteGraph:
                 if mid:
                     graph._add_undirected(sum_key, f"msg:{mid}", 0.85)
 
-        # 4. Connect explicit semantic/Zettelkasten & evolution edges between items in this namespace.
+        # Add stored semantic and revision edges within the namespace.
         edge_rows = conn.execute(
             """
             SELECT src_type, src_id, dst_type, dst_id, relation

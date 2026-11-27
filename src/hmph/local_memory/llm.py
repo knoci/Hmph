@@ -9,11 +9,18 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from pydantic import ValidationError
 
 from hmph.local_memory.types import ExtractionResponse, ItemRecord, MessageRecord
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
+
+EXTRACTION_SYSTEM_PROMPT_EN = """Extract durable personal facts, preferences, episodes, and plan changes from the current user message. Use prior dialogue and existing items to identify the subject. Return a complete JSON object {"changes":[...]} or {"changes":[]} for questions, small talk, hypotheticals, or no durable change.
+
+For each change include action (create, reschedule, update, pause, resume, complete, cancel, retract, or ambiguous), target_item_id (an existing ID for changes, null for create), title (short and stable, without the schedule), kind (plan, fact, preference, or episode), summary, effective_time_text, valid_from, valid_to, condition_text, entities, related_item_ids, candidate_item_ids, ambiguity_note, and source_quote. Include ISO dates only when explicit. Preserve timing, negations, exceptions, and names from the user message. The source_quote must be a contiguous verbatim substring of that message. Preserve the source language of user-facing fields.
+
+Use the same item ID for moves, pauses, and resumes. For a resume without new timing, keep the last active schedule. When the subject is ambiguous, give candidate IDs and a brief clarification note. A clear plural change may affect multiple named items. Keep assistant text out of user facts."""
 
 EXTRACTION_SYSTEM_PROMPT = """你是长期记忆的状态演化抽取器。任务：根据用户本轮原话、近期上下文和已有记忆事项，识别是否发生了值得长期记住的新事实、新约定/计划，或已有事项的状态变化。
 
@@ -285,6 +292,19 @@ PERSONA_SYSTEM_PROMPT = """你是 Hmph（哼。），一个嘴硬心软、机灵
    - 如果记忆检索结果明确表示未找到相关记录，或前情和当前对话里都没有某件事的记录，必须坦诚表示没印象、不记得约定过这事；绝不为了装作记得而顺着提问编造“周三改周五”之类的虚假细节。"""
 
 
+PERSONA_SYSTEM_PROMPT_EN = """You are Hmph, a playful, warmhearted companion with a slightly prickly sense of humor. Use the user's language and speak naturally. Treat pending user statements as newer than recorded state. Distinguish earlier arrangements from the current one, clarify which item is meant when several could match, and let paused plans rest unless the user brings them up. Acknowledge what you do not recall without inventing details. Keep operational labels out of the reply."""
+
+
+def memory_locale(setting: str, text: str = "") -> str:
+    if setting in {"en", "zh"}:
+        return setting
+    han = len(re.findall(r"[\u3400-\u9fff]", text))
+    if han and not re.search(r"[\u3040-\u30ff\uac00-\ud7af]", text):
+        if han >= sum(c.isascii() and c.isalpha() for c in text):
+            return "zh"
+    return "en"
+
+
 class LLMClient(Protocol):
     model_name: str
 
@@ -325,15 +345,26 @@ def _load_dotenv_file(path: Path) -> dict[str, str]:
     return values
 
 
-def resolve_llm_config() -> tuple[str, str, str, str]:
-    """Resolve (api_key, base_url, model, timezone) from env > .env.local > .env."""
+def _local_settings() -> dict[str, str]:
     merged: dict[str, str] = {}
     for fname in (".env", ".env.local"):
         merged.update(_load_dotenv_file(Path(fname)))
     for key, val in os.environ.items():
         if key.startswith(("HMPH_", "OPENAI_", "DEEPSEEK_")):
             merged[key] = val
+    return merged
 
+
+def resolve_locale_config() -> str:
+    setting = _local_settings().get("HMPH_LOCALE", "auto").strip().lower()
+    if setting not in {"auto", "en", "zh"}:
+        raise ValueError("HMPH_LOCALE must be auto, en, or zh")
+    return setting
+
+
+def resolve_llm_config() -> tuple[str, str, str, str]:
+    """Resolve provider and source timezone from env > .env.local > .env."""
+    merged = _local_settings()
     api_key = (
         merged.get("HMPH_LOCAL_API_KEY")
         or merged.get("HMPH_DEEPSEEK_API_KEY")
@@ -395,6 +426,24 @@ def _extract_json_object(raw: str) -> dict[str, Any]:
     return {"changes": []}
 
 
+class InvalidExtraction(ValueError):
+    """A successful provider reply did not contain a complete extraction object."""
+
+
+def _parse_turn_extraction(raw: str) -> ExtractionResponse:
+    text = raw.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.I | re.S)
+    if fence:
+        text = fence[1]
+    try:
+        payload = json.loads(text)
+        if not isinstance(payload, dict) or not isinstance(payload.get("changes"), list):
+            raise InvalidExtraction("Extraction output must contain a changes array")
+        return ExtractionResponse.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise InvalidExtraction("Extraction output is invalid or incomplete") from exc
+
+
 class OpenAICompatLLM:
     """Async OpenAI-compatible / DeepSeek client for extraction and companion generation."""
 
@@ -408,6 +457,7 @@ class OpenAICompatLLM:
         max_extract_tokens: int = 768,
         temperature: float = 0.3,
         disable_thinking: bool = True,
+        locale: str = "auto",
     ):
         if not api_key.strip():
             raise ValueError("API key is required for OpenAICompatLLM")
@@ -418,6 +468,7 @@ class OpenAICompatLLM:
         self._max_extract_tokens = max_extract_tokens
         self._temperature = temperature
         self._disable_thinking = disable_thinking
+        self.locale = locale
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -544,17 +595,18 @@ class OpenAICompatLLM:
             },
             ensure_ascii=False,
         )
+        locale = memory_locale(self.locale, user_message)
+        prompt = EXTRACTION_SYSTEM_PROMPT if locale == "zh" else EXTRACTION_SYSTEM_PROMPT_EN
         raw, usage = await self._chat_completion(
             [
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": user_payload},
             ],
             max_tokens=self._max_extract_tokens,
             temperature=0.0,
             json_mode=True,
         )
-        parsed = _extract_json_object(raw)
-        return ExtractionResponse.model_validate(parsed), usage
+        return _parse_turn_extraction(raw), usage
 
     async def extract_session_changes(
         self,
@@ -596,7 +648,7 @@ class OpenAICompatLLM:
         turn_sample = " ".join(str(t.get("text", ""))[:200] for t in session_turns[:6])
         sys_prompt = (
             SESSION_EXTRACTION_SYSTEM_PROMPT_EN
-            if _is_primarily_english(turn_sample)
+            if memory_locale(self.locale, turn_sample) == "en"
             else SESSION_EXTRACTION_SYSTEM_PROMPT
         )
         raw, usage = await self._chat_completion(
@@ -700,7 +752,7 @@ class OpenAICompatLLM:
         sample_text = " ".join(
             f"{it.title} {it.current.summary if it.current else ''}" for it in items[:12]
         )
-        is_en = _is_primarily_english(sample_text)
+        is_en = memory_locale(self.locale, sample_text) == "en"
         sys_prompt = CONSOLIDATION_SYSTEM_PROMPT_EN if is_en else CONSOLIDATION_SYSTEM_PROMPT
 
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -875,7 +927,7 @@ class OpenAICompatLLM:
         turn_sample = " ".join(str(t.get("text", ""))[:200] for t in turns[:8])
         sys_prompt = (
             SESSION_SUMMARY_SYSTEM_PROMPT_EN
-            if _is_primarily_english(turn_sample)
+            if memory_locale(self.locale, turn_sample) == "en"
             else SESSION_SUMMARY_SYSTEM_PROMPT
         )
         compact_turns = [
@@ -994,15 +1046,14 @@ class OpenAICompatLLM:
         now_iso: str,
         timezone_name: str,
     ) -> list[dict[str, str]]:
-        system_content = (
-            PERSONA_SYSTEM_PROMPT
-            + f"\n\n当前时间：{now_iso}（时区：{timezone_name}）"
-        )
+        if memory_locale(self.locale, user_message) == "zh":
+            system_content = PERSONA_SYSTEM_PROMPT + f"\n\n当前时间：{now_iso}（时区：{timezone_name}）"
+            memory_header = "以下是你目前知道的前情与记忆线索（仅供参考，不要直接复述标签格式）："
+        else:
+            system_content = PERSONA_SYSTEM_PROMPT_EN + f"\n\nCurrent time: {now_iso} ({timezone_name})"
+            memory_header = "Use this memory for context without repeating its labels:"
         if narrated_context.strip():
-            system_content += (
-                "\n\n以下是你目前知道的前情与记忆线索（仅供参考，不要直接复述标签格式）：\n"
-                + narrated_context.strip()
-            )
+            system_content += f"\n\n{memory_header}\n{narrated_context.strip()}"
         messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
         for msg in recent_messages[-8:]:
             messages.append({"role": msg.role, "content": msg.content})

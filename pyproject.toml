@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hmph"
-version = "0.7.0"
+version = "0.8.0"
 description = "Headless single-file SQLite frontier long-term memory component for Project AIRI and MCP agents."
 readme = "README.md"
 license = { text = "MIT" }

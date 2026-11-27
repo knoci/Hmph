@@ -81,6 +81,12 @@ HMPH_DEEPSEEK_MODEL=deepseek-chat
 
 *(Works with DeepSeek, OpenAI, OpenRouter, Ollama, or any OpenAI-compatible API via `HMPH_LOCAL_API_KEY`, `HMPH_LOCAL_BASE_URL`, and `HMPH_LOCAL_MODEL`.)*
 
+With `HMPH_LOCALE=auto`, memory prompts follow English and Chinese conversation and the CLI uses English. Use `en` or `zh` to set both explicitly. Set `HMPH_SOURCE_TIMEZONE` independently to control how relative dates are interpreted.
+
+The AIRI-compatible gateway has been tested end to end in English and Chinese. Unicode tokenization and the default multilingual embeddings also support lexical and semantic search across scripts such as kana, Hangul, Cyrillic, and accented Latin.
+
+When opening a database with older full-text indexes, Hmph rebuilds them from stored records. Older hashing vectors are refreshed when the hashing backend is active. Messages that produce three invalid extraction responses are isolated so the queue can continue. Provider failures leave messages pending.
+
 ### 3. Start the Headless AIRI Gateway
 
 ```bash
@@ -153,6 +159,8 @@ Exposed MCP tools:
 | `GET /v1/memory/export` | Export character memory as a readable Markdown handbook or lossless JSON |
 | `POST /v1/memory/import` | Idempotently import a JSON memory snapshot into any namespace |
 | `POST /v1/memory/recall` | Inspect raw hybrid retrieval evidence and latency (supports optional `as_of`) |
+| `GET /v1/memory/extractions` | List isolated extraction failures in a namespace |
+| `POST /v1/memory/extractions/{message_id}/retry` | Retry an isolated message. Returns HTTP 409 if a newer source already changed the item |
 | `POST /v1/memory/forget` | Atomically cascade-forget items or source utterances |
 | `POST /v1/memory/consolidate` | Run Map-Reduce Sleep Consolidation |
 | `POST /v1/memory/summarize` | Generate coreference-resolved session summaries |
@@ -180,7 +188,7 @@ Measured on a single SQLite file with offline multilingual MiniLM ONNX embedding
 
 ```text
 hmph/
-├── .github/workflows/checks.yml   # Zero-Docker CI (ruff + compileall + CLI smoke)
+├── .github/workflows/checks.yml   # Lint, regression tests, and CLI checks
 ├── docs/
 │   └── architecture.md            # System architecture, retrieval pipeline & SQLite schema
 ├── integrations/
@@ -190,8 +198,9 @@ hmph/
 ├── src/hmph/
 │   ├── __init__.py                # Public Python API
 │   ├── cli.py                     # CLI entrypoint (airi-gateway, local-mcp, local-chat, export/import)
-│   ├── lexical.py                 # Zero-dependency bilingual (CJK + English) tokenizer
+│   ├── lexical.py                 # Unicode tokenizer
 │   └── local_memory/              # Core SQLite engine, hybrid retrieval, gateway & MCP server
+├── tests/                         # Memory, migration, and gateway regressions
 ├── .env.example
 ├── LICENSE
 ├── pyproject.toml
@@ -207,6 +216,7 @@ hmph/
 pip install -e ".[dev]"
 ruff check .
 python -m compileall -q src
+python -m unittest discover -s tests
 hmph --help
 ```
 

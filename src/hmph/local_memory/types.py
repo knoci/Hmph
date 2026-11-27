@@ -43,6 +43,9 @@ class MessageRecord(BaseModel):
     timezone: str
     extracted: bool = False
     deleted: bool = False
+    extraction_status: Literal["pending", "done", "quarantined"] = "pending"
+    extract_attempts: int = 0
+    extraction_failure: Literal["invalid_output", "stale_source"] | None = None
 
 
 class VersionRecord(BaseModel):

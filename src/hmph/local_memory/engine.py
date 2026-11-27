@@ -9,20 +9,27 @@ import os
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from hmph.lexical import tokenize
 from hmph.local_memory.embeddings import Embedder, build_default_embedder
-from hmph.local_memory.llm import LLMClient, OpenAICompatLLM, resolve_llm_config
+from hmph.local_memory.llm import (
+    InvalidExtraction,
+    LLMClient,
+    OpenAICompatLLM,
+    memory_locale,
+    resolve_llm_config,
+    resolve_locale_config,
+)
 from hmph.local_memory.reranker import (
     FeatureReranker,
     anchor_relative_dates,
     compute_actr_activation,
     parse_anchor_date,
 )
-from hmph.local_memory.store import LocalMemoryStore, normalize_namespace
+from hmph.local_memory.store import LocalMemoryStore, StaleExtraction, normalize_namespace
 from hmph.local_memory.types import (
     AmbiguityRecord,
     ConsolidationRecord,
@@ -176,14 +183,14 @@ def _chrono_sort_key(ts_str: str | None, tie: str = "") -> tuple[int, str, str]:
     return (1, str(ts_str or ""), tie)
 
 
-def _format_version_line(v) -> str:
-    parts = [f"v{v.version_no} [{v.change_type} -> {v.status}]: {v.summary}"]
+def _format_version_line(v, *, zh: bool = False) -> str:
+    parts = [f"[{v.change_type} -> {v.status}]: {v.summary}"]
     if v.effective_time_text:
-        parts.append(f"(时间: {v.effective_time_text})")
+        parts.append(f"({'时间' if zh else 'Time'}: {v.effective_time_text})")
     if v.valid_from and v.valid_to:
-        parts.append(f"(有效区间: {v.valid_from[:10]}~{v.valid_to[:10]})")
+        parts.append(f"({'有效区间' if zh else 'Validity'}: {v.valid_from[:10]}~{v.valid_to[:10]})")
     if v.condition_text:
-        parts.append(f"(条件: {v.condition_text})")
+        parts.append(f"({'条件' if zh else 'Condition'}: {v.condition_text})")
     return " ".join(parts)
 
 
@@ -197,6 +204,7 @@ class LocalMemoryEngine:
         llm: LLMClient,
         embedder: Embedder | None = None,
         timezone_name: str = "Asia/Hong_Kong",
+        locale: str = "auto",
         recent_turn_limit: int = 8,
         enable_ppr: bool = True,
         enable_two_hop: bool = True,
@@ -212,6 +220,7 @@ class LocalMemoryEngine:
         self.store = LocalMemoryStore(db_path, embedder=self.embedder)
         self.llm = llm
         self.timezone_name = timezone_name
+        self.locale = locale
         self.recent_turn_limit = recent_turn_limit
         self.enable_ppr = enable_ppr
         self.enable_two_hop = enable_two_hop
@@ -225,6 +234,7 @@ class LocalMemoryEngine:
         self.reranker = FeatureReranker()
         self._bg_tasks: set[asyncio.Task] = set()
         self._extract_lock = asyncio.Lock()
+        self._extraction_tasks: dict[str, asyncio.Task] = {}
         self._consolidate_lock = asyncio.Lock()
         self._mutations_since_consolidation: dict[str, int] = defaultdict(int)
         self._last_active_session: dict[str, str] = {}
@@ -244,6 +254,7 @@ class LocalMemoryEngine:
         temperature: float = 0.3,
     ) -> LocalMemoryEngine:
         api_key, base_url, model, tz = resolve_llm_config()
+        locale = resolve_locale_config()
         idle_env = os.getenv("HMPH_SESSION_IDLE_MINUTES", "").strip()
         idle_mins = float(idle_env) if idle_env else 45.0
         llm = OpenAICompatLLM(
@@ -251,12 +262,14 @@ class LocalMemoryEngine:
             base_url=base_url,
             model=model,
             temperature=temperature,
+            locale=locale,
         )
         return cls(
             db_path,
             llm=llm,
             embedder=embedder,
             timezone_name=tz,
+            locale=locale,
             session_idle_minutes=idle_mins,
         )
 
@@ -292,6 +305,8 @@ class LocalMemoryEngine:
             timezone_name=self.timezone_name,
             created_at=ts,
         )
+
+        self._schedule_extraction(ns)
 
         # 2. Assemble short-term + long-term + working memory with mention gating.
         t0 = time.perf_counter()
@@ -333,8 +348,6 @@ class LocalMemoryEngine:
             ambiguity_ids=evidence.ambiguity_ids,
         )
 
-        # 5. Launch background structured state-evolution extraction.
-        self._schedule_extraction(user_msg, recent_before, ts)
         if await_extraction:
             await self.flush()
 
@@ -360,9 +373,6 @@ class LocalMemoryEngine:
         """Direct ingestion entry point for offline benchmark evaluation & headless remember API."""
         ns = normalize_namespace(namespace)
         ts = now_iso or self._now_iso()
-        recent_before = self.store.get_session_messages(
-            session_id, namespace=ns, limit=self.recent_turn_limit
-        )
         user_msg = self.store.add_message(
             session_id,
             "user",
@@ -371,9 +381,10 @@ class LocalMemoryEngine:
             timezone_name=self.timezone_name,
             created_at=ts,
         )
-        self._schedule_extraction(user_msg, recent_before, ts)
+        self._schedule_extraction(ns)
         if await_extraction:
             await self.flush()
+            return self.store.get_message(user_msg.id) or user_msg
         return user_msg
 
     async def ingest_session(
@@ -390,6 +401,16 @@ class LocalMemoryEngine:
         Returns {"ingested_messages": int, "writer_calls": int, "writer_tokens": int}.
         """
         ns = normalize_namespace(namespace)
+        async with self._extract_lock:
+            if extract_state and not await self._consume_pending_extractions(ns):
+                raise RuntimeError("An earlier memory extraction failed; retry before importing state")
+            return await self._ingest_session(session_id, turns, ns, extract_state)
+
+    async def _ingest_session(
+        self, session_id: str, turns: list[dict], ns: str, extract_state: bool
+    ) -> dict:
+        extract_fn = getattr(self.llm, "extract_session_changes", None)
+        has_extractor = extract_state and callable(extract_fn)
         stored_msgs: list[tuple[int, MessageRecord, dict]] = []
         for idx, turn in enumerate(turns):
             role = "user" if turn.get("role", "user") == "user" else "assistant"
@@ -405,45 +426,35 @@ class LocalMemoryEngine:
                 created_at=str(turn.get("timestamp") or self._now_iso()),
                 index_for_retrieval=True,
                 external_id=turn.get("external_id"),
+                extract_state=has_extractor,
             )
             stored_msgs.append((idx, msg, {"turn_index": idx, "speaker": speaker or role, "time": msg.created_at, "text": formatted}))
 
-        if not extract_state or not stored_msgs:
-            for _, msg, _ in stored_msgs:
-                self.store.mark_message_extracted(msg.id)
+        if not has_extractor or not stored_msgs:
             return {"ingested_messages": len(stored_msgs), "writer_calls": 0, "writer_tokens": 0}
 
         session_blob = "\n".join(payload["text"] for _, _, payload in stored_msgs)
         candidates = self._select_extraction_candidates(session_blob[:3000], namespace=ns, limit=18)
-
-        extract_fn = getattr(self.llm, "extract_session_changes", None)
-        if not callable(extract_fn):
-            for _, msg, _ in stored_msgs:
-                self.store.mark_message_extracted(msg.id)
-            return {"ingested_messages": len(stored_msgs), "writer_calls": 0, "writer_tokens": 0}
 
         resp, usage = await extract_fn(
             session_turns=[payload for _, _, payload in stored_msgs],
             candidate_items=candidates,
             timezone_name=self.timezone_name,
         )
-        by_idx = {idx: msg for idx, msg, _ in stored_msgs}
-        ordered_changes = sorted(
-            resp.changes,
-            key=lambda c: c.source_turn_index if c.source_turn_index is not None else 0,
-        )
-        for change in ordered_changes:
-            t_idx = change.source_turn_index if change.source_turn_index in by_idx else stored_msgs[-1][0]
-            src_msg = by_idx[t_idx]
-            fresh_candidates = self.store.list_items(namespace=ns)
-            ops = self._validate_and_plan_operations(
-                src_msg.content, [change], fresh_candidates, namespace=ns
-            )
-            if ops:
-                self.store.commit_extraction(src_msg.id, ops, created_at=src_msg.created_at)
-
-        for _, msg, _ in stored_msgs:
-            self.store.mark_message_extracted(msg.id)
+        changes_by_source = defaultdict(list)
+        for change in resp.changes:
+            idx = change.source_turn_index
+            if idx is None or not 0 <= idx < len(stored_msgs):
+                idx = len(stored_msgs) - 1
+            changes_by_source[idx].append(change)
+        for idx, msg, _ in stored_msgs:
+            changes = changes_by_source[idx]
+            operations = []
+            if changes:
+                operations = self._validate_and_plan_operations(
+                    msg.content, changes, self.store.list_items(namespace=ns), namespace=ns
+                )
+            self.store.commit_extraction(msg.id, operations, created_at=msg.created_at)
 
         tokens = int((usage or {}).get("total_tokens", 0))
         return {"ingested_messages": len(stored_msgs), "writer_calls": 1, "writer_tokens": tokens}
@@ -490,15 +501,10 @@ class LocalMemoryEngine:
                 seen_msg_ids.add(msg_id)
 
         if mode == "oracle":
-            for mid in self.store.get_message_ids_by_external(oracle_external_ids):
+            for mid in self.store.get_message_ids_by_external(oracle_external_ids, namespace=ns):
                 add_msg(mid)
-            context_blocks: list[str] = []
-            if selected_msgs:
-                lines = ["[Original Conversation Excerpts]"]
-                for m in sorted(selected_msgs, key=lambda x: x.created_at):
-                    lines.append(f"- ({m.created_at}) {m.content}")
-                context_blocks.append("\n".join(lines))
-            context_text = "\n\n".join(context_blocks)
+            source_heading = "[Original Conversation Excerpts]"
+            source_messages = sorted(selected_msgs, key=lambda m: m.created_at)
         elif mode == "raw_only":
             # Diversity-first filling: reserve up to 8 slots for distinct top hits across sessions,
             # then fill remaining slots with adjacent confirmations in the same session.
@@ -521,14 +527,12 @@ class LocalMemoryEngine:
                 if len(selected_msgs) >= max_sources:
                     break
                 add_msg(mid)
-            lines = ["[Retrieved Original Conversation Excerpts (chronological)]"]
-            for m in sorted(selected_msgs, key=lambda x: x.created_at):
-                lines.append(f"- ({m.created_at}) {m.content}")
-            context_text = "\n\n".join(["\n".join(lines)])
+            source_heading = "[Retrieved Original Conversation Excerpts (chronological)]"
+            source_messages = sorted(selected_msgs, key=lambda m: m.created_at)
         elif mode == "local_state":
             # Frontier multi-channel retrieval:
             # (1) Dense ONNX + FTS5 on items & raw messages
-            # (2) Bipartite Entity-Item-Message Personalized PageRank (HippoRAG-inspired, 0 LLM cost)
+            # Spread relevance through entity, item, and message links without another model call.
             # (3) Adaptive 2-Hop Query Decomposition only for multi-session / ordering / enumeration queries
             # (4) Multi-feature + Session-Diversity Reranking + Deterministic Relative-Time Anchoring
             is_multi_session = bool(MULTI_SESSION_CUE.search(query))
@@ -781,7 +785,7 @@ class LocalMemoryEngine:
                     [all_sem, all_fts, list(ppr_msg_scores.keys())], limit=max_sources * 2
                 )
 
-            # Optional Listwise Evidence Reranking (Hindsight / RankGPT pattern):
+            # Optionally rerank the evidence as a set.
             # jointly selects the sharpest session summaries + raw excerpts from Top-24 candidates.
             selected_summaries: list[SessionSummaryRecord] = []
             listwise_used = False
@@ -923,41 +927,53 @@ class LocalMemoryEngine:
                     break
                 add_msg(mid)
 
+            source_heading = "[Verified Original Excerpts (chronological)]"
             if selected_msgs:
-                raw_lines = ["[Verified Original Excerpts (chronological)]"]
-                # Preserve exact same-timestamp turn order using SQLite rowid instead of random UUIDs.
-                rowids: dict[str, int] = {}
-                if selected_msgs:
-                    ph = ",".join("?" for _ in selected_msgs)
-                    for r in self.store._conn.execute(
-                        f"SELECT id, rowid FROM messages WHERE id IN ({ph})",
-                        [m.id for m in selected_msgs],
-                    ).fetchall():
-                        rowids[r["id"]] = int(r["rowid"])
-                for m in sorted(
-                    selected_msgs,
-                    key=lambda x: (
-                        _chrono_sort_key(x.created_at)[0],
-                        _chrono_sort_key(x.created_at)[1],
-                        rowids.get(x.id, 0),
-                    ),
-                ):
-                    anchor_hint = anchor_relative_dates(m.content, m.created_at)
-                    raw_lines.append(f"- ({m.created_at}){anchor_hint} {m.content}")
-                state_sections.append("\n".join(raw_lines))
-            context_text = "\n\n".join(state_sections)
+                ph = ",".join("?" for _ in selected_msgs)
+                order = dict(self.store._conn.execute(
+                    f"SELECT message_id, sequence FROM message_ingest_order WHERE message_id IN ({ph})",
+                    [m.id for m in selected_msgs],
+                ).fetchall())
+            else:
+                order = {}
+            source_messages = sorted(
+                selected_msgs,
+                key=lambda m: (*_chrono_sort_key(m.created_at)[:2], order.get(m.id, 0)),
+            )
         else:
             raise ValueError(f"Unsupported evaluation mode: {mode}")
 
-        # Enforce identical UTF-8 byte budget across all arms.
-        encoded = context_text.encode("utf-8")
-        if len(encoded) > max_context_bytes:
-            context_text = encoded[:max_context_bytes].decode("utf-8", errors="ignore")
+        budget = max(0, max_context_bytes)
+        context_bytes = "\n\n".join(state_sections).encode("utf-8")[:budget]
+        context_text = context_bytes.decode("utf-8", errors="ignore")
+        remaining = budget - len(context_text.encode("utf-8"))
+        source_prefix = ("\n\n" if context_text else "") + source_heading + "\n"
+
+        used_message_ids: list[str] = []
+        truncated_message_ids: list[str] = []
+        for message in source_messages:
+            if not message.content:
+                continue
+            hint = anchor_relative_dates(message.content, message.created_at) if mode == "local_state" else ""
+            prefix = f"{source_prefix}- ({message.created_at}){hint} "
+            available = remaining - len(prefix.encode("utf-8"))
+            if available <= 0:
+                break
+            content = message.content.encode("utf-8")
+            excerpt = content[:available].decode("utf-8", errors="ignore")
+            if not excerpt:
+                break
+            context_text += prefix + excerpt
+            if len(content) > available:
+                truncated_message_ids.append(message.id)
+                break
+            used_message_ids.append(message.id)
+            remaining = available - len(content)
+            source_prefix = "\n"
 
         retrieval_ms = (time.perf_counter() - t0) * 1000.0
         t1 = time.perf_counter()
-        answer_fn = getattr(self.llm, "answer_from_context")
-        reply, usage = await answer_fn(
+        reply, usage = await self.llm.answer_from_context(
             question=query,
             context_text=context_text,
             now_iso=ts,
@@ -966,15 +982,19 @@ class LocalMemoryEngine:
         )
         generation_ms = (time.perf_counter() - t1) * 1000.0
 
-        ext_map = self.store.get_external_ids([m.id for m in selected_msgs])
-        used_external_ids = [ext_map[m.id] for m in selected_msgs if m.id in ext_map]
+        ext_map = self.store.get_external_ids([*used_message_ids, *truncated_message_ids])
+        included_ids = set(used_message_ids) | set(truncated_message_ids)
         return {
             "mode": mode,
             "intent": intent,
             "reply": reply,
             "used_item_ids": used_item_ids,
-            "used_message_ids": [m.id for m in selected_msgs],
-            "used_external_ids": used_external_ids,
+            "candidate_message_ids": [m.id for m in selected_msgs],
+            "used_message_ids": used_message_ids,
+            "used_external_ids": [ext_map[mid] for mid in used_message_ids if mid in ext_map],
+            "truncated_message_ids": truncated_message_ids,
+            "truncated_external_ids": [ext_map[mid] for mid in truncated_message_ids if mid in ext_map],
+            "omitted_message_ids": [m.id for m in selected_msgs if m.id not in included_ids],
             "context_bytes": len(context_text.encode("utf-8")),
             "retrieval_ms": round(retrieval_ms, 2),
             "generation_ms": round(generation_ms, 2),
@@ -1112,7 +1132,7 @@ class LocalMemoryEngine:
         return self.store.list_session_summaries(namespace=namespace)
 
     # ------------------------------------------------------------------
-    # Letta-Style Core Memory Blocks & Proactive Companion Check-In
+    # Core memory blocks and proactive check-ins
     # ------------------------------------------------------------------
 
     def get_core_memory_blocks(self, *, namespace: str = "default") -> list[CoreMemoryBlock]:
@@ -1184,7 +1204,7 @@ class LocalMemoryEngine:
             )
 
         # 2. Active plans past cooldown window (NEVER paused/closed items!).
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         for it in all_items:
             if it.status != "active" or it.kind != "plan":
                 continue
@@ -1193,7 +1213,7 @@ class LocalMemoryEngine:
             try:
                 dt = datetime.fromisoformat(str(ref_ts).replace("Z", "+00:00"))
                 if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.replace(tzinfo=UTC)
                 elapsed_hours = (now_dt - dt).total_seconds() / 3600.0
             except ValueError:
                 pass
@@ -1402,16 +1422,9 @@ class LocalMemoryEngine:
         scheduled = 0
         for ns in namespaces:
             pending = self.store.get_pending_messages(namespace=ns)
-            for msg in pending:
-                recent = [
-                    m
-                    for m in self.store.get_session_messages(
-                        msg.session_id, namespace=ns, limit=self.recent_turn_limit
-                    )
-                    if m.id != msg.id and m.created_at <= msg.created_at
-                ]
-                self._schedule_extraction(msg, recent, msg.created_at)
-                scheduled += 1
+            if pending:
+                self._schedule_extraction(ns)
+                scheduled += len(pending)
         return scheduled
 
     def resolve_episode_session_id(
@@ -1422,7 +1435,7 @@ class LocalMemoryEngine:
         now_iso: str | None = None,
         explicit: bool = False,
     ) -> str:
-        """MemoryOS-style idle-gap episode auto-rolling for stateless OpenAI clients (AIRI)."""
+        """Start a new session after an idle gap for clients without explicit session IDs."""
         clean_base = (base_session_id or "").strip() or f"airi-{normalize_namespace(namespace)}"
         if explicit or self.session_idle_minutes <= 0.0:
             return clean_base
@@ -1437,9 +1450,9 @@ class LocalMemoryEngine:
             dt_prev = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
             dt_now = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             if dt_prev.tzinfo is None:
-                dt_prev = dt_prev.replace(tzinfo=timezone.utc)
+                dt_prev = dt_prev.replace(tzinfo=UTC)
             if dt_now.tzinfo is None:
-                dt_now = dt_now.replace(tzinfo=timezone.utc)
+                dt_now = dt_now.replace(tzinfo=UTC)
             idle_mins = (dt_now - dt_prev).total_seconds() / 60.0
             if idle_mins >= self.session_idle_minutes:
                 # Track previous episode so `_maybe_schedule_auto_summary` summarizes it even across restarts!
@@ -1488,11 +1501,12 @@ class LocalMemoryEngine:
         if item is None or item.namespace != ns or item.status not in {"active", "paused"}:
             return item if (item is not None and item.namespace == ns) else None
         ts = self._now_iso()
+        zh = memory_locale(self.locale, item.title) == "zh"
         if item.status == "active":
-            text = f"手动暂停事项：{item.title}，这阵子先搁一搁，不用提醒。"
+            text = f"手动暂停事项：{item.title}，暂时不用提醒。" if zh else f"Manually paused: {item.title}. Hold reminders."
             action = "pause"
             new_status: ItemStatus = "paused"
-            summary = f"{item.title}已手动暂停搁置"
+            summary = f"{item.title}已手动暂停" if zh else f"{item.title} was paused"
             eff_time = None
         else:
             last_active = next(
@@ -1500,14 +1514,12 @@ class LocalMemoryEngine:
                 None,
             )
             eff_time = last_active.effective_time_text if last_active else None
-            text = f"手动恢复事项：{item.title}。"
+            text = f"手动恢复事项：{item.title}。" if zh else f"Manually resumed: {item.title}."
             action = "resume"
             new_status = "active"
-            summary = (
-                f"恢复{item.title}（延续时间：{eff_time}）"
-                if eff_time
-                else f"恢复{item.title}"
-            )
+            summary = f"恢复{item.title}" if zh else f"{item.title} was resumed"
+            if eff_time:
+                summary += f"（延续时间：{eff_time}）" if zh else f" (schedule: {eff_time})"
         src_msg = self.store.add_message(
             session_id,
             "user",
@@ -1579,24 +1591,28 @@ class LocalMemoryEngine:
         *,
         now_iso: str,
         timezone_name: str,
+        locale: str = "en",
     ) -> list[dict]:
-        """Inject Hmph memory context cleanly WITHOUT overwriting AIRI's persona / Live2D system prompt."""
+        """Extend the caller's system prompt with recalled context."""
         cloned = [dict(m) for m in messages]
-        memory_block = (
-            "\n\n<hmph_memory>\n"
-            f"Current time: {now_iso} ({timezone_name})\n"
-            "Instructions: Use the recalled memory below naturally in your own character voice. "
-            "Never expose XML/database tags. Respect paused plans (do not nag unless asked). "
-            "Distinguish current latest state from superseded historical versions. "
-            "Connect clear supporting clues naturally (e.g., recurring favorite dishes -> implied preference, "
-            "or stated hobbies + constraints -> tailored advice), "
-            "but if NO related record exists for a factual question, be honest instead of fabricating.\n"
-            f"{narrated_context.strip()}\n"
-            "</hmph_memory>"
-        ) if narrated_context.strip() else ""
-
-        if not memory_block:
+        if not narrated_context.strip():
             return cloned
+
+        if locale == "zh":
+            guidance = (
+                f"当前时间：{now_iso}（{timezone_name}）\n"
+                "用角色自己的语气自然参考以下记忆，保持当前对话的语言。"
+                "区分最新状态和历史记录。暂停的计划等用户问起再提。"
+                "可以联系证据清楚的线索回答，缺少相关记录时如实说明。"
+            )
+        else:
+            guidance = (
+                f"Current time: {now_iso} ({timezone_name})\n"
+                "Use the recalled memory naturally in your character voice and the current conversation's language. "
+                "Distinguish current state from superseded versions. Mention paused plans when asked. "
+                "Connect clearly supported clues, and say when there is no relevant record."
+            )
+        memory_block = f"\n\n<hmph_memory>\n{guidance}\n{narrated_context.strip()}\n</hmph_memory>"
 
         for idx, msg in enumerate(cloned):
             if msg.get("role") == "system":
@@ -1653,6 +1669,8 @@ class LocalMemoryEngine:
                     timezone_name=self.timezone_name,
                     created_at=ts,
                 )
+            if not user_msg.extracted:
+                self._schedule_extraction(ns)
 
         t0 = time.perf_counter()
         evidence = self._assemble_working_memory(
@@ -1669,6 +1687,7 @@ class LocalMemoryEngine:
             evidence.narrated_context,
             now_iso=ts,
             timezone_name=self.timezone_name,
+            locale=memory_locale(self.locale, user_text),
         )
         return augmented, evidence, user_msg, recent_before, ts
 
@@ -1686,7 +1705,7 @@ class LocalMemoryEngine:
         ttft_ms: float | None = None,
         total_ms: float | None = None,
     ) -> None:
-        """Persist assistant reply & launch non-blocking extraction after AIRI stream finishes."""
+        """Persist the assistant reply and its evidence independently of extraction."""
         if ttft_ms is not None:
             self._ttft_history_ms = [*self._ttft_history_ms[-199:], ttft_ms]
         if total_ms is not None:
@@ -1715,7 +1734,6 @@ class LocalMemoryEngine:
                     source_message_ids=evidence.used_source_message_ids,
                     ambiguity_ids=evidence.ambiguity_ids,
                 )
-        self._schedule_extraction(user_msg, recent_before, user_msg.created_at)
         self._maybe_schedule_auto_summary(session_id, namespace=ns)
 
     def _schedule_session_summary(self, session_id: str, namespace: str) -> None:
@@ -1768,6 +1786,7 @@ class LocalMemoryEngine:
             timezone_name=self.timezone_name,
             created_at=ts,
         )
+        extraction = self._schedule_extraction("default")
         t0 = time.perf_counter()
         evidence = self._assemble_working_memory(
             session_id=session_id,
@@ -1859,9 +1878,8 @@ class LocalMemoryEngine:
             },
         }
 
-        # Run structured state-evolution extraction right after streaming finishes so the UI
-        # receives an immediate memory_synced event to refresh "她的记事本".
-        await self._run_extraction(user_msg, recent_before, ts)
+        # Clients may disconnect while the durable extraction is still running.
+        await asyncio.shield(extraction)
         yield {
             "event": "memory_synced",
             "data": {
@@ -1891,19 +1909,45 @@ class LocalMemoryEngine:
     # Background Extraction, Auto-Consolidation & Safety Guards
     # ------------------------------------------------------------------
 
-    def _schedule_extraction(
-        self,
-        user_msg: MessageRecord,
-        recent_before: list[MessageRecord],
-        now_iso: str,
-    ) -> None:
-        if self.enable_trivial_gate and is_trivial_backchannel(user_msg.content):
-            self.store.mark_message_extracted(user_msg.id)
-            self.skipped_trivial_extractions += 1
-            return
-        task = asyncio.create_task(self._run_extraction(user_msg, recent_before, now_iso))
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+    def _schedule_extraction(self, namespace: str) -> asyncio.Task:
+        namespace = normalize_namespace(namespace)
+        task = self._extraction_tasks.get(namespace)
+        if task is None:
+            task = asyncio.create_task(self._drain_extractions(namespace))
+            self._extraction_tasks[namespace] = task
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    async def _drain_extractions(self, namespace: str) -> None:
+        try:
+            async with self._extract_lock:
+                await self._consume_pending_extractions(namespace)
+        finally:
+            self._extraction_tasks.pop(namespace, None)
+
+    async def retry_quarantined_extraction(
+        self, message_id: str, *, namespace: str = "default"
+    ) -> MessageRecord | None:
+        ns = normalize_namespace(namespace)
+        async with self._extract_lock:
+            if not self.store.requeue_extraction(message_id, namespace=ns):
+                return None
+            await self._consume_pending_extractions(ns)
+            return self.store.get_message(message_id)
+
+    async def _consume_pending_extractions(self, namespace: str) -> bool:
+        while pending := self.store.get_pending_messages(namespace=namespace, limit=1):
+            message = pending[0]
+            if self.enable_trivial_gate and is_trivial_backchannel(message.content):
+                self.store.mark_message_extracted(message.id)
+                self.skipped_trivial_extractions += 1
+                continue
+            recent = self.store.get_messages_before(message, limit=self.recent_turn_limit)
+            if not await self._run_extraction(message, recent, message.created_at):
+                # Leave the failed head pending for the next drain or startup recovery.
+                return False
+        return True
 
     def _schedule_consolidation(self, namespace: str) -> None:
         ns = normalize_namespace(namespace)
@@ -1923,58 +1967,65 @@ class LocalMemoryEngine:
         user_msg: MessageRecord,
         recent_before: list[MessageRecord],
         now_iso: str,
-    ) -> None:
+    ) -> bool:
         ns = normalize_namespace(user_msg.namespace)
         should_auto_consolidate = False
-        async with self._extract_lock:
-            # Re-check the message wasn't deleted while waiting for lock.
-            if self.store.get_message(user_msg.id) is None:
-                return
-            try:
-                candidates = self._select_extraction_candidates(
-                    user_msg.content, namespace=ns
+        try:
+            candidates = self._select_extraction_candidates(
+                user_msg.content, namespace=ns
+            )
+            resp, usage = await self.llm.extract_changes(
+                user_message=user_msg.content,
+                recent_messages=recent_before,
+                candidate_items=candidates,
+                now_iso=now_iso,
+                timezone_name=self.timezone_name,
+            )
+            self.last_extraction_usage = usage
+            operations = self._validate_and_plan_operations(
+                user_msg.content, resp.changes, candidates, namespace=ns
+            )
+            touched = self.store.commit_extraction(
+                user_msg.id, operations, created_at=now_iso
+            )
+            if touched:
+                self._publish_event(
+                    "memory_extracted",
+                    namespace=ns,
+                    payload={
+                        "message_id": user_msg.id,
+                        "touched_item_ids": touched,
+                        "operation_count": len(operations),
+                    },
                 )
-                resp, usage = await self.llm.extract_changes(
-                    user_message=user_msg.content,
-                    recent_messages=recent_before,
-                    candidate_items=candidates,
-                    now_iso=now_iso,
-                    timezone_name=self.timezone_name,
+            if any(op.get("kind") == "add_ambiguity" for op in operations):
+                self._publish_event(
+                    "ambiguity_detected",
+                    namespace=ns,
+                    payload={"message_id": user_msg.id},
                 )
-                self.last_extraction_usage = usage
-                operations = self._validate_and_plan_operations(
-                    user_msg.content, resp.changes, candidates, namespace=ns
-                )
-                touched = self.store.commit_extraction(
-                    user_msg.id, operations, created_at=now_iso
-                )
-                if touched:
-                    self._publish_event(
-                        "memory_extracted",
-                        namespace=ns,
-                        payload={
-                            "message_id": user_msg.id,
-                            "touched_item_ids": touched,
-                            "operation_count": len(operations),
-                        },
-                    )
-                if any(op.get("kind") == "add_ambiguity" for op in operations):
-                    self._publish_event(
-                        "ambiguity_detected",
-                        namespace=ns,
-                        payload={"message_id": user_msg.id},
-                    )
-                if touched and self.auto_consolidate_every > 0:
-                    self._mutations_since_consolidation[ns] += len(touched)
-                    if self._mutations_since_consolidation[ns] >= self.auto_consolidate_every:
-                        self._mutations_since_consolidation[ns] = 0
-                        should_auto_consolidate = True
-            except Exception as exc:
-                logger.warning("Background memory extraction failed: %s", exc)
+            if touched and self.auto_consolidate_every > 0:
+                self._mutations_since_consolidation[ns] += len(touched)
+                if self._mutations_since_consolidation[ns] >= self.auto_consolidate_every:
+                    self._mutations_since_consolidation[ns] = 0
+                    should_auto_consolidate = True
+        except (InvalidExtraction, StaleExtraction) as exc:
+            quarantined = self.store.record_extraction_failure(
+                user_msg.id, stale=isinstance(exc, StaleExtraction)
+            )
+            if quarantined:
+                logger.warning("Quarantined memory extraction for %s: %s", user_msg.id, exc)
                 self.extraction_errors.append(str(exc))
+            # Try again within the structural failure budget or advance after quarantine.
+            return True
+        except Exception as exc:
+            logger.warning("Background memory extraction failed: %s", exc)
+            self.extraction_errors.append(str(exc))
+            return False
 
         if should_auto_consolidate and callable(getattr(self.llm, "consolidate_insights", None)):
             self._schedule_consolidation(ns)
+        return True
 
     def _select_extraction_candidates(
         self, text: str, *, namespace: str = "default", limit: int = 24
@@ -2009,9 +2060,8 @@ class LocalMemoryEngine:
     ) -> list[dict]:
         ns = normalize_namespace(namespace)
         by_id = {item.id: item for item in candidates}
-        # Deterministic guard: if the model tries to mutate multiple existing items from a single
-        # vague utterance that does not explicitly mention all of them or use plural ("都/全部"),
-        # downgrade to an ambiguity record rather than corrupting unrelated items.
+        zh = memory_locale(self.locale, user_text) == "zh"
+        # A vague reference cannot authorize updates to multiple existing items.
         mutating = [
             c
             for c in changes
@@ -2033,7 +2083,10 @@ class LocalMemoryEngine:
                         "kind": "add_ambiguity",
                         "source_quote": _anchor_quote(mutating[0].source_quote, user_text),
                         "candidate_item_ids": cand_ids,
-                        "note": "原话可能指向多个事项且未明确区分，暂不修改，待用户确认。",
+                        "note": (
+                            "原话可能指向多个事项且未明确区分，暂不修改，待用户确认。"
+                            if zh else "Several items could match. Ask which one before changing anything."
+                        ),
                     }
                 ]
 
@@ -2049,7 +2102,9 @@ class LocalMemoryEngine:
                         "kind": "add_ambiguity",
                         "source_quote": quote,
                         "candidate_item_ids": cand_ids,
-                        "note": (change.ambiguity_note or "指代不明确，需向用户确认具体事项。").strip(),
+                        "note": (change.ambiguity_note or (
+                            "指代不明确，需向用户确认具体事项。" if zh else "Ask which item the user means."
+                        )).strip(),
                     }
                 )
                 continue
@@ -2130,12 +2185,15 @@ class LocalMemoryEngine:
                             "candidate_item_ids": [
                                 cid for cid in change.candidate_item_ids if cid in by_id
                             ],
-                            "note": change.ambiguity_note or "未找到唯一匹配的已有事项，保留原话待确认。",
+                            "note": change.ambiguity_note or (
+                                "未找到唯一匹配的事项，保留原话待确认。"
+                                if zh else "No unique item matched. Keep the quote for clarification."
+                            ),
                         }
                     )
                 continue
 
-            # Epistemic protection (Hindsight principle): an inferred belief may never overwrite
+            # An inferred belief may never overwrite
             # or retract a user-confirmed fact or shared commitment.
             if (
                 change.epistemic_type == "inferred_belief"
@@ -2176,7 +2234,7 @@ class LocalMemoryEngine:
         return operations
 
     # ------------------------------------------------------------------
-    # Read Path: Unified 6-Channel Hybrid Retrieval + HippoRAG-2 PPR + ACT-R
+    # Working-memory retrieval and ranking
     # ------------------------------------------------------------------
 
     def _assemble_working_memory(
@@ -2192,13 +2250,14 @@ class LocalMemoryEngine:
         intent = classify_query_intent(query)
         asks_overview = bool(PLAN_OVERVIEW_CUE.search(query))
 
-        # Optional Zep/Graphiti point-in-time snapshot recall (`as_of`).
+        # Use a historical snapshot when the caller supplies `as_of`.
         if as_of:
             snap_items = self.store.get_items_as_of(as_of, namespace=ns, include_closed=True)
             active_snap = [it for it in snap_items if it.status == "active"][:8]
             paused_snap = [it for it in snap_items if it.status == "paused"][:6]
             closed_snap = [it for it in snap_items if it.status not in {"active", "paused"}][:6]
             narrated_snap = self._narrate_context(
+                locale=memory_locale(self.locale, query),
                 intent="history",
                 active_items=active_snap,
                 paused_items=paused_snap,
@@ -2253,7 +2312,7 @@ class LocalMemoryEngine:
         graph_item_ids = self.store.expand_one_hop_items(fused_item_ids[:6], limit=6)
         fused_msg_ids = reciprocal_rank_fusion([msg_sem, msg_fts], limit=12)
 
-        # HippoRAG-2 Heterogeneous PPR on the live path (entities + items + summaries + messages).
+        # Rank linked entities and evidence with personalized PageRank.
         ppr_item_ids: list[str] = []
         ppr_msg_scores: dict[str, float] = {}
         ppr_sum_ids: list[str] = []
@@ -2292,7 +2351,7 @@ class LocalMemoryEngine:
                 recalled_items.insert(0, it)
                 recalled_ids_set.add(it.id)
 
-        # Weight recalled items with ACT-R cognitive activation while keeping direct matches first.
+        # Weight recalled items by recency and use while keeping direct matches first.
         base_rank = {it.id: idx for idx, it in enumerate(recalled_items)}
         recalled_items.sort(
             key=lambda it: (
@@ -2437,7 +2496,7 @@ class LocalMemoryEngine:
                 if len(relevant_consolidations) >= 4:
                     break
 
-        # 5c. Coreference-resolved Session Summaries + Entity-Scoped + HippoRAG-2 Passage PPR.
+        # Retrieve session summaries by resolved entities and graph relevance.
         relevant_summaries: list[SessionSummaryRecord] = []
         if effective_associative:
             sem_ss_live = self.store.search_session_summaries(query, namespace=ns, limit=3)
@@ -2462,7 +2521,7 @@ class LocalMemoryEngine:
                 if len(relevant_summaries) >= 4:
                     break
 
-        # 5d. Always-in-context Letta-style Core Memory Blocks (strictly respecting paused-plan anti-nag boundary).
+        # Include core blocks whose sources are relevant to the current turn.
         hidden_paused_ids_all = {
             it.id
             for it in all_items
@@ -2479,6 +2538,7 @@ class LocalMemoryEngine:
 
         # 6. Narrate working memory cleanly (with deterministic relative-time anchoring).
         narrated = self._narrate_context(
+            locale=memory_locale(self.locale, query),
             intent=intent,
             active_items=active_to_show,
             paused_items=paused_to_show,
@@ -2532,6 +2592,7 @@ class LocalMemoryEngine:
     def _narrate_context(
         self,
         *,
+        locale: str = "en",
         intent: str,
         active_items: list[ItemRecord],
         paused_items: list[ItemRecord],
@@ -2545,97 +2606,119 @@ class LocalMemoryEngine:
         show_excerpts: bool = False,
         as_of: str | None = None,
     ) -> str:
+        zh = locale == "zh"
+
+        def localize(en: str, cn: str) -> str:
+            return cn if zh else en
+
+        def timeline(item: ItemRecord) -> str:
+            versions = " -> ".join(_format_version_line(version, zh=zh) for version in item.versions)
+            return localize("  History: ", "  演变记录：") + versions
+
+        condition_label = localize(" | Condition: ", "｜条件：")
         sections: list[str] = []
         if as_of:
-            sections.append(f"[历史时间截面快照（截至 {as_of} 当时有效的记忆状态）]")
+            sections.append(localize(
+                f"[Memory state as of {as_of}]", f"[历史时间截面快照（截至 {as_of}）]"
+            ))
 
         if core_blocks:
-            lines = ["[常驻核心记忆（始终生效的长期默契与边界）]"]
-            for blk in core_blocks[:4]:
-                lines.append(f"- {blk.block_key}：{blk.content}")
+            lines = [localize("[Core memory]", "[常驻核心记忆（始终生效的长期默契与边界）]")]
+            lines.extend(f"- {blk.block_key}: {blk.content}" for blk in core_blocks[:4])
             sections.append("\n".join(lines))
 
         if pending_msgs:
-            lines = ["[刚说的最新原话（后台尚未整理完，优先级高于下方旧状态）]"]
-            for msg in pending_msgs[-4:]:
-                lines.append(f"- ({msg.created_at}) 用户刚说：{msg.content}")
+            lines = [localize(
+                "[Recent user statements awaiting extraction. Prefer these over earlier state.]",
+                "[刚说的最新原话（后台尚未整理完，优先级高于下方旧状态）]",
+            )]
+            lines.extend(f"- ({msg.created_at}) {msg.content}" for msg in pending_msgs[-4:])
             sections.append("\n".join(lines))
 
         if consolidations:
-            lines = ["[对你的长期了解与偏好（基于历史归纳）]"]
-            for cons in consolidations:
-                lines.append(f"- {cons.topic}：{cons.summary}")
+            lines = [localize("[Long-term understanding and preferences]", "[对你的长期了解与偏好（基于历史归纳）]")]
+            lines.extend(f"- {cons.topic}: {cons.summary}" for cons in consolidations)
             sections.append("\n".join(lines))
 
         if session_summaries:
-            lines = ["[相关过往会话消歧摘要]"]
+            lines = [localize("[Relevant session summaries]", "[相关过往会话消歧摘要]")]
             for ss in session_summaries[:3]:
-                facts_join = "；".join(ss.facts[:3])
-                lines.append(
-                    f"- ({ss.session_date}) {ss.summary}"
-                    + (f"（要点：{facts_join}）" if facts_join else "")
-                )
+                facts_join = localize("; ", "；").join(ss.facts[:3])
+                detail = localize(f" (Key facts: {facts_join})", f"（要点：{facts_join}）") if facts_join else ""
+                lines.append(f"- ({ss.session_date}) {ss.summary}{detail}")
             sections.append("\n".join(lines))
 
         if active_items:
-            lines = ["[当前仍在进行的事项（最新有效状态）]"]
+            lines = [localize("[Current active items]", "[当前仍在进行的事项（最新有效状态）]")]
             for item in active_items:
                 cur = item.current
                 desc = cur.summary if cur else item.title
-                time_part = f"｜生效时间：{cur.effective_time_text}" if (cur and cur.effective_time_text) else ""
-                cond_part = f"｜条件：{cur.condition_text}" if (cur and cur.condition_text) else ""
-                lines.append(f"- {item.title}：{desc}{time_part}{cond_part}")
+                time_part = localize(" | Effective time: ", "｜生效时间：") + cur.effective_time_text if cur and cur.effective_time_text else ""
+                condition = condition_label + cur.condition_text if cur and cur.condition_text else ""
+                lines.append(f"- {item.title}: {desc}{time_part}{condition}")
                 if intent in {"history", "both"} and len(item.versions) > 1:
-                    lines.append("  演变记录：" + " -> ".join(_format_version_line(v) for v in item.versions))
+                    lines.append(timeline(item))
                 elif len(item.versions) > 1:
                     prev = item.versions[-2]
-                    lines.append(f"  （注意：此前版本“{prev.summary}”已被上述最新状态取代，回答现状时勿误用旧值）")
+                    lines.append(localize(
+                        f'  The earlier version "{prev.summary}" has been superseded.',
+                        f'  旧版本“{prev.summary}”已被当前状态取代。',
+                    ))
             sections.append("\n".join(lines))
 
         if paused_items:
-            lines = ["[已暂停/搁置的事项（当前不进行，除非用户主动问起或恢复，不要催促）]"]
+            lines = [localize(
+                "[Paused items. Let them rest unless the user asks or resumes.]",
+                "[已暂停/搁置的事项（当前不进行，除非用户主动问起或恢复，不要催促）]",
+            )]
+            paused = localize("paused", "已暂停")
             for item in paused_items:
                 cur = item.current
-                desc = cur.summary if cur else item.title
-                lines.append(f"- {item.title}（已暂停）：{desc}")
+                lines.append(f"- {item.title} ({paused}): {cur.summary if cur else item.title}")
                 if len(item.versions) > 1:
-                    lines.append("  演变记录：" + " -> ".join(_format_version_line(v) for v in item.versions))
+                    lines.append(timeline(item))
             sections.append("\n".join(lines))
 
         if closed_items:
-            lines = ["[已结束/已撤回的历史事项]"]
+            lines = [localize("[Closed or retracted items]", "[已结束/已撤回的历史事项]")]
             for item in closed_items:
                 cur = item.current
-                desc = cur.summary if cur else item.title
-                cond_part = f"｜条件：{cur.condition_text}" if (cur and cur.condition_text) else ""
-                lines.append(f"- {item.title}（{item.status}）：{desc}{cond_part}")
+                condition = condition_label + cur.condition_text if cur and cur.condition_text else ""
+                lines.append(f"- {item.title} ({item.status}): {cur.summary if cur else item.title}{condition}")
                 if len(item.versions) > 1:
-                    lines.append("  演变记录：" + " -> ".join(_format_version_line(v) for v in item.versions))
+                    lines.append(timeline(item))
             sections.append("\n".join(lines))
 
         if ambiguities:
-            lines = ["[未决指代疑点（以下话指代不明，暂未擅自修改任何事项，请自然向用户确认）]"]
+            lines = [localize(
+                "[Unresolved references. Ask the user which item they meant.]",
+                "[未决指代疑点（以下话指代不明，暂未修改事项，请自然向用户确认）]",
+            )]
             for amb in ambiguities:
-                cand_titles = []
+                titles = []
                 for cid in amb.candidate_item_ids:
-                    it = self.store.get_item(cid)
-                    if it is not None:
-                        cand_titles.append(f"{it.title}({it.status})")
-                cand_str = " / ".join(cand_titles) if cand_titles else "多个已有事项"
-                lines.append(f"- 原话：“{amb.source_quote}”｜可能指向：{cand_str}｜疑点：{amb.note}")
+                    item = self.store.get_item(cid)
+                    if item is not None:
+                        titles.append(f"{item.title} ({item.status})")
+                candidates = " / ".join(titles) or localize("multiple items", "多个已有事项")
+                lines.append(localize(
+                    f'- Quote: "{amb.source_quote}" | Possible matches: {candidates} | {amb.note}',
+                    f"- 原话：“{amb.source_quote}”｜可能指向：{candidates}｜疑点：{amb.note}",
+                ))
             sections.append("\n".join(lines))
 
         if drilled_messages and (show_excerpts or intent in {"history", "both", "current"}):
-            lines = ["[可核对的相关用户原话]"]
+            lines = [localize("[Relevant verbatim user excerpts]", "[可核对的相关用户原话]")]
             for msg in drilled_messages[:6]:
                 anchor_hint = anchor_relative_dates(msg.content, msg.created_at)
-                lines.append(f"- ({msg.created_at}){anchor_hint} “{msg.content}”")
+                quoted = localize(f'"{msg.content}"', f"“{msg.content}”")
+                lines.append(f"- ({msg.created_at}){anchor_hint} {quoted}")
             sections.append("\n".join(lines))
 
         if not sections and intent in {"history", "both", "current"}:
-            sections.append(
-                "[记忆检索结果：未找到与本轮问题相关的任何历史约定、计划或记录。"
-                "请诚实说明没印象或没约过这件事，绝不可顺着用户提问编造时间、地点或历史改动。]"
-            )
+            sections.append(localize(
+                "[No relevant memory found. Acknowledge the gap and avoid inventing past details.]",
+                "[记忆检索结果：未找到与本轮问题相关的记录。请如实说不记得，避免编造旧事。]",
+            ))
 
         return "\n\n".join(sections)

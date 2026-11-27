@@ -237,6 +237,7 @@ def create_airi_gateway_app(
                 "memory_graph": "/v1/memory/graph",
                 "memory_recall": "/v1/memory/recall",
                 "memory_remember": "/v1/memory/remember",
+                "memory_extractions": "/v1/memory/extractions",
                 "memory_summarize": "/v1/memory/summarize",
                 "memory_consolidate": "/v1/memory/consolidate",
                 "memory_forget": "/v1/memory/forget",
@@ -577,7 +578,7 @@ def create_airi_gateway_app(
                         evt = await asyncio.wait_for(queue.get(), timeout=15.0)
                         yield f"event: {evt.event_type}\ndata: {json.dumps(evt.model_dump(mode='json'), ensure_ascii=False)}\n\n"
                         emitted += 1
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         yield ": keepalive\n\n"
             finally:
                 engine.unsubscribe_events(queue, namespace=ns)
@@ -650,6 +651,21 @@ def create_airi_gateway_app(
             "message": msg.model_dump(mode="json"),
             "item_count": len(engine.list_items(namespace=req.namespace)),
         }
+
+    @app.get("/v1/memory/extractions")
+    async def list_extractions(namespace: str = "default"):
+        return {
+            "quarantined": engine.store.list_quarantined_messages(namespace=namespace),
+        }
+
+    @app.post("/v1/memory/extractions/{message_id}/retry")
+    async def retry_extraction(message_id: str, namespace: str = "default"):
+        message = await engine.retry_quarantined_extraction(message_id, namespace=namespace)
+        if message is None:
+            raise HTTPException(status_code=404, detail="Quarantined message not found")
+        if message.extraction_failure == "stale_source":
+            raise HTTPException(status_code=409, detail="A newer source already updated this item")
+        return {"message": message}
 
     @app.post("/v1/memory/consolidate")
     async def consolidate_memory(req: ConsolidateRequest | None = None):

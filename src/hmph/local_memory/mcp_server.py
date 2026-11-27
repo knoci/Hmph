@@ -156,7 +156,7 @@ TOOLS_SPEC = [
     {
         "name": "hmph_core_memory",
         "description": (
-            "Read, update, or delete Letta-style always-in-context Core Memory blocks "
+            "Read, update, or delete Core Memory blocks included in the companion context "
             "(e.g., user_profile, relationship_style, boundaries) for a namespace."
         ),
         "inputSchema": {

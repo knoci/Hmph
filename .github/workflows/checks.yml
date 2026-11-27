@@ -23,5 +23,7 @@ jobs:
         run: ruff check .
       - name: Bytecode compile check
         run: python -m compileall -q src
+      - name: Memory regression tests
+        run: python -m unittest discover -s tests
       - name: Verify CLI entrypoint
         run: hmph --version && hmph --help && hmph airi-gateway --help && hmph export --help

@@ -81,6 +81,12 @@ HMPH_DEEPSEEK_MODEL=deepseek-chat
 
 *（同时支持 DeepSeek、OpenAI、OpenRouter、Ollama 及任意 OpenAI 兼容接口，可通过 `HMPH_LOCAL_API_KEY`、`HMPH_LOCAL_BASE_URL`、`HMPH_LOCAL_MODEL` 覆盖。）*
 
+`HMPH_LOCALE=auto` 按当前对话选择中英文记忆提示，CLI 默认为英文。设为 `en` 或 `zh` 可以固定两者的语言。`HMPH_SOURCE_TIMEZONE` 独立设置解释相对日期时使用的时区。
+
+AIRI 兼容网关已完成中英文端到端验证。Unicode 分词和默认多语言向量也适用于假名、韩文、西里尔字母和带重音符号的拉丁字母等文字的检索。
+
+打开使用旧全文索引的数据库时，Hmph 会从已存记录重建索引，并在启用哈希向量后端时刷新旧向量。单条消息连续三次返回无效结构后会被隔离，队列继续处理后续消息。上游服务故障时，消息保持待处理。
+
 ### 3. 启动无头 AIRI 记忆网关
 
 ```bash
@@ -153,6 +159,8 @@ hmph airi-gateway --db data/hmph.db --port 8018
 | `GET /v1/memory/export` | 将指定角色记忆导出为人类可读 Markdown 手账或无损 JSON |
 | `POST /v1/memory/import` | 将 JSON 记忆快照幂等导入至指定角色命名空间 |
 | `POST /v1/memory/recall` | 调试混合检索证据链与本地延迟（支持可选 `as_of`） |
+| `GET /v1/memory/extractions` | 列出指定命名空间内被隔离的抽取失败消息 |
+| `POST /v1/memory/extractions/{message_id}/retry` | 重试隔离消息。若更新的原话已改变该事项，返回 HTTP 409 |
 | `POST /v1/memory/forget` | 原子级联遗忘指定事项或原话 |
 | `POST /v1/memory/consolidate` | 触发 Map-Reduce 睡眠整合 |
 | `POST /v1/memory/summarize` | 生成消解指代后的会话情景摘要 |
@@ -180,7 +188,7 @@ hmph airi-gateway --db data/hmph.db --port 8018
 
 ```text
 hmph/
-├── .github/workflows/checks.yml   # 零 Docker CI（ruff + compileall + CLI 冒烟）
+├── .github/workflows/checks.yml   # 静态检查、回归测试与 CLI 检查
 ├── docs/
 │   └── architecture.md            # 系统架构、检索管线与 SQLite 表结构
 ├── integrations/
@@ -190,8 +198,9 @@ hmph/
 ├── src/hmph/
 │   ├── __init__.py                # 公共 Python API
 │   ├── cli.py                     # CLI 入口（airi-gateway、local-mcp、local-chat、export/import）
-│   ├── lexical.py                 # 零依赖中英双语分词器
+│   ├── lexical.py                 # Unicode 分词器
 │   └── local_memory/              # 核心 SQLite 引擎、混合检索、网关与 MCP 服务
+├── tests/                         # 记忆、旧库迁移和网关回归测试
 ├── .env.example
 ├── LICENSE
 ├── pyproject.toml
@@ -207,6 +216,7 @@ hmph/
 pip install -e ".[dev]"
 ruff check .
 python -m compileall -q src
+python -m unittest discover -s tests
 hmph --help
 ```
 
